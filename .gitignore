@@ -1,0 +1,10 @@
+# Environment variables
+.env
+.env.local
+
+# Supabase
+.supabase/
+
+# OS
+.DS_Store
+
