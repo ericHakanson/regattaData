@@ -1,0 +1,28 @@
+2026/02/15 20:27:56 Authorizing with Application Default Credentials
+2026/02/15 20:27:56 [regattadata:us-central1:regatta-data] Listening on 127.0.0.1:58462
+2026/02/15 20:27:56 The proxy has started successfully and is ready for new connections!
+2026/02/15 20:27:57 [regattadata:us-central1:regatta-data] Accepted connection from 127.0.0.1:58469
+2026/02/15 20:27:57 [regattadata:us-central1:regatta-data] client closed the connection
+2026/02/15 20:27:57 [regattadata:us-central1:regatta-data] Accepted connection from 127.0.0.1:58472
+2026/02/15 20:27:57 [regattadata:us-central1:regatta-data] client closed the connection
+2026/02/15 20:27:57 [regattadata:us-central1:regatta-data] Accepted connection from 127.0.0.1:58474
+2026/02/15 20:27:58 [regattadata:us-central1:regatta-data] client closed the connection
+2026/02/15 20:27:58 [regattadata:us-central1:regatta-data] Accepted connection from 127.0.0.1:58479
+2026/02/15 20:27:59 [regattadata:us-central1:regatta-data] client closed the connection
+2026/02/15 20:27:59 [regattadata:us-central1:regatta-data] Accepted connection from 127.0.0.1:58481
+2026/02/15 20:28:00 [regattadata:us-central1:regatta-data] client closed the connection
+2026/02/15 20:28:00 [regattadata:us-central1:regatta-data] Accepted connection from 127.0.0.1:58483
+2026/02/15 20:28:01 [regattadata:us-central1:regatta-data] client closed the connection
+2026/02/15 20:28:01 [regattadata:us-central1:regatta-data] Accepted connection from 127.0.0.1:58485
+2026/02/15 20:28:01 [regattadata:us-central1:regatta-data] client closed the connection
+2026/02/15 20:28:01 [regattadata:us-central1:regatta-data] Accepted connection from 127.0.0.1:58487
+2026/02/15 20:28:02 [regattadata:us-central1:regatta-data] client closed the connection
+2026/02/15 20:28:02 [regattadata:us-central1:regatta-data] Accepted connection from 127.0.0.1:58489
+2026/02/15 20:28:03 [regattadata:us-central1:regatta-data] client closed the connection
+2026/02/15 20:28:03 [regattadata:us-central1:regatta-data] Accepted connection from 127.0.0.1:58491
+2026/02/15 20:28:03 [regattadata:us-central1:regatta-data] client closed the connection
+2026/02/15 20:28:03 [regattadata:us-central1:regatta-data] Accepted connection from 127.0.0.1:58493
+2026/02/15 20:28:04 [regattadata:us-central1:regatta-data] client closed the connection
+2026/02/15 20:28:04 Sending SIGTERM signal for proxy to shutdown.
+2026/02/15 20:28:04 SIGTERM signal received. Shutting down...
+2026/02/15 20:28:04 proxy server error: accept tcp 127.0.0.1:58462: use of closed network connection

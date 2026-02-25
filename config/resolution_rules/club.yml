@@ -1,0 +1,33 @@
+entity_type: club
+source_system: "regattaman_csv_export|regattaman_public_scrape_csv|airtable_copy_csv|yacht_scoring_csv"
+version: "v1.0.0"
+
+thresholds:
+  auto_promote: 0.75
+  review: 0.50
+  hold: 0.25
+
+# Feature weights: sum to 1.0 for a fully-attributed club.
+feature_weights:
+  name_normalized: 0.50      # well-formed normalized club name present
+  website_present: 0.25      # website URL present (strong identity signal)
+  state_usa_present: 0.15    # US state present
+  phone_present: 0.10        # phone number present
+
+hard_blocks:
+  - conflicting_normalized_names_no_corroboration  # normalized names disagree and no shared website/phone
+
+source_precedence:
+  - regattaman_csv_export
+  - airtable_copy_csv
+  - regattaman_public_scrape_csv
+  - yacht_scoring_csv
+
+survivorship_rules:
+  name: highest_precedence_non_null
+  website: highest_precedence_non_null
+  phone: highest_precedence_non_null
+  state_usa: highest_precedence_non_null
+
+missing_attribute_penalties:
+  missing_website: 0.05   # clubs without websites are less uniquely identifiable

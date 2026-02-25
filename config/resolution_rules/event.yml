@@ -1,0 +1,36 @@
+entity_type: event
+source_system: "regattaman_csv_export|regattaman_public_scrape_csv|airtable_copy_csv|yacht_scoring_csv"
+version: "v1.0.0"
+
+thresholds:
+  auto_promote: 0.90
+  review: 0.75
+  hold: 0.50
+
+# Feature weights: sum to 1.0 for a fully-attributed event.
+feature_weights:
+  external_id_present: 0.40   # race_id or emenu ID present (strong anchor)
+  season_year_present: 0.25   # numeric season year present
+  name_normalized: 0.25       # normalized event name present
+  dates_present: 0.10         # start_date and/or end_date present
+
+hard_blocks:
+  - conflicting_years_same_external_id  # same external ID maps to different years across sources
+
+source_precedence:
+  - regattaman_csv_export
+  - airtable_copy_csv
+  - regattaman_public_scrape_csv
+  - yacht_scoring_csv
+
+survivorship_rules:
+  event_name: highest_precedence_non_null
+  season_year: highest_precedence_non_null
+  event_external_id: highest_precedence_non_null
+  start_date: highest_precedence_non_null
+  end_date: highest_precedence_non_null
+  location_raw: highest_precedence_non_null
+
+missing_attribute_penalties:
+  missing_external_id: 0.10   # events without external IDs are harder to deduplicate
+  missing_season_year: 0.10   # year absence makes cross-source matching unreliable

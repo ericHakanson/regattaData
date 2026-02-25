@@ -1,0 +1,5 @@
+[wrapper] starting proxy on 127.0.0.1:57792
+error: proxy did not become ready within 30s — see /Users/erichakanson/projects/regattaData/migrations/tests/logs/20260215_201705_71954_15795/proxy.log
+[wrapper] proxy stopped (pid 71961)
+[wrapper] dropping database: regatta_smoke_20260215_201705_71954_15795
+[wrapper] ERROR: failed to drop regatta_smoke_20260215_201705_71954_15795 — see /Users/erichakanson/projects/regattaData/migrations/tests/logs/20260215_201705_71954_15795/cleanup.log

@@ -1,0 +1,45 @@
+entity_type: participant
+source_system: "regattaman_csv_export|regattaman_public_scrape_csv|mailchimp_audience_csv|jotform_waiver_csv|airtable_copy_csv|yacht_scoring_csv"
+version: "v1.0.0"
+
+# Score thresholds for resolution_state routing.
+# Scores are cumulative feature weights minus missing-attribute penalties.
+thresholds:
+  auto_promote: 0.90
+  review: 0.75
+  hold: 0.50
+
+# Feature weights: each feature is a boolean detected by the scoring pipeline.
+# Weights sum to 1.0 for a fully-attributed participant.
+feature_weights:
+  email_exact: 0.55        # confirmed normalized email present
+  phone_exact: 0.20        # confirmed normalized phone present
+  dob_exact: 0.15          # date_of_birth present
+  normalized_name_exact: 0.10  # well-formed normalized_name present
+
+# Hard blocks: any detected condition in this list forces score=0, state=reject.
+hard_blocks:
+  - conflicting_dob                     # two source rows disagree on DOB for same fingerprint
+  - conflicting_high_confidence_email   # verified email conflicts with existing verified email
+
+# Source precedence for survivorship (highest-precedence wins for a given attribute).
+source_precedence:
+  - jotform_waiver_csv
+  - regattaman_csv_export
+  - regattaman_public_scrape_csv
+  - mailchimp_audience_csv
+  - airtable_copy_csv
+  - yacht_scoring_csv
+
+# Survivorship rules: how to select the best value when multiple sources contribute.
+survivorship_rules:
+  date_of_birth: highest_precedence_non_null   # use DOB from highest-precedence source that has it
+  best_email: highest_score_confirmed          # use email from source with highest precedence
+  best_phone: highest_precedence_non_null
+  display_name: highest_precedence_non_null
+
+# Penalties applied when high-value attributes are absent.
+# Penalty is subtracted from the weighted feature sum.
+missing_attribute_penalties:
+  missing_email: 0.10   # deduct if no email present
+  missing_phone: 0.05   # deduct if no phone present

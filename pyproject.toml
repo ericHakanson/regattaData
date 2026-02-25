@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "regatta-etl"
+version = "0.2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary]>=3.1",
+    "click>=8.1",
+    "PyYAML>=6.0",
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "google-cloud-storage>=2.14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-postgresql>=6",
+]
+
+[project.scripts]
+regatta-import = "regatta_etl.import_regattaman_csv:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

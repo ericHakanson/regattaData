@@ -8,3 +8,18 @@
 # OS
 .DS_Store
 
+# Raw evidence exports
+rawEvidence/
+
+# ETL artifacts
+artifacts/rejects/*
+!artifacts/rejects/.gitkeep
+artifacts/reports/*
+!artifacts/reports/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/

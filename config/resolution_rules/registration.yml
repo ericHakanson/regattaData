@@ -1,0 +1,33 @@
+entity_type: registration
+source_system: "regattaman_csv_export|regattaman_public_scrape_csv|airtable_copy_csv|yacht_scoring_csv"
+version: "v1.0.0"
+
+thresholds:
+  auto_promote: 0.90
+  review: 0.75
+  hold: 0.50
+
+# Feature weights: sum to 1.0 for a fully-attributed registration.
+feature_weights:
+  external_id_present: 0.40   # registration_external_id present
+  event_resolved: 0.25        # candidate_event_id successfully resolved
+  yacht_resolved: 0.25        # candidate_yacht_id successfully resolved
+  participant_resolved: 0.10  # candidate_primary_participant_id resolved
+
+hard_blocks:
+  - duplicate_external_id_different_event  # same external_id maps to different events
+
+source_precedence:
+  - regattaman_csv_export
+  - airtable_copy_csv
+  - regattaman_public_scrape_csv
+  - yacht_scoring_csv
+
+survivorship_rules:
+  registration_external_id: highest_precedence_non_null
+  entry_status: highest_precedence_non_null
+  registered_at: highest_precedence_non_null
+
+missing_attribute_penalties:
+  missing_external_id: 0.10   # deduct if no external registration ID
+  missing_yacht: 0.10         # deduct if yacht not resolved

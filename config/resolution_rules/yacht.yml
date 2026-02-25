@@ -1,0 +1,34 @@
+entity_type: yacht
+source_system: "regattaman_csv_export|regattaman_public_scrape_csv|airtable_copy_csv|yacht_scoring_csv"
+version: "v1.0.0"
+
+thresholds:
+  auto_promote: 0.95
+  review: 0.75
+  hold: 0.50
+
+# Feature weights: sum to 1.0 for a fully-attributed yacht.
+feature_weights:
+  sail_number_exact: 0.50    # normalized sail number present
+  name_normalized: 0.30      # normalized yacht name present
+  yacht_type_present: 0.10   # yacht type (model/class) present
+  length_feet_present: 0.10  # LOA in feet present
+
+hard_blocks:
+  - conflicting_sail_number_same_name   # same normalized name but different confirmed sail numbers across source rows
+
+source_precedence:
+  - regattaman_csv_export
+  - airtable_copy_csv
+  - regattaman_public_scrape_csv
+  - yacht_scoring_csv
+
+survivorship_rules:
+  sail_number: highest_precedence_non_null
+  name: highest_precedence_non_null
+  yacht_type: highest_precedence_non_null
+  length_feet: highest_precedence_non_null
+
+missing_attribute_penalties:
+  missing_sail_number: 0.15  # deduct if no sail number (harder to disambiguate)
+  missing_name: 0.20         # deduct if yacht name is absent

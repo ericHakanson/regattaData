@@ -1,0 +1,40 @@
+[wrapper] starting proxy on 127.0.0.1:58462
+[wrapper] proxy ready (pid 75684, port 58462)
+[wrapper] creating database: regatta_smoke_20260215_202756_75677_20719
+[wrapper] delegating to run_smoke.sh
+────────────────────────────────────────
+[smoke] using temporary database: regatta_smoke_20260215_202756_75677_20719
+[smoke] apply migrations/0001_extensions.sql
+[smoke] ok migrations/0001_extensions.sql
+[smoke] apply migrations/0002_core_entities.sql
+[smoke] ok migrations/0002_core_entities.sql
+[smoke] apply migrations/0003_relationships.sql
+[smoke] ok migrations/0003_relationships.sql
+[smoke] apply migrations/0004_event_ops.sql
+[smoke] ok migrations/0004_event_ops.sql
+[smoke] apply migrations/0005_resolution_and_actions.sql
+[smoke] ok migrations/0005_resolution_and_actions.sql
+[smoke] apply migrations/0006_views.sql
+[smoke] ok migrations/0006_views.sql
+[smoke] run migrations/tests/01_seed.sql
+[smoke] ok migrations/tests/01_seed.sql
+[smoke] run migrations/tests/02_constraints.sql
+[smoke] ok migrations/tests/02_constraints.sql
+[smoke] run migrations/tests/03_views.sql
+[smoke] ok migrations/tests/03_views.sql
+[smoke] PASS
+────────────────────────────────────────
+
+┌─────────────────────────────────────────
+│ Cloud SQL Smoke Test Summary
+├─────────────────────────────────────────
+│ Environment:  dev
+│ Instance:     regattadata:us-central1:regatta-data
+│ Project:      regattadata
+│ Temp DB:      regatta_smoke_20260215_202756_75677_20719
+│ Result:       PASS
+│ Logs:         /Users/erichakanson/projects/regattaData/migrations/tests/logs/20260215_202756_75677_20719
+└─────────────────────────────────────────
+[wrapper] proxy stopped (pid 75684)
+[wrapper] dropping database: regatta_smoke_20260215_202756_75677_20719
+[wrapper] ERROR: failed to drop regatta_smoke_20260215_202756_75677_20719 — see /Users/erichakanson/projects/regattaData/migrations/tests/logs/20260215_202756_75677_20719/cleanup.log
