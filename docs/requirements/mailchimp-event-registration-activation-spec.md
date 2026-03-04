@@ -185,6 +185,8 @@ Run report must include:
 2. No silent fallback that broadens audience scope.
 3. Fail fast if API mode requested without list ID/API key.
 4. Dry-run executes full selection/suppression logic and writes no external side effects.
+5. Production campaigns must use gated segments/tags, never "All contacts."
+6. Activation runs with API failures are treated as failed and must not be used for sends.
 
 ## 16. Testing Requirements
 
@@ -214,7 +216,11 @@ Run report must include:
 3. Run production CSV export and import into Mailchimp manually.
 4. Add API mode only after CSV flow is proven effective.
 
-## 19. Claude Implementation Checklist
+## 19. Operational Safety References
+1. Pre-send runbook checklist: `docs/runbooks/09-mailchimp-pre-send-checklist.md`
+2. Production safety requirements: `docs/requirements/mailchimp-production-send-safety-requirements.md`
+
+## 20. Claude Implementation Checklist
 - [ ] Add activation tables migration.
 - [ ] Add `mailchimp_event_activation` CLI mode and options.
 - [ ] Implement segment SQL and suppression logic.
