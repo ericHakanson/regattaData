@@ -44,6 +44,12 @@ _REQUIRED_TABLES = [
     "canonical_registration",
     "mailchimp_audience_row",
     "mailchimp_contact_state",
+    # Audit tables — created by migration 0019; fail fast if missing
+    "mailchimp_activation_run",
+    "mailchimp_activation_row",
+    # Identity policy tables — created by migration 0020
+    "participant_mailchimp_identity",
+    "mailchimp_identity_review_queue",
 ]
 
 _SUPPRESSED_STATUSES = {"unsubscribed", "cleaned"}
@@ -261,7 +267,9 @@ def _query_likely_registrants(
             FROM canonical_registration cr
             JOIN canonical_event ce ON ce.id = cr.canonical_event_id
             WHERE cr.canonical_primary_participant_id IS NOT NULL
+              AND ce.start_date < CURRENT_DATE
               AND ce.season_year >= EXTRACT(YEAR FROM now())::int - %(lookback)s
+              AND ce.season_year <= EXTRACT(YEAR FROM now())::int
             GROUP BY cr.canonical_primary_participant_id
         )
         SELECT
@@ -553,16 +561,88 @@ def _insert_activation_rows(
 # API mode (optional)
 # ---------------------------------------------------------------------------
 
+def _persist_api_contact_id(
+    conn: psycopg.Connection,
+    participant_id: str,
+    email_normalized: str,
+    mailchimp_contact_id: str,
+    subscriber_hash: str,
+    ctrs: RunCounters,
+) -> bool:
+    """Persist the Mailchimp contact ID returned by the API.
+
+    Returns True on success, False if a cross-participant conflict is detected
+    (in which case a review-queue row is inserted and ctrs are updated).
+    """
+    # Check for cross-participant contact_id conflict
+    conflict = conn.execute(
+        """
+        SELECT participant_id FROM participant_mailchimp_identity
+        WHERE mailchimp_contact_id = %s AND participant_id != %s::uuid
+        """,
+        (mailchimp_contact_id, participant_id),
+    ).fetchone()
+    if conflict:
+        conn.execute(
+            """
+            INSERT INTO mailchimp_identity_review_queue
+                (source_file_name, email_normalized, candidate_participant_id,
+                 reason_code, reason_detail, raw_payload)
+            VALUES (%s, %s, %s::uuid, %s, %s, %s::jsonb)
+            """,
+            (
+                "mailchimp_event_activation",
+                email_normalized,
+                participant_id,
+                "mailchimp_contact_id_conflict",
+                f"contact_id={mailchimp_contact_id!r} already linked to "
+                f"participant {conflict[0]}",
+                json.dumps({"mailchimp_contact_id": mailchimp_contact_id,
+                            "participant_id": participant_id}),
+            ),
+        )
+        ctrs.mailchimp_contact_id_conflicts += 1
+        ctrs.mailchimp_identity_conflicts += 1
+        return False
+
+    # Upsert identity link with contact ID and subscriber hash
+    result = conn.execute(
+        """
+        INSERT INTO participant_mailchimp_identity
+            (participant_id, mailchimp_contact_id, subscriber_hash, email_normalized,
+             source_system, source_file_name)
+        VALUES (%s::uuid, %s, %s, %s, %s, %s)
+        ON CONFLICT (participant_id, email_normalized) DO UPDATE SET
+            last_seen_at         = now(),
+            mailchimp_contact_id = COALESCE(participant_mailchimp_identity.mailchimp_contact_id,
+                                            EXCLUDED.mailchimp_contact_id),
+            subscriber_hash      = COALESCE(participant_mailchimp_identity.subscriber_hash,
+                                            EXCLUDED.subscriber_hash)
+        RETURNING (xmax = 0) AS was_inserted
+        """,
+        (participant_id, mailchimp_contact_id, subscriber_hash, email_normalized,
+         "mailchimp_event_activation", "mailchimp_event_activation"),
+    ).fetchone()
+    if result and result[0]:
+        ctrs.mailchimp_identity_links_inserted += 1
+    elif result:
+        ctrs.mailchimp_identity_links_updated += 1
+    return True
+
+
 def _api_upsert(
     rows: list[_AudienceRow],
     list_id: str,
     api_key: str,
     ctrs: RunCounters,
+    conn: Optional[psycopg.Connection] = None,
 ) -> None:
     """Upsert eligible rows into a Mailchimp list and apply segment tags.
 
     Never subscribes suppressed contacts.  Retries on rate-limit (429) with
-    exponential backoff up to 3 attempts.
+    exponential backoff up to 3 attempts.  When conn is provided, persists
+    returned Mailchimp contact IDs into participant_mailchimp_identity and
+    fails closed on cross-participant contact-ID conflicts.
     """
     try:
         import mailchimp_marketing as mc
@@ -596,10 +676,11 @@ def _api_upsert(
             },
             "tags": [f"segment:{st}" for st in row.segment_types] + ["source:regattadata_cdp"],
         }
+        api_success = False
         for attempt in range(3):
             try:
-                client.lists.set_list_member(list_id, subscriber_hash, member_body)
-                ctrs.activation_rows_api_upserted += 1
+                response = client.lists.set_list_member(list_id, subscriber_hash, member_body)
+                api_success = True
                 break
             except ApiClientError as exc:
                 status_code = getattr(exc, "status_code", None)
@@ -622,6 +703,29 @@ def _api_upsert(
                 f"Max retries exceeded for {row.email_normalized}"
             )
 
+        if not api_success:
+            continue
+
+        # Persist returned contact ID when conn is available
+        if conn is not None:
+            mailchimp_contact_id = getattr(response, "unique_email_id", None)
+            if mailchimp_contact_id:
+                ok = _persist_api_contact_id(
+                    conn, row.participant_id, row.email_normalized,
+                    mailchimp_contact_id, subscriber_hash, ctrs,
+                )
+                if not ok:
+                    # Cross-participant conflict — treat this row as failed
+                    ctrs.activation_rows_api_failed += 1
+                    ctrs.warnings.append(
+                        f"Contact-ID conflict for {row.email_normalized}: "
+                        f"contact_id={mailchimp_contact_id!r} already linked to "
+                        "a different participant"
+                    )
+                    continue
+
+        ctrs.activation_rows_api_upserted += 1
+
 
 # ---------------------------------------------------------------------------
 # Counters helper
@@ -637,6 +741,10 @@ def _activation_counters_dict(ctrs: RunCounters) -> dict:
         "rows_exported_csv": ctrs.activation_rows_exported_csv,
         "rows_api_upserted": ctrs.activation_rows_api_upserted,
         "rows_api_failed": ctrs.activation_rows_api_failed,
+        "identity_links_inserted": ctrs.mailchimp_identity_links_inserted,
+        "identity_links_updated": ctrs.mailchimp_identity_links_updated,
+        "identity_conflicts": ctrs.mailchimp_identity_conflicts,
+        "contact_id_conflicts": ctrs.mailchimp_contact_id_conflicts,
         "db_errors": ctrs.db_phase_errors,
         "warnings": ctrs.warnings,
     }
@@ -722,10 +830,15 @@ def run_mailchimp_event_activation(
             elif delivery_mode == "api":
                 assert mailchimp_api_key is not None
                 assert mailchimp_list_id is not None
-                _api_upsert(audience_rows, mailchimp_list_id, mailchimp_api_key, ctrs)
+                _api_upsert(audience_rows, mailchimp_list_id, mailchimp_api_key, ctrs,
+                            conn=conn)
 
-            # Finalize run record
-            final_status = "failed" if ctrs.db_phase_errors > 0 else "ok"
+            # Finalize run record — DB errors OR any API delivery failures → failed
+            final_status = (
+                "failed"
+                if ctrs.db_phase_errors > 0 or ctrs.activation_rows_api_failed > 0
+                else "ok"
+            )
             _update_activation_run(conn, run_id, final_status, ctrs)
             conn.commit()
         else:
@@ -758,6 +871,10 @@ def build_activation_report(ctrs: RunCounters, dry_run: bool = False) -> str:
         f"  rows_exported_csv:              {ctrs.activation_rows_exported_csv}",
         f"  rows_api_upserted:              {ctrs.activation_rows_api_upserted}",
         f"  rows_api_failed:                {ctrs.activation_rows_api_failed}",
+        f"  identity_links_inserted:        {ctrs.mailchimp_identity_links_inserted}",
+        f"  identity_links_updated:         {ctrs.mailchimp_identity_links_updated}",
+        f"  identity_conflicts:             {ctrs.mailchimp_identity_conflicts}",
+        f"  contact_id_conflicts:           {ctrs.mailchimp_contact_id_conflicts}",
         f"  db_errors:                      {ctrs.db_phase_errors}",
     ]
     if ctrs.warnings:

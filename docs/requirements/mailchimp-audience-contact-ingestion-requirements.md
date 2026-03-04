@@ -106,6 +106,19 @@ Merge/update policy:
 4. Timestamps (`OPTIN_TIME`, `CONFIRM_TIME`, `LAST_CHANGED`, `UNSUB_TIME`, `CLEAN_TIME`) parse `%Y-%m-%d %H:%M:%S`.
 5. `TAGS` parse as comma-delimited tag list with quote-aware splitting; trim each tag and drop empties.
 6. Preserve all source IDs (`LEID`, `EUID`) exactly as text.
+7. Compute and persist `subscriber_hash = md5(normalized_email)` for API identity correlation.
+
+## Address and Contact-ID Edge Case Handling
+1. Address field-shift anomalies (example: full street/city/state stuffed into `City`, zip in `State/Region`) must not silently overwrite curated structured addresses.
+2. For anomalous address layouts:
+   - keep raw payload and raw address always,
+   - attempt structured parse only when confidence is high,
+   - otherwise queue for manual review per strict policy.
+3. Mailchimp export files may omit canonical Mailchimp contact/member ID.
+4. `LEID`/`EUID` are auxiliary IDs and must be captured, but are not guaranteed substitutes for canonical contact ID.
+5. Contact ID linkage must be backfilled via API lookup using audience/list + `subscriber_hash`, then stored in participant Mailchimp identity linkage.
+6. While contact ID is missing or identity is unresolved, ingestion must not perform curated profile overwrites that could corrupt participant identity (name/phone/address).
+7. Strict identity policy in `docs/requirements/mailchimp-strict-identity-and-contact-id-policy-spec.md` is authoritative for quarantine/allow decisions.
 
 ## Status Semantics
 1. Rows from subscribed file -> state `subscribed`.

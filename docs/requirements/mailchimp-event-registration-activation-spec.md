@@ -161,6 +161,9 @@ If `delivery-mode=api`:
 3. Never call subscribe/reactivate endpoints for suppressed contacts.
 4. Handle API throttling/retries with bounded backoff.
 5. Store per-row API outcome in run counters and warning list.
+6. If strict identity linkage is missing for a participant, API mode must not overwrite profile PII merge fields (name/phone/address); allow only safe tags/segment markers.
+7. If Mailchimp export lacks canonical contact ID, API correlation must use `subscriber_hash` and persist returned contact ID into participant identity linkage.
+8. If returned contact ID conflicts with an existing participant mapping, fail closed and queue manual review.
 
 ## 13. Idempotency
 1. Same run inputs should produce identical deduped audience rows.

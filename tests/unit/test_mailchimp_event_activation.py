@@ -6,14 +6,16 @@ No DB connection required.
 
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch, call
 
 import pytest
 
 from regatta_etl.import_mailchimp_event_activation import (
     _AudienceRow,
     _CandidateRow,
+    _api_upsert,
     _apply_suppression,
     _dedupe_by_email,
     _merge_segment_rows,
@@ -363,3 +365,186 @@ class TestWriteCsv:
             rows_out = list(reader)
         assert rows_out == []
         assert reader.fieldnames  # header present
+
+
+# ---------------------------------------------------------------------------
+# _api_upsert — mocked Mailchimp client
+# ---------------------------------------------------------------------------
+
+def _make_eligible_row(email: str, segments: list[str]) -> _AudienceRow:
+    return _AudienceRow(
+        email_normalized=email,
+        participant_id="p1",
+        first_name="Alice",
+        last_name="Smith",
+        display_name="Alice Smith",
+        segment_types=segments,
+        upcoming_event_count=1,
+        historical_registration_count=2,
+        is_suppressed=False,
+        suppression_reason=None,
+        yacht_name=None,
+        last_registered_event_name=None,
+        generated_at="2026-03-01T00:00:00Z",
+    )
+
+
+def _make_suppressed_row(email: str) -> _AudienceRow:
+    row = _make_eligible_row(email, ["upcoming_registrants"])
+    row.is_suppressed = True
+    row.suppression_reason = "unsubscribed"
+    return row
+
+
+class TestApiUpsert:
+    """Tests for _api_upsert using a mocked mailchimp_marketing client."""
+
+    def _run(self, rows: list[_AudienceRow], *, api_key: str = "testkey-us6",
+             list_id: str = "list123") -> RunCounters:
+        ctrs = RunCounters()
+        _api_upsert(rows, list_id, api_key, ctrs)
+        return ctrs
+
+    def _patch_mc(self, side_effects=None):
+        """Return a context manager that patches mailchimp_marketing."""
+        mock_client = MagicMock()
+        mock_module = MagicMock()
+        mock_module.Client.return_value = mock_client
+        mock_api_error = type("ApiClientError", (Exception,), {"status_code": 500})
+        mock_module.api_client.ApiClientError = mock_api_error
+
+        if side_effects:
+            mock_client.lists.set_list_member.side_effect = side_effects
+
+        return mock_module, mock_client, mock_api_error
+
+    def test_happy_path_upserts_all_eligible(self):
+        rows = [
+            _make_eligible_row("a@x.com", ["upcoming_registrants"]),
+            _make_eligible_row("b@x.com", ["likely_registrants"]),
+        ]
+        mock_module, mock_client, _ = self._patch_mc()
+        with patch.dict(sys.modules, {
+            "mailchimp_marketing": mock_module,
+            "mailchimp_marketing.api_client": mock_module.api_client,
+        }):
+            ctrs = self._run(rows)
+
+        assert ctrs.activation_rows_api_upserted == 2
+        assert ctrs.activation_rows_api_failed == 0
+        assert mock_client.lists.set_list_member.call_count == 2
+
+    def test_suppressed_rows_skipped(self):
+        rows = [
+            _make_eligible_row("ok@x.com", ["upcoming_registrants"]),
+            _make_suppressed_row("bad@x.com"),
+        ]
+        mock_module, mock_client, _ = self._patch_mc()
+        with patch.dict(sys.modules, {
+            "mailchimp_marketing": mock_module,
+            "mailchimp_marketing.api_client": mock_module.api_client,
+        }):
+            ctrs = self._run(rows)
+
+        assert ctrs.activation_rows_api_upserted == 1
+        assert ctrs.activation_rows_api_failed == 0
+        # Only the eligible row was sent
+        assert mock_client.lists.set_list_member.call_count == 1
+        call_args = mock_client.lists.set_list_member.call_args
+        assert call_args[0][2]["email_address"] == "ok@x.com"
+
+    def test_429_retries_succeed(self):
+        mock_module, mock_client, ApiError = self._patch_mc()
+        rate_limit_err = ApiError("Rate limited")
+        rate_limit_err.status_code = 429
+        # First two calls raise 429, third succeeds
+        mock_client.lists.set_list_member.side_effect = [
+            rate_limit_err, rate_limit_err, None
+        ]
+        rows = [_make_eligible_row("a@x.com", ["upcoming_registrants"])]
+        with patch("regatta_etl.import_mailchimp_event_activation.time.sleep"):
+            with patch.dict(sys.modules, {
+                "mailchimp_marketing": mock_module,
+                "mailchimp_marketing.api_client": mock_module.api_client,
+            }):
+                ctrs = self._run(rows)
+
+        assert ctrs.activation_rows_api_upserted == 1
+        assert ctrs.activation_rows_api_failed == 0
+        # 2 rate-limit warnings recorded
+        assert sum(1 for w in ctrs.warnings if "Rate limited" in w) == 2
+
+    def test_non_429_api_error_increments_failed(self):
+        mock_module, mock_client, ApiError = self._patch_mc()
+        server_err = ApiError("Internal Server Error")
+        server_err.status_code = 500
+        mock_client.lists.set_list_member.side_effect = server_err
+        rows = [_make_eligible_row("a@x.com", ["upcoming_registrants"])]
+        with patch.dict(sys.modules, {
+            "mailchimp_marketing": mock_module,
+            "mailchimp_marketing.api_client": mock_module.api_client,
+        }):
+            ctrs = self._run(rows)
+
+        assert ctrs.activation_rows_api_upserted == 0
+        assert ctrs.activation_rows_api_failed == 1
+        assert any("API error" in w for w in ctrs.warnings)
+
+    def test_max_retries_exceeded_increments_failed(self):
+        mock_module, mock_client, ApiError = self._patch_mc()
+        rate_limit_err = ApiError("Rate limited")
+        rate_limit_err.status_code = 429
+        # Always rate-limit — exhausts all 3 attempts
+        mock_client.lists.set_list_member.side_effect = rate_limit_err
+        rows = [_make_eligible_row("a@x.com", ["upcoming_registrants"])]
+        with patch("regatta_etl.import_mailchimp_event_activation.time.sleep"):
+            with patch.dict(sys.modules, {
+                "mailchimp_marketing": mock_module,
+                "mailchimp_marketing.api_client": mock_module.api_client,
+            }):
+                ctrs = self._run(rows)
+
+        assert ctrs.activation_rows_api_upserted == 0
+        assert ctrs.activation_rows_api_failed == 1
+        assert any("Max retries" in w for w in ctrs.warnings)
+
+    def test_segment_tags_applied_correctly(self):
+        row = _make_eligible_row("a@x.com", ["upcoming_registrants", "likely_registrants"])
+        mock_module, mock_client, _ = self._patch_mc()
+        with patch.dict(sys.modules, {
+            "mailchimp_marketing": mock_module,
+            "mailchimp_marketing.api_client": mock_module.api_client,
+        }):
+            self._run([row])
+
+        body = mock_client.lists.set_list_member.call_args[0][2]
+        assert "segment:upcoming_registrants" in body["tags"]
+        assert "segment:likely_registrants" in body["tags"]
+        assert "source:regattadata_cdp" in body["tags"]
+
+    def test_missing_package_raises_runtime_error(self):
+        rows = [_make_eligible_row("a@x.com", ["upcoming_registrants"])]
+        ctrs = RunCounters()
+        # Remove mailchimp_marketing from sys.modules if present and block import
+        with patch.dict(sys.modules, {"mailchimp_marketing": None}):
+            with pytest.raises(RuntimeError, match="mailchimp-marketing"):
+                _api_upsert(rows, "list123", "key-us1", ctrs)
+
+    def test_partial_failure_correct_counters(self):
+        """First row succeeds, second fails with non-429 error."""
+        mock_module, mock_client, ApiError = self._patch_mc()
+        err = ApiError("Bad request")
+        err.status_code = 400
+        mock_client.lists.set_list_member.side_effect = [None, err]
+        rows = [
+            _make_eligible_row("ok@x.com", ["upcoming_registrants"]),
+            _make_eligible_row("fail@x.com", ["likely_registrants"]),
+        ]
+        with patch.dict(sys.modules, {
+            "mailchimp_marketing": mock_module,
+            "mailchimp_marketing.api_client": mock_module.api_client,
+        }):
+            ctrs = self._run(rows)
+
+        assert ctrs.activation_rows_api_upserted == 1
+        assert ctrs.activation_rows_api_failed == 1

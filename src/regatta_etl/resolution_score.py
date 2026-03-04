@@ -327,6 +327,7 @@ def _score_entity_type(
             ctrs.nbas_written += nba_count
         except Exception as exc:
             conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+            conn.execute(f"RELEASE SAVEPOINT {sp}")
             ctrs.db_errors += 1
             ctrs.warnings.append(f"{entity_type} pk={pk}: {exc}")
 

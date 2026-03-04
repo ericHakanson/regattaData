@@ -149,40 +149,264 @@ def _build_full_name(first_raw: str | None, last_raw: str | None) -> str | None:
     return " ".join(parts) if parts else None
 
 
-def _resolve_or_insert_participant(
+def _get_participant_corroboration_data(
     conn: psycopg.Connection,
-    first_raw: str | None,
-    last_raw: str | None,
-    email_norm: str,
-    counters: RunCounters,
-) -> str:
-    """Resolve participant via email → name → insert.
+    participant_id: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Return (normalized_full_name, phone_norm, address_raw) for a participant."""
+    name_row = conn.execute(
+        "SELECT normalized_full_name FROM participant WHERE id = %s",
+        (participant_id,),
+    ).fetchone()
+    phone_row = conn.execute(
+        """
+        SELECT contact_value_normalized FROM participant_contact_point
+        WHERE participant_id = %s AND contact_type = 'phone' LIMIT 1
+        """,
+        (participant_id,),
+    ).fetchone()
+    addr_row = conn.execute(
+        "SELECT address_raw FROM participant_address WHERE participant_id = %s LIMIT 1",
+        (participant_id,),
+    ).fetchone()
+    return (
+        name_row[0] if name_row else None,
+        phone_row[0] if phone_row else None,
+        addr_row[0] if addr_row else None,
+    )
 
-    Raises AmbiguousMatchError on ambiguous email or name match.
-    Uses the email address as the full_name placeholder when no name columns
-    are present, satisfying the participant.full_name NOT NULL constraint.
+
+def _insert_identity_review_queue(
+    conn: psycopg.Connection,
+    source_file_name: str,
+    email_norm: str | None,
+    candidate_participant_id: str | None,
+    reason_code: str,
+    reason_detail: str | None,
+    raw_payload: str,
+) -> None:
+    """Insert a quarantine row into mailchimp_identity_review_queue."""
+    conn.execute(
+        """
+        INSERT INTO mailchimp_identity_review_queue
+            (source_file_name, email_normalized, candidate_participant_id,
+             reason_code, reason_detail, raw_payload)
+        VALUES (%s, %s, %s::uuid, %s, %s, %s::jsonb)
+        """,
+        (source_file_name, email_norm, candidate_participant_id,
+         reason_code, reason_detail, raw_payload),
+    )
+
+
+def _strict_resolve_participant(
+    conn: psycopg.Connection,
+    row: dict[str, str],
+    email_norm: str,
+    source_file_name: str,
+    audience_status: str,
+    raw_payload: str,
+    counters: RunCounters,
+    rejects: RejectWriter,
+) -> str | None:
+    """Resolve participant per Policy v2 strict identity rules.
+
+    Returns participant_id on success, or None if the row was quarantined or
+    rejected.  On quarantine: inserts a review-queue row, writes to the reject
+    file, and increments the quarantine / rejection counters.  On
+    name-fallback ambiguous match: writes to reject file only (not a review
+    queue case).
     """
-    # Step 1: email lookup
-    pid = _resolve_participant_by_email(conn, email_norm)
+    def _quarantine(pid: str | None, reason_code: str, reason_detail: str | None) -> None:
+        _insert_identity_review_queue(
+            conn, source_file_name, email_norm, pid,
+            reason_code, reason_detail, raw_payload,
+        )
+        rejects.write(
+            {**row, "_source_file": source_file_name,
+             "_audience_status": audience_status},
+            reason_code,
+        )
+        counters.mailchimp_identity_rows_quarantined += 1
+        counters.rows_rejected += 1
+
+    # ------------------------------------------------------------------ A
+    # Email lookup
+    # ------------------------------------------------------------------ A
+    try:
+        pid = _resolve_participant_by_email(conn, email_norm)
+    except AmbiguousMatchError:
+        _quarantine(None, "ambiguous_email_match",
+                    f"email {email_norm!r} maps to multiple participants")
+        return None
+
     if pid is not None:
+        # -------------------------------------------------------------- B
+        # Name corroboration (required when email matched)
+        # -------------------------------------------------------------- B
+        target_name, target_phone, target_address = _get_participant_corroboration_data(
+            conn, pid
+        )
+        source_first = trim(row.get("First Name"))
+        source_last = trim(row.get("Last Name"))
+        source_full = _build_full_name(source_first, source_last)
+        source_name_norm = normalize_name(source_full) if source_full else None
+
+        if source_name_norm is None or target_name is None:
+            _quarantine(
+                pid, "missing_name_for_email_match",
+                f"source_has_name={source_name_norm is not None}, "
+                f"target_has_name={target_name is not None}",
+            )
+            return None
+
+        if source_name_norm != target_name:
+            _quarantine(
+                pid, "email_name_mismatch",
+                f"source={source_name_norm!r}, target={target_name!r}",
+            )
+            return None
+
+        # -------------------------------------------------------------- C
+        # Optional corroboration: phone
+        # -------------------------------------------------------------- C
+        source_phone_raw = trim(row.get("Phone Number"))
+        if source_phone_raw and target_phone:
+            source_phone_norm = normalize_phone(source_phone_raw)
+            if source_phone_norm and source_phone_norm != target_phone:
+                _quarantine(
+                    pid, "email_phone_mismatch",
+                    f"source={source_phone_norm!r}, target={target_phone!r}",
+                )
+                return None
+
+        # -------------------------------------------------------------- D
+        # Optional corroboration: address
+        # -------------------------------------------------------------- D
+        source_address = trim(row.get("Address"))
+        if source_address and target_address:
+            if source_address != target_address:
+                _quarantine(
+                    pid, "email_address_mismatch",
+                    f"source={source_address!r}, target={target_address!r}",
+                )
+                return None
+
+        # All checks passed — link to existing participant
         counters.participants_matched_existing += 1
         return pid
 
-    # Step 2: name lookup (only when name is available)
-    full_name = _build_full_name(first_raw, last_raw)
+    # ------------------------------------------------------------------ E
+    # No email match — fall through to name lookup or create new
+    # ------------------------------------------------------------------ E
+    source_first = trim(row.get("First Name"))
+    source_last = trim(row.get("Last Name"))
+    full_name = _build_full_name(source_first, source_last)
+
     if full_name:
         name_norm = normalize_name(full_name)
         if name_norm:
-            pid = _resolve_participant_by_name_strict(conn, name_norm)
-            if pid is not None:
+            try:
+                name_pid = _resolve_participant_by_name_strict(conn, name_norm)
+            except AmbiguousMatchError:
+                # Name-only ambiguity: row-level reject only (not a review-queue case)
+                rejects.write(
+                    {**row, "_source_file": source_file_name,
+                     "_audience_status": audience_status},
+                    "ambiguous_name_match",
+                )
+                counters.rows_rejected += 1
+                return None
+            if name_pid is not None:
                 counters.participants_matched_existing += 1
-                return pid
+                return name_pid
 
-    # Step 3: insert new participant
     display_name = full_name or email_norm  # email as fallback for name-absent rows
-    pid = insert_participant(conn, display_name)
+    new_pid = insert_participant(conn, display_name)
     counters.participants_inserted += 1
-    return pid
+    return new_pid
+
+
+def _upsert_mailchimp_identity(
+    conn: psycopg.Connection,
+    participant_id: str,
+    email_norm: str,
+    leid: str | None,
+    euid: str | None,
+    source_file_name: str,
+    raw_payload: str,
+    counters: RunCounters,
+) -> None:
+    """Upsert participant_mailchimp_identity when LEID or EUID is present.
+
+    Checks for cross-participant LEID/EUID conflicts before upserting.
+    Conflict rows are inserted into the review queue; the upsert is skipped.
+    Curated state/tag writes are not affected by an identity conflict here.
+    """
+    if not leid and not euid:
+        return
+
+    # Check LEID conflict
+    if leid:
+        conflict = conn.execute(
+            """
+            SELECT participant_id FROM participant_mailchimp_identity
+            WHERE leid = %s AND participant_id != %s::uuid
+            """,
+            (leid, participant_id),
+        ).fetchone()
+        if conflict:
+            _insert_identity_review_queue(
+                conn, source_file_name, email_norm, participant_id,
+                "leid_conflict",
+                f"leid={leid!r} already linked to participant {conflict[0]}",
+                raw_payload,
+            )
+            counters.mailchimp_identity_conflicts += 1
+            return
+
+    # Check EUID conflict
+    if euid:
+        conflict = conn.execute(
+            """
+            SELECT participant_id FROM participant_mailchimp_identity
+            WHERE euid = %s AND participant_id != %s::uuid
+            """,
+            (euid, participant_id),
+        ).fetchone()
+        if conflict:
+            _insert_identity_review_queue(
+                conn, source_file_name, email_norm, participant_id,
+                "euid_conflict",
+                f"euid={euid!r} already linked to participant {conflict[0]}",
+                raw_payload,
+            )
+            counters.mailchimp_identity_conflicts += 1
+            return
+
+    import hashlib as _hashlib
+    subscriber_hash = _hashlib.md5(email_norm.encode()).hexdigest()
+
+    result = conn.execute(
+        """
+        INSERT INTO participant_mailchimp_identity
+            (participant_id, leid, euid, subscriber_hash, email_normalized,
+             source_system, source_file_name)
+        VALUES (%s::uuid, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (participant_id, email_normalized) DO UPDATE SET
+            last_seen_at    = now(),
+            leid            = COALESCE(participant_mailchimp_identity.leid, EXCLUDED.leid),
+            euid            = COALESCE(participant_mailchimp_identity.euid, EXCLUDED.euid),
+            subscriber_hash = COALESCE(participant_mailchimp_identity.subscriber_hash,
+                                       EXCLUDED.subscriber_hash)
+        RETURNING (xmax = 0) AS was_inserted
+        """,
+        (participant_id, leid, euid, subscriber_hash, email_norm,
+         SOURCE_SYSTEM, source_file_name),
+    ).fetchone()
+    if result and result[0]:
+        counters.mailchimp_identity_links_inserted += 1
+    elif result:
+        counters.mailchimp_identity_links_updated += 1
 
 
 # ---------------------------------------------------------------------------
@@ -384,8 +608,9 @@ def _process_row(
       2. Lossless raw capture — always, even for rows that will be rejected.
       3. Email presence + format validation (reject if invalid).
       4. Status datetime validation (reject if present but unparseable).
-      5. Participant resolution.
-      6-10. Contact points, address, state, tags.
+      5. Strict identity resolution (Policy v2): quarantine on mismatch.
+      6. Upsert participant_mailchimp_identity if LEID/EUID present.
+      7-11. Contact points, address, state, tags.
     """
     counters.rows_read += 1
 
@@ -441,37 +666,48 @@ def _process_row(
         counters.rows_rejected += 1
         return
 
-    # Step 5: participant resolution (may raise AmbiguousMatchError)
-    participant_id = _resolve_or_insert_participant(
-        conn,
-        row.get("First Name"),
-        row.get("Last Name"),
+    # Step 5: strict identity resolution per Policy v2
+    # On quarantine: review queue row inserted + reject written + counter incremented;
+    # returns None so we skip curated writes.
+    participant_id = _strict_resolve_participant(
+        conn, row,
         email_norm,  # type: ignore[arg-type]  # validated non-null above
-        counters,
+        source_file_name, audience_status, raw_payload, counters, rejects,
     )
+    if participant_id is None:
+        return  # quarantined or ambiguous-name reject; raw capture persists
 
-    # Step 6: contact point — email
+    # Step 6: upsert identity link when LEID or EUID is present
+    leid = trim(row.get("LEID"))
+    euid = trim(row.get("EUID"))
+    if leid or euid:
+        _upsert_mailchimp_identity(
+            conn, participant_id, email_norm,  # type: ignore[arg-type]
+            leid, euid, source_file_name, raw_payload, counters,
+        )
+
+    # Step 7: contact point — email
     _upsert_email_contact_point(conn, participant_id, email_raw, email_norm, counters)  # type: ignore[arg-type]
 
-    # Step 7: contact point — phone (optional)
+    # Step 8: contact point — phone (optional)
     phone_raw = trim(row.get("Phone Number"))
     if phone_raw:
         phone_norm = normalize_phone(phone_raw)
         if phone_norm:
             _upsert_phone_contact_point(conn, participant_id, phone_raw, phone_norm, counters)
 
-    # Step 8: address (raw only, optional)
+    # Step 9: address (raw only, optional)
     address_raw = trim(row.get("Address"))
     if address_raw:
         _upsert_address(conn, participant_id, address_raw, counters)
 
-    # Step 9: mailchimp_contact_state (append-only, idempotent by row_hash)
+    # Step 10: mailchimp_contact_state (append-only, idempotent by row_hash)
     _insert_mailchimp_state(
         conn, participant_id, email_norm, audience_status,  # type: ignore[arg-type]
         row, status_at, source_file_name, row_hash, counters,
     )
 
-    # Step 10: tags
+    # Step 11: tags
     tags = parse_tags(row.get("TAGS"))
     if tags:
         _insert_mailchimp_tags(
@@ -667,8 +903,12 @@ def _run_mailchimp_audience(
     click.echo(
         f"[{run_id}] Done: {counters.rows_read} rows read, "
         f"{counters.rows_rejected} rejected, "
+        f"{counters.mailchimp_identity_rows_quarantined} identity-quarantined, "
+        f"{counters.mailchimp_identity_conflicts} identity-conflicts, "
         f"{counters.participants_inserted} participants inserted, "
         f"{counters.participants_matched_existing} matched, "
+        f"{counters.mailchimp_identity_links_inserted} identity-links-inserted, "
+        f"{counters.mailchimp_identity_links_updated} identity-links-updated, "
         f"{counters.mailchimp_status_rows_inserted} state rows inserted, "
         f"{counters.mailchimp_tags_inserted} tags inserted"
     )

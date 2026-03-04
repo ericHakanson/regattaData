@@ -159,6 +159,12 @@ class RunCounters:
     activation_rows_exported_csv: int = 0
     activation_rows_api_upserted: int = 0
     activation_rows_api_failed: int = 0
+    # Mailchimp strict identity policy counters
+    mailchimp_identity_rows_quarantined: int = 0
+    mailchimp_identity_conflicts: int = 0
+    mailchimp_identity_links_inserted: int = 0
+    mailchimp_identity_links_updated: int = 0
+    mailchimp_contact_id_conflicts: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -242,6 +248,11 @@ class RunCounters:
             "activation_rows_exported_csv": self.activation_rows_exported_csv,
             "activation_rows_api_upserted": self.activation_rows_api_upserted,
             "activation_rows_api_failed": self.activation_rows_api_failed,
+            "mailchimp_identity_rows_quarantined": self.mailchimp_identity_rows_quarantined,
+            "mailchimp_identity_conflicts": self.mailchimp_identity_conflicts,
+            "mailchimp_identity_links_inserted": self.mailchimp_identity_links_inserted,
+            "mailchimp_identity_links_updated": self.mailchimp_identity_links_updated,
+            "mailchimp_contact_id_conflicts": self.mailchimp_contact_id_conflicts,
             "warnings": self.warnings,
         }
 

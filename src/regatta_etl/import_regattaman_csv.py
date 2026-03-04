@@ -845,11 +845,13 @@ def main(
             counters,
         )
         click.echo(f"[{run_id}] Run report: {report_path}")
-        if counters.db_phase_errors > 0 and not dry_run:
-            click.echo(
-                f"[{run_id}] {counters.db_phase_errors} DB error(s) — exiting non-zero",
-                err=True,
-            )
+        if not dry_run and (counters.db_phase_errors > 0 or counters.activation_rows_api_failed > 0):
+            parts = []
+            if counters.db_phase_errors > 0:
+                parts.append(f"{counters.db_phase_errors} DB error(s)")
+            if counters.activation_rows_api_failed > 0:
+                parts.append(f"{counters.activation_rows_api_failed} API delivery failure(s)")
+            click.echo(f"[{run_id}] {', '.join(parts)} — exiting non-zero", err=True)
             sys.exit(1)
         return
     elif mode == "jotform_waiver":

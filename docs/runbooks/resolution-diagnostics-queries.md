@@ -177,12 +177,19 @@ ORDER BY 1, 3 DESC;
 
 ## Usage
 
-Run **before** applying new YAML and scoring to establish baseline:
+Copy individual query blocks and run them in `psql` or your SQL client.  To run
+a single block non-interactively, save it to a `.sql` file first:
 
 ```bash
-psql "$DB_DSN" -f docs/runbooks/resolution-diagnostics-queries.md
+# Example: save state-count query to a file, then run it
+psql "$DB_DSN" -f /tmp/state_counts.sql
 ```
 
-Run **after** `resolution_score --entity-type all` to confirm expected transitions.
+Run the **state counts** and **score distribution** queries **before** applying
+new YAML policy and rescoring to capture a baseline snapshot.
 
-Run **after** `resolution_promote --entity-type all` to confirm canonical rows.
+Run **after** `resolution_score --entity-type all` to confirm expected state
+transitions and check `would_enter_auto_promote` counts drop to zero.
+
+Run **after** `resolution_promote --entity-type all` to confirm canonical row
+counts in query 5.
