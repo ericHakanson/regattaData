@@ -1,13 +1,36 @@
 entity_type: participant
 source_system: "regattaman_csv_export|regattaman_public_scrape_csv|mailchimp_audience_csv|jotform_waiver_csv|airtable_copy_csv|yacht_scoring_csv"
-version: "v1.0.0"
+version: "v1.1.0"
+
+# v1.1.0 changes (promotion-enable):
+#   auto_promote lowered from 0.90 → 0.75.
+#   review    lowered from 0.75 → 0.50.
+#   hold      lowered from 0.50 → 0.25.
+#
+# Rationale: email is the strongest identity signal (weight 0.55); corroborated
+# by phone (weight 0.20) it reaches a combined score of 0.75 with no penalties,
+# providing sufficient confidence for promotion.  Under v1.0.0 (auto_promote=0.90)
+# these participants were unreachably stuck in 'review'.
+#
+# Risk tradeoffs:
+#   - Participants with email alone score 0.50 after missing_phone penalty (0.55 - 0.05).
+#     Under the new thresholds they enter 'review', not auto_promote — deliberate.
+#     Adding a phone enrichment NBA will guide operators toward the missing signal.
+#   - Name-only participants score ≈ 0 (0.10 - 0.10 - 0.05 ≈ -0.05, clamped to 0.00)
+#     and remain in 'reject', preserving protection against false merges on common names.
+#   - hard_blocks (conflicting_dob, conflicting_high_confidence_email) unchanged.
+#
+# State-machine note: participants currently in 'review' (email+phone score = 0.75)
+# transition review → auto_promote, which is trigger-safe.
+# The scoring engine's staged-transition path handles any candidate that ends up
+# in 'reject' state but scores ≥ 0.75 (e.g. a manually rejected participant
+# subsequently enriched), routing them reject → review → auto_promote.
 
 # Score thresholds for resolution_state routing.
-# Scores are cumulative feature weights minus missing-attribute penalties.
 thresholds:
-  auto_promote: 0.90
-  review: 0.75
-  hold: 0.50
+  auto_promote: 0.75
+  review: 0.50
+  hold: 0.25
 
 # Feature weights: each feature is a boolean detected by the scoring pipeline.
 # Weights sum to 1.0 for a fully-attributed participant.

@@ -37,6 +37,7 @@ MIGRATIONS = [
     PROJECT_ROOT / "migrations" / "0016_lineage_coverage.sql",
     PROJECT_ROOT / "migrations" / "0017_index_additions.sql",
     PROJECT_ROOT / "migrations" / "0018_bhyc_member_directory_tables.sql",
+    PROJECT_ROOT / "migrations" / "0019_mailchimp_activation_tables.sql",
 ]
 
 # ---------------------------------------------------------------------------

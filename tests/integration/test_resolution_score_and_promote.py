@@ -548,3 +548,273 @@ class TestCandidatePromotion:
             "SELECT is_promoted FROM candidate_participant WHERE id = %s", (cid,)
         ).fetchone()
         assert row[0] is False
+
+
+# ---------------------------------------------------------------------------
+# Staged-transition safety tests (§6.1) — reject → auto_promote without abort
+# ---------------------------------------------------------------------------
+
+class TestStagedTransitionSafety:
+    """Verify that the scoring engine stages reject→review→auto_promote rather
+    than attempting a single forbidden direct transition that would abort the
+    whole transaction via the DB trigger enforce_candidate_state_transition().
+    """
+
+    def test_reject_to_auto_promote_staged_no_abort(self, db_conn):
+        """A fully-attributed participant forcibly set to 'reject' must reach
+        'auto_promote' after rescoring without any db_errors or transaction
+        abort, and state_transitions_staged must be incremented.
+        """
+        conn, dsn = db_conn
+        # Insert a fully-attributed participant (email+phone+dob+name → score 1.0)
+        cid = _insert_candidate_participant(conn)
+        # Default resolution_state is 'hold'; going to 'reject' is trigger-safe
+        conn.execute(
+            "UPDATE candidate_participant SET resolution_state = 'reject' WHERE id = %s",
+            (cid,),
+        )
+        # Verify the forced state
+        state_before = conn.execute(
+            "SELECT resolution_state FROM candidate_participant WHERE id = %s", (cid,)
+        ).fetchone()[0]
+        assert state_before == "reject"
+
+        # Run scoring — must not abort even though it targets 'auto_promote' from 'reject'
+        ctrs = run_score(conn, entity_type="participant")
+        assert ctrs.db_errors == 0, f"Expected no db_errors; got {ctrs.db_errors}: {ctrs.warnings}"
+        assert ctrs.state_transitions_staged >= 1
+
+        row = conn.execute(
+            "SELECT resolution_state, quality_score FROM candidate_participant WHERE id = %s",
+            (cid,),
+        ).fetchone()
+        assert row[0] == "auto_promote"
+        assert float(row[1]) == pytest.approx(1.0, abs=0.001)
+
+    def test_non_reject_to_auto_promote_no_staging(self, db_conn):
+        """A candidate starting from 'hold' or 'review' must reach 'auto_promote'
+        without incrementing state_transitions_staged (no staging needed).
+        """
+        conn, dsn = db_conn
+        cid = _insert_candidate_participant(conn)
+        # Default state is 'hold'; scoring should go directly to 'auto_promote'
+        ctrs = run_score(conn, entity_type="participant")
+        assert ctrs.db_errors == 0
+        assert ctrs.state_transitions_staged == 0
+
+        row = conn.execute(
+            "SELECT resolution_state FROM candidate_participant WHERE id = %s", (cid,)
+        ).fetchone()
+        assert row[0] == "auto_promote"
+
+    def test_reject_staging_does_not_leave_candidate_in_review(self, db_conn):
+        """After staged transition, final state must be 'auto_promote', not 'review'."""
+        conn, dsn = db_conn
+        cid = _insert_candidate_participant(conn)
+        conn.execute(
+            "UPDATE candidate_participant SET resolution_state = 'reject' WHERE id = %s",
+            (cid,),
+        )
+        run_score(conn, entity_type="participant")
+        row = conn.execute(
+            "SELECT resolution_state FROM candidate_participant WHERE id = %s", (cid,)
+        ).fetchone()
+        assert row[0] == "auto_promote", "Staged transition must complete fully to auto_promote"
+
+    def test_staged_candidate_promotes_to_canonical(self, db_conn):
+        """A candidate that needed a staged transition must still be promotable."""
+        conn, dsn = db_conn
+        cid = _insert_candidate_participant(conn)
+        conn.execute(
+            "UPDATE candidate_participant SET resolution_state = 'reject' WHERE id = %s",
+            (cid,),
+        )
+        run_score(conn, entity_type="participant")
+        ctrs = run_promote(conn, entity_type="participant")
+        assert ctrs.db_errors == 0
+        assert ctrs.candidates_promoted >= 1
+        row = conn.execute(
+            "SELECT is_promoted FROM candidate_participant WHERE id = %s", (cid,)
+        ).fetchone()
+        assert row[0] is True
+
+
+# ---------------------------------------------------------------------------
+# v1.1.0 YAML policy promotion tests (§6.2 + §5)
+# Test boundary cases: name-only club, email+phone participant, sail+name yacht
+# ---------------------------------------------------------------------------
+
+class TestV110PolicyPromotion:
+    """Verify that the updated v1.1.0 YAML thresholds enable auto_promote and
+    canonical row creation for club, participant, and yacht.
+    """
+
+    def test_club_name_only_scores_auto_promote(self, db_conn):
+        """Club with only normalized_name scores 0.45 (0.50 - 0.05 penalty)
+        which meets the v1.1.0 auto_promote threshold of 0.45.
+        """
+        conn, dsn = db_conn
+        # Insert club with name only (no website, state, phone)
+        cid = _insert_candidate_club(conn, website=None, state_usa=None, phone=None)
+        ctrs = run_score(conn, entity_type="club")
+        assert ctrs.db_errors == 0
+        row = conn.execute(
+            "SELECT quality_score, resolution_state FROM candidate_club WHERE id = %s",
+            (cid,),
+        ).fetchone()
+        # name(0.50) - missing_website(0.05) = 0.45 → auto_promote at v1.1.0 threshold
+        assert float(row[0]) == pytest.approx(0.45, abs=0.001)
+        assert row[1] == "auto_promote"
+
+    def test_club_name_only_promotes_to_canonical(self, db_conn):
+        """Name-only club must create a canonical_club row under v1.1.0."""
+        conn, dsn = db_conn
+        cid = _insert_candidate_club(conn, website=None, state_usa=None, phone=None)
+        run_score(conn, entity_type="club")
+        ctrs = run_promote(conn, entity_type="club")
+        assert ctrs.db_errors == 0
+        assert ctrs.candidates_promoted >= 1
+        row = conn.execute(
+            "SELECT is_promoted, promoted_canonical_id FROM candidate_club WHERE id = %s",
+            (cid,),
+        ).fetchone()
+        assert row[0] is True
+        assert row[1] is not None
+        # Canonical row exists
+        can = conn.execute(
+            "SELECT normalized_name FROM canonical_club WHERE id = %s",
+            (str(row[1]),),
+        ).fetchone()
+        assert can is not None
+        assert can[0] == "bhyc"
+
+    def test_participant_email_phone_scores_auto_promote(self, db_conn):
+        """Participant with email+phone+name (no DOB) scores 0.85 → auto_promote at v1.1.0."""
+        conn, dsn = db_conn
+        # Helper default includes normalized_name="john-doe", so we get name(0.10) too
+        cid = _insert_candidate_participant(conn, date_of_birth=None)
+        ctrs = run_score(conn, entity_type="participant")
+        assert ctrs.db_errors == 0
+        row = conn.execute(
+            "SELECT quality_score, resolution_state FROM candidate_participant WHERE id = %s",
+            (cid,),
+        ).fetchone()
+        # email(0.55) + phone(0.20) + name(0.10) = 0.85 → auto_promote at v1.1.0 threshold (0.75)
+        assert float(row[0]) == pytest.approx(0.85, abs=0.001)
+        assert row[1] == "auto_promote"
+
+    def test_participant_email_phone_promotes_to_canonical(self, db_conn):
+        """email+phone participant must create a canonical_participant row."""
+        conn, dsn = db_conn
+        cid = _insert_candidate_participant(conn, date_of_birth=None)
+        run_score(conn, entity_type="participant")
+        ctrs = run_promote(conn, entity_type="participant")
+        assert ctrs.db_errors == 0
+        assert ctrs.candidates_promoted >= 1
+        row = conn.execute(
+            "SELECT is_promoted, promoted_canonical_id FROM candidate_participant WHERE id = %s",
+            (cid,),
+        ).fetchone()
+        assert row[0] is True
+        can = conn.execute(
+            "SELECT best_email FROM canonical_participant WHERE id = %s",
+            (str(row[1]),),
+        ).fetchone()
+        assert can is not None
+        assert can[0] == "john@example.com"
+
+    def test_yacht_sail_name_scores_auto_promote(self, db_conn):
+        """Yacht with sail number + name (no type/length) scores 0.80 → auto_promote at v1.1.0."""
+        conn, dsn = db_conn
+        # No yacht_type, no length_feet
+        cid = _insert_candidate_yacht(conn, yacht_type=None, length_feet=None)
+        ctrs = run_score(conn, entity_type="yacht")
+        assert ctrs.db_errors == 0
+        row = conn.execute(
+            "SELECT quality_score, resolution_state FROM candidate_yacht WHERE id = %s",
+            (cid,),
+        ).fetchone()
+        # sail(0.50) + name(0.30) = 0.80, no penalties (sail+name both present)
+        assert float(row[0]) == pytest.approx(0.80, abs=0.001)
+        assert row[1] == "auto_promote"
+
+    def test_yacht_sail_name_promotes_to_canonical(self, db_conn):
+        """sail+name yacht must create a canonical_yacht row."""
+        conn, dsn = db_conn
+        cid = _insert_candidate_yacht(conn, yacht_type=None, length_feet=None)
+        run_score(conn, entity_type="yacht")
+        ctrs = run_promote(conn, entity_type="yacht")
+        assert ctrs.db_errors == 0
+        assert ctrs.candidates_promoted >= 1
+        row = conn.execute(
+            "SELECT is_promoted, promoted_canonical_id FROM candidate_yacht WHERE id = %s",
+            (cid,),
+        ).fetchone()
+        assert row[0] is True
+        can = conn.execute(
+            "SELECT normalized_name, normalized_sail_number FROM canonical_yacht WHERE id = %s",
+            (str(row[1]),),
+        ).fetchone()
+        assert can is not None
+        assert can[0] == "sea-legs"
+        assert can[1] == "usa-1234"
+
+    def test_new_auto_promote_counters_populated(self, db_conn):
+        """new_auto_promote_* counters must reflect candidates newly entering auto_promote."""
+        conn, dsn = db_conn
+        _insert_candidate_club(conn, website=None, state_usa=None, phone=None)
+        _insert_candidate_participant(conn, date_of_birth=None)
+        _insert_candidate_yacht(conn, yacht_type=None, length_feet=None)
+        ctrs = run_score(conn, entity_type="all")
+        assert ctrs.db_errors == 0
+        assert ctrs.new_auto_promote_club >= 1
+        assert ctrs.new_auto_promote_participant >= 1
+        assert ctrs.new_auto_promote_yacht >= 1
+
+    def test_all_three_entity_types_promote_end_to_end(self, db_conn):
+        """Full end-to-end: score + promote all three previously-blocked entity types."""
+        conn, dsn = db_conn
+        _insert_candidate_club(conn, website=None, state_usa=None, phone=None)
+        _insert_candidate_participant(conn, date_of_birth=None)
+        _insert_candidate_yacht(conn, yacht_type=None, length_feet=None)
+
+        score_ctrs = run_score(conn, entity_type="all")
+        assert score_ctrs.db_errors == 0
+
+        promote_ctrs = run_promote(conn, entity_type="all")
+        assert promote_ctrs.db_errors == 0
+        assert promote_ctrs.candidates_promoted >= 3
+
+        can_club = conn.execute("SELECT COUNT(*) FROM canonical_club").fetchone()[0]
+        can_part = conn.execute("SELECT COUNT(*) FROM canonical_participant").fetchone()[0]
+        can_yacht = conn.execute("SELECT COUNT(*) FROM canonical_yacht").fetchone()[0]
+        assert can_club >= 1
+        assert can_part >= 1
+        assert can_yacht >= 1
+
+    def test_participant_email_only_stays_review(self, db_conn):
+        """Participant with email+name (no phone, no DOB) stays 'review', not auto_promote."""
+        conn, dsn = db_conn
+        # Helper default includes normalized_name="john-doe"
+        cid = _insert_candidate_participant(conn, best_phone=None, date_of_birth=None)
+        run_score(conn, entity_type="participant")
+        row = conn.execute(
+            "SELECT quality_score, resolution_state FROM candidate_participant WHERE id = %s",
+            (cid,),
+        ).fetchone()
+        # email(0.55) + name(0.10) - missing_phone(0.05) = 0.60 → review at v1.1.0 thresholds
+        assert float(row[0]) == pytest.approx(0.60, abs=0.001)
+        assert row[1] == "review"
+
+    def test_yacht_sail_only_stays_hold(self, db_conn):
+        """Yacht with sail only (score 0.30 after missing_name penalty) stays 'hold'."""
+        conn, dsn = db_conn
+        cid = _insert_candidate_yacht(conn, normalized_name=None, yacht_type=None, length_feet=None)
+        run_score(conn, entity_type="yacht")
+        row = conn.execute(
+            "SELECT quality_score, resolution_state FROM candidate_yacht WHERE id = %s",
+            (cid,),
+        ).fetchone()
+        # sail(0.50) - missing_name(0.20) = 0.30 → hold at v1.1.0 thresholds
+        assert float(row[0]) == pytest.approx(0.30, abs=0.001)
+        assert row[1] == "hold"

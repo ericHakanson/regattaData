@@ -32,8 +32,8 @@ def _insert_candidate_participant(
     conn: psycopg.Connection,
     *,
     normalized_name: str | None = "jane-doe",
-    best_email: str | None = "jane.doe@example.test",  # email+phone → score=0.85 → review state
-    best_phone: str | None = "+12025551234",
+    best_email: str | None = "jane.doe@example.test",  # email+name (no phone) → score=0.60 → review
+    best_phone: str | None = None,
     date_of_birth: str | None = None,
 ) -> str:
     fp = _fp(normalized_name or "", (best_email or "").lower())

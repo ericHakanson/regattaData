@@ -1,11 +1,38 @@
 entity_type: yacht
 source_system: "regattaman_csv_export|regattaman_public_scrape_csv|airtable_copy_csv|yacht_scoring_csv"
-version: "v1.0.0"
+version: "v1.1.0"
+
+# v1.1.0 changes (promotion-enable):
+#   auto_promote lowered from 0.95 → 0.75.
+#   review    lowered from 0.75 → 0.50.
+#   hold      lowered from 0.50 → 0.25.
+#
+# Rationale: sail number is the strongest yacht identity anchor (weight 0.50);
+# corroborated by normalized name (weight 0.30) it reaches a combined score of
+# 0.80 with no penalties applied (sail present → no missing_sail_number penalty;
+# name present → no missing_name penalty).  This score clearly clears the new
+# auto_promote threshold of 0.75.
+#
+# Under v1.0.0 (auto_promote=0.95) these sail+name yachts were stranded in
+# 'review' despite being unambiguously identified.
+#
+# Risk tradeoffs:
+#   - Sail-only yachts: 0.50 - 0.20 (missing_name) = 0.30 → 'hold' under new rules.
+#     They receive NBA to add a name before auto_promote is possible.
+#   - Name-only yachts: 0.30 - 0.15 (missing_sail) = 0.15 → 'reject' under new rules.
+#     Name alone is insufficient for confident deduplication across race sources.
+#   - hard_block (conflicting_sail_number_same_name) unchanged; such yachts remain
+#     at score=0/state=reject regardless of threshold.
+#
+# State-machine note: yachts currently in 'review' (sail+name score = 0.80)
+# transition review → auto_promote, which is trigger-safe.
+# The scoring engine's staged-transition path handles any yacht in 'reject' that
+# newly scores ≥ 0.75 after enrichment, routing it reject → review → auto_promote.
 
 thresholds:
-  auto_promote: 0.95
-  review: 0.75
-  hold: 0.50
+  auto_promote: 0.75
+  review: 0.50
+  hold: 0.25
 
 # Feature weights: sum to 1.0 for a fully-attributed yacht.
 feature_weights:

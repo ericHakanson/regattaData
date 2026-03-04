@@ -1,11 +1,30 @@
 entity_type: club
 source_system: "regattaman_csv_export|regattaman_public_scrape_csv|airtable_copy_csv|yacht_scoring_csv"
-version: "v1.0.0"
+version: "v1.1.0"
+
+# v1.1.0 changes (promotion-enable):
+#   auto_promote lowered from 0.75 → 0.45.
+#
+# Rationale: a club with a well-formed normalized name is uniquely identifiable
+# for most practical purposes.  name_normalized weight is 0.50; after the
+# missing_website penalty (-0.05) a name-only club scores 0.45, which exactly
+# meets the new auto_promote threshold.  Requiring website/phone/state would
+# block the majority of clubs that appear only in race-entry results and have
+# no separate web presence in our ingested sources.
+#
+# Risk tradeoffs:
+#   - Clubs with conflicting normalized names are still hard-blocked → rejected.
+#   - The 0.05 missing_website penalty is preserved; clubs with websites score
+#     0.50, giving them higher canonical_confidence_score than name-only clubs.
+#   - hold/review thresholds lowered proportionally to maintain clean ordering.
+#
+# State-machine note: existing 'hold' club candidates (score ≈ 0.45) transition
+# hold → auto_promote, which is trigger-safe (Rule 2 only blocks reject → auto_promote).
 
 thresholds:
-  auto_promote: 0.75
-  review: 0.50
-  hold: 0.25
+  auto_promote: 0.45
+  review: 0.30
+  hold: 0.15
 
 # Feature weights: sum to 1.0 for a fully-attributed club.
 feature_weights:

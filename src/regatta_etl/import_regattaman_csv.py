@@ -424,7 +424,8 @@ def _process_row(
     default="private_export",
     type=click.Choice([
         "private_export", "public_scrape", "jotform_waiver",
-        "mailchimp_audience", "airtable_copy", "yacht_scoring",
+        "mailchimp_audience", "mailchimp_event_activation",
+        "airtable_copy", "yacht_scoring",
         "bhyc_member_directory",
         "resolution_source_to_candidate", "resolution_score", "resolution_promote",
         "resolution_manual_apply", "resolution_lifecycle",
@@ -475,6 +476,45 @@ def _process_row(
 @click.option("--subscribed-path", default=None, type=click.Path(), help="[mailchimp_audience] Subscribed audience CSV")
 @click.option("--unsubscribed-path", default=None, type=click.Path(), help="[mailchimp_audience] Unsubscribed audience CSV")
 @click.option("--cleaned-path", default=None, type=click.Path(), help="[mailchimp_audience] Cleaned audience CSV")
+# mailchimp_event_activation flags
+@click.option(
+    "--event-window-days",
+    default=45,
+    type=int,
+    show_default=True,
+    help="[mailchimp_event_activation] Days forward from today to search for upcoming events",
+)
+@click.option(
+    "--segment-type",
+    default="all",
+    type=click.Choice(["upcoming_registrants", "likely_registrants", "all"]),
+    show_default=True,
+    help="[mailchimp_event_activation] Audience segment(s) to include",
+)
+@click.option(
+    "--delivery-mode",
+    default="csv",
+    type=click.Choice(["csv", "api"]),
+    show_default=True,
+    help="[mailchimp_event_activation] Delivery target: csv file or Mailchimp API",
+)
+@click.option(
+    "--output-path",
+    default=None,
+    type=click.Path(),
+    help="[mailchimp_event_activation] Output CSV file path (required for csv delivery mode)",
+)
+@click.option(
+    "--mailchimp-list-id",
+    default=None,
+    help="[mailchimp_event_activation] Mailchimp audience/list ID (required for api delivery mode)",
+)
+@click.option(
+    "--mailchimp-api-key-env",
+    default="MAILCHIMP_API_KEY",
+    show_default=True,
+    help="[mailchimp_event_activation] Env var name holding the Mailchimp API key",
+)
 @click.option(
     "--event-unresolved-link-max-reject-rate",
     default=0.05,
@@ -589,6 +629,13 @@ def main(
     subscribed_path: str | None,
     unsubscribed_path: str | None,
     cleaned_path: str | None,
+    # mailchimp_event_activation
+    event_window_days: int,
+    segment_type: str,
+    delivery_mode: str,
+    output_path: str | None,
+    mailchimp_list_id: str | None,
+    mailchimp_api_key_env: str,
     # shared
     dry_run: bool,
     rejects_path: str,
@@ -754,6 +801,57 @@ def main(
             max_reject_rate=max_reject_rate,
             dry_run=dry_run,
         )
+    elif mode == "mailchimp_event_activation":
+        _validate_mailchimp_event_activation_flags(
+            delivery_mode, output_path, mailchimp_list_id, mailchimp_api_key_env, run_id
+        )
+        from regatta_etl.import_mailchimp_event_activation import (
+            build_activation_report,
+            run_mailchimp_event_activation,
+        )
+        click.echo(
+            f"[{run_id}] mailchimp_event_activation "
+            f"segment_type={segment_type} delivery_mode={delivery_mode} "
+            f"window_days={event_window_days} dry_run={dry_run}"
+        )
+        api_key = os.environ.get(mailchimp_api_key_env) if delivery_mode == "api" else None
+        try:
+            run_mailchimp_event_activation(
+                run_id,
+                started_at,
+                db_dsn,
+                counters,
+                event_window_days=event_window_days,
+                segment_type=segment_type,
+                delivery_mode=delivery_mode,
+                output_path=output_path,
+                mailchimp_list_id=mailchimp_list_id,
+                mailchimp_api_key=api_key,
+                dry_run=dry_run,
+            )
+        except Exception as exc:
+            click.echo(f"[{run_id}] FATAL: {exc}", err=True)
+            sys.exit(1)
+        report = build_activation_report(counters, dry_run=dry_run)
+        click.echo(report)
+        report_path = write_run_report(
+            run_id, started_at, mode, dry_run,
+            {
+                "segment_type": segment_type,
+                "delivery_mode": delivery_mode,
+                "event_window_days": event_window_days,
+                "output_path": output_path,
+            },
+            counters,
+        )
+        click.echo(f"[{run_id}] Run report: {report_path}")
+        if counters.db_phase_errors > 0 and not dry_run:
+            click.echo(
+                f"[{run_id}] {counters.db_phase_errors} DB error(s) — exiting non-zero",
+                err=True,
+            )
+            sys.exit(1)
+        return
     elif mode == "jotform_waiver":
         from regatta_etl.import_jotform_waiver import _run_jotform_waiver
         _validate_jotform_waiver_flags(
@@ -1198,6 +1296,35 @@ def _validate_mailchimp_audience_flags(
             err=True,
         )
         sys.exit(1)
+
+
+def _validate_mailchimp_event_activation_flags(
+    delivery_mode: str,
+    output_path: str | None,
+    mailchimp_list_id: str | None,
+    mailchimp_api_key_env: str,
+    run_id: str,
+) -> None:
+    if delivery_mode == "csv" and not output_path:
+        click.echo(
+            f"[{run_id}] FATAL: mailchimp_event_activation csv mode requires: --output-path",
+            err=True,
+        )
+        sys.exit(1)
+    if delivery_mode == "api":
+        if not mailchimp_list_id:
+            click.echo(
+                f"[{run_id}] FATAL: mailchimp_event_activation api mode requires: --mailchimp-list-id",
+                err=True,
+            )
+            sys.exit(1)
+        if not os.environ.get(mailchimp_api_key_env):
+            click.echo(
+                f"[{run_id}] FATAL: mailchimp_event_activation api mode requires "
+                f"env var {mailchimp_api_key_env!r} to be set",
+                err=True,
+            )
+            sys.exit(1)
 
 
 def _validate_airtable_copy_flags(

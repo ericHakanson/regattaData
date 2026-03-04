@@ -150,6 +150,15 @@ class RunCounters:
     bhyc_parse_errors: int = 0
     bhyc_rate_limit_hits: int = 0
     bhyc_safe_stop_reason: str | None = None
+    # Mailchimp event-activation counters
+    activation_rows_considered: int = 0
+    activation_rows_eligible: int = 0
+    activation_rows_suppressed_unsubscribed: int = 0
+    activation_rows_suppressed_cleaned: int = 0
+    activation_rows_deduped_out: int = 0
+    activation_rows_exported_csv: int = 0
+    activation_rows_api_upserted: int = 0
+    activation_rows_api_failed: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -225,6 +234,14 @@ class RunCounters:
             "bhyc_parse_errors": self.bhyc_parse_errors,
             "bhyc_rate_limit_hits": self.bhyc_rate_limit_hits,
             "bhyc_safe_stop_reason": self.bhyc_safe_stop_reason,
+            "activation_rows_considered": self.activation_rows_considered,
+            "activation_rows_eligible": self.activation_rows_eligible,
+            "activation_rows_suppressed_unsubscribed": self.activation_rows_suppressed_unsubscribed,
+            "activation_rows_suppressed_cleaned": self.activation_rows_suppressed_cleaned,
+            "activation_rows_deduped_out": self.activation_rows_deduped_out,
+            "activation_rows_exported_csv": self.activation_rows_exported_csv,
+            "activation_rows_api_upserted": self.activation_rows_api_upserted,
+            "activation_rows_api_failed": self.activation_rows_api_failed,
             "warnings": self.warnings,
         }
 

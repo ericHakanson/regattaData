@@ -282,3 +282,49 @@ class TestScoreCounters:
         ctrs = ScoreCounters()
         assert ctrs.nbas_written == 0
         assert ctrs.to_dict()["nbas_written"] == 0
+
+    # ------------------------------------------------------------------
+    # New counter fields (§6.4 — staged/capped transitions + entity counts)
+    # ------------------------------------------------------------------
+
+    def test_new_counter_fields_default_zero(self):
+        ctrs = ScoreCounters()
+        assert ctrs.state_transitions_staged == 0
+        assert ctrs.state_transitions_capped == 0
+        assert ctrs.new_auto_promote_club == 0
+        assert ctrs.new_auto_promote_participant == 0
+        assert ctrs.new_auto_promote_yacht == 0
+
+    def test_new_counter_fields_in_to_dict(self):
+        ctrs = ScoreCounters(
+            state_transitions_staged=3,
+            state_transitions_capped=1,
+            new_auto_promote_club=2,
+            new_auto_promote_participant=5,
+            new_auto_promote_yacht=4,
+        )
+        d = ctrs.to_dict()
+        assert d["state_transitions_staged"] == 3
+        assert d["state_transitions_capped"] == 1
+        assert d["new_auto_promote_club"] == 2
+        assert d["new_auto_promote_participant"] == 5
+        assert d["new_auto_promote_yacht"] == 4
+
+    def test_to_dict_includes_all_expected_keys(self):
+        expected_keys = {
+            "candidates_scored",
+            "candidates_auto_promote",
+            "candidates_review",
+            "candidates_hold",
+            "candidates_rejected",
+            "nbas_written",
+            "state_transitions_staged",
+            "state_transitions_capped",
+            "new_auto_promote_club",
+            "new_auto_promote_participant",
+            "new_auto_promote_yacht",
+            "db_errors",
+            "warnings",
+        }
+        d = ScoreCounters().to_dict()
+        assert expected_keys <= set(d.keys())

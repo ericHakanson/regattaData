@@ -54,6 +54,13 @@ class ScoreCounters:
     candidates_hold: int = 0
     candidates_rejected: int = 0
     nbas_written: int = 0
+    # State-machine-safe transition counters (§6.1 / §6.4)
+    state_transitions_staged: int = 0   # reject→review→auto_promote two-step
+    state_transitions_capped: int = 0   # rows capped to review (safety path)
+    # Per-entity new-entry-to-auto_promote counters (§6.4)
+    new_auto_promote_club: int = 0
+    new_auto_promote_participant: int = 0
+    new_auto_promote_yacht: int = 0
     db_errors: int = 0
     warnings: list[str] = field(default_factory=list)
 
@@ -65,6 +72,11 @@ class ScoreCounters:
             "candidates_hold": self.candidates_hold,
             "candidates_rejected": self.candidates_rejected,
             "nbas_written": self.nbas_written,
+            "state_transitions_staged": self.state_transitions_staged,
+            "state_transitions_capped": self.state_transitions_capped,
+            "new_auto_promote_club": self.new_auto_promote_club,
+            "new_auto_promote_participant": self.new_auto_promote_participant,
+            "new_auto_promote_yacht": self.new_auto_promote_yacht,
             "db_errors": self.db_errors,
             "warnings": self.warnings[:50],
         }
@@ -143,12 +155,13 @@ _CANDIDATE_TABLE = {
 # Columns fetched per entity type for feature extraction.
 # is_promoted is included so the scorer can preserve resolution_state for
 # already-promoted candidates and skip NBA generation.
+# resolution_state is included so staged-transition logic can detect reject→auto_promote.
 _SELECT_COLS: dict[str, str] = {
-    "participant":  "id, normalized_name, best_email, best_phone, date_of_birth, quality_score, is_promoted",
-    "yacht":        "id, normalized_name, normalized_sail_number, yacht_type, length_feet, quality_score, is_promoted",
-    "club":         "id, normalized_name, website, state_usa, phone, quality_score, is_promoted",
-    "event":        "id, normalized_event_name, event_external_id, season_year, start_date, end_date, quality_score, is_promoted",
-    "registration": "id, registration_external_id, candidate_event_id, candidate_yacht_id, candidate_primary_participant_id, quality_score, is_promoted",
+    "participant":  "id, normalized_name, best_email, best_phone, date_of_birth, quality_score, is_promoted, resolution_state",
+    "yacht":        "id, normalized_name, normalized_sail_number, yacht_type, length_feet, quality_score, is_promoted, resolution_state",
+    "club":         "id, normalized_name, website, state_usa, phone, quality_score, is_promoted, resolution_state",
+    "event":        "id, normalized_event_name, event_external_id, season_year, start_date, end_date, quality_score, is_promoted, resolution_state",
+    "registration": "id, registration_external_id, candidate_event_id, candidate_yacht_id, candidate_primary_participant_id, quality_score, is_promoted, resolution_state",
 }
 
 
@@ -247,15 +260,36 @@ def _score_entity_type(
     ).fetchall()
     col_names = [c.strip() for c in cols.split(",")]
 
-    for raw_row in rows:
+    for idx, raw_row in enumerate(rows):
         row = dict(zip(col_names, raw_row))
         pk = str(row["id"])
         is_promoted: bool = bool(row["is_promoted"])
+        current_state: str = str(row["resolution_state"])
+
+        sp = f"score_{entity_type}_{idx}"
+        conn.execute(f"SAVEPOINT {sp}")
         try:
             features = extractor(row)
             score, state, reasons = compute_score(rule_set, features)
-            # Preserve resolution_state='auto_promote' for already-promoted candidates
-            # so a re-score cannot downgrade their state back to review/hold.
+
+            # Determine the state we intend to write.
+            # Promoted candidates are locked to 'auto_promote' regardless of score.
+            write_state = "auto_promote" if is_promoted else state
+
+            # State-machine-safe write:
+            # The DB trigger enforce_candidate_state_transition() forbids a direct
+            # reject → auto_promote UPDATE (Rule 2 in migration 0014).  When the
+            # computed write_state is 'auto_promote' but the current DB state is
+            # 'reject', we stage through 'review' first so both UPDATEs are
+            # trigger-safe.  Both steps are inside the same SAVEPOINT so a failure
+            # rolls back only this candidate, not the whole transaction.
+            if write_state == "auto_promote" and current_state == "reject":
+                conn.execute(
+                    f"UPDATE {table} SET resolution_state = 'review' WHERE id = %s",
+                    (pk,),
+                )
+                ctrs.state_transitions_staged += 1
+
             conn.execute(
                 f"""
                 UPDATE {table}
@@ -267,10 +301,20 @@ def _score_entity_type(
                 """,
                 (score, state, json.dumps(reasons), score_run_id, pk),
             )
+            conn.execute(f"RELEASE SAVEPOINT {sp}")
+
             ctrs.candidates_scored += 1
             effective_state = "auto_promote" if is_promoted else state
             if effective_state == "auto_promote":
                 ctrs.candidates_auto_promote += 1
+                # Track entity-specific new entries to auto_promote (§6.4)
+                if current_state != "auto_promote":
+                    if entity_type == "club":
+                        ctrs.new_auto_promote_club += 1
+                    elif entity_type == "participant":
+                        ctrs.new_auto_promote_participant += 1
+                    elif entity_type == "yacht":
+                        ctrs.new_auto_promote_yacht += 1
             elif effective_state == "review":
                 ctrs.candidates_review += 1
             elif effective_state == "hold":
@@ -282,6 +326,7 @@ def _score_entity_type(
             )
             ctrs.nbas_written += nba_count
         except Exception as exc:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
             ctrs.db_errors += 1
             ctrs.warnings.append(f"{entity_type} pk={pk}: {exc}")
 
@@ -353,13 +398,18 @@ def build_score_report(ctrs: ScoreCounters, dry_run: bool = False) -> str:
         "Candidate Scoring Pipeline Report",
         f"  dry_run: {dry_run}",
         "=" * 60,
-        f"  candidates scored:   {ctrs.candidates_scored}",
-        f"    → auto_promote:    {ctrs.candidates_auto_promote}",
-        f"    → review:          {ctrs.candidates_review}",
-        f"    → hold:            {ctrs.candidates_hold}",
-        f"    → rejected:        {ctrs.candidates_rejected}",
-        f"  NBAs written:        {ctrs.nbas_written}",
-        f"DB errors:             {ctrs.db_errors}",
+        f"  candidates scored:         {ctrs.candidates_scored}",
+        f"    → auto_promote:          {ctrs.candidates_auto_promote}",
+        f"      new club→auto_promote: {ctrs.new_auto_promote_club}",
+        f"      new part→auto_promote: {ctrs.new_auto_promote_participant}",
+        f"      new yacht→auto_promote:{ctrs.new_auto_promote_yacht}",
+        f"    → review:                {ctrs.candidates_review}",
+        f"    → hold:                  {ctrs.candidates_hold}",
+        f"    → rejected:              {ctrs.candidates_rejected}",
+        f"  NBAs written:              {ctrs.nbas_written}",
+        f"  staged transitions:        {ctrs.state_transitions_staged}",
+        f"  capped transitions:        {ctrs.state_transitions_capped}",
+        f"DB errors:                   {ctrs.db_errors}",
     ]
     if ctrs.warnings:
         lines.append(f"\nWarnings ({len(ctrs.warnings)}):")

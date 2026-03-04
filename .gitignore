@@ -2,6 +2,7 @@
 .env
 .env.local
 /env
+env.*
 
 # Supabase
 .supabase/
@@ -17,6 +18,14 @@ artifacts/rejects/*
 !artifacts/rejects/.gitkeep
 artifacts/reports/*
 !artifacts/reports/.gitkeep
+artifacts/qa/*
+!artifacts/qa/.gitkeep
+artifacts/exports/*
+!artifacts/exports/.gitkeep
+
+# Migration smoke logs
+migrations/tests/logs/*
+!migrations/tests/logs/.gitkeep
 
 # Python
 __pycache__/
@@ -24,3 +33,9 @@ __pycache__/
 *.egg-info/
 .venv/
 dist/
+
+# Local credential material
+*.pem
+*.p12
+*.key
+*.crt

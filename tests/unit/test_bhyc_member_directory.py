@@ -468,6 +468,54 @@ class TestParseProfileHtml3Col:
         assert hh[0]["name"] == "Alice Smith"
         assert hh[0]["relationship"] == "spouse"
 
+    def test_household_empty_in_row_falls_through_to_sibling_table(self):
+        """An Other Members row with an empty value cell must not block Strategy 1.
+
+        Enough profile rows are included so that the <body> element's text length
+        exceeds 60 characters and is not mistaken for the household header.
+        """
+        html = (
+            "<html><body>"
+            # Table 1: main profile — Other Members cell is empty
+            "<table>"
+            "<tr><td>Name</td><td>Primary Person</td></tr>"
+            "<tr><td>Email</td><td>primary@example.com</td></tr>"
+            "<tr><td>Home Phone</td><td>(207) 555-1234</td></tr>"
+            "<tr><td>Other Members</td><td></td></tr>"
+            "</table>"
+            # Strategy 1 header + sibling table with actual household data
+            "<h3>Household Members</h3>"
+            "<table>"
+            "<tr><td>Sibling Person</td><td>Child</td></tr>"
+            "</table>"
+            "</body></html>"
+        )
+        data, _ = parse_profile_html(html)
+        hh = data["household"]
+        assert len(hh) == 1, f"expected 1 member from sibling table, got {hh}"
+        assert hh[0]["name"] == "Sibling Person"
+        assert hh[0]["relationship"] == "child"
+
+    def test_household_no_space_hyphen_degrades_gracefully(self):
+        """No-space 'Name-Relationship' (no whitespace around hyphen) is not the
+        primary format.  _HYPHEN_SEP_RE requires \\s+ on both sides so it does not
+        split.  However, _REL_RE still recognises the relationship keyword at the
+        word boundary created by the hyphen; the full text is preserved as name.
+        Critically: no crash occurs and exactly one entry is returned."""
+        html = (
+            "<html><body><table>"
+            "<tr><td>Other Members</td><td>AliceSmith-Spouse</td></tr>"
+            "</table></body></html>"
+        )
+        data, _ = parse_profile_html(html)
+        hh = data["household"]
+        # Must not crash; one entry returned
+        assert len(hh) == 1
+        # Relationship keyword is found via word boundary at the hyphen
+        assert hh[0]["relationship"] == "spouse"
+        # Full text (with '-Spouse' suffix) is preserved as name
+        assert hh[0]["name"] == "AliceSmith-Spouse"
+
 
 # ---------------------------------------------------------------------------
 # parse_vcard_text
