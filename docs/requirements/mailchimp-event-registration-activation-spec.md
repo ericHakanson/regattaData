@@ -219,6 +219,7 @@ Run report must include:
 ## 19. Operational Safety References
 1. Pre-send runbook checklist: `docs/runbooks/09-mailchimp-pre-send-checklist.md`
 2. Production safety requirements: `docs/requirements/mailchimp-production-send-safety-requirements.md`
+3. Strict identity + participant Mailchimp ID policy: `docs/requirements/mailchimp-strict-identity-and-contact-id-policy-spec.md`
 
 ## 20. Claude Implementation Checklist
 - [ ] Add activation tables migration.

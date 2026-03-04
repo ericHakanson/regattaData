@@ -11,6 +11,10 @@ Primary goals:
 2. Upsert participant/contact data with safe entity resolution (merge/create appropriately).
 3. Keep reruns idempotent and auditable.
 
+Policy note:
+1. Strict identity behavior for production is governed by `docs/requirements/mailchimp-strict-identity-and-contact-id-policy-spec.md`.
+2. Where this document conflicts with that policy, the strict policy takes precedence.
+
 ## Baseline Profile (Current Files)
 1. `subscribed`: 889 rows, 21 columns.
 2. `unsubscribed`: 70 rows, 25 columns.
