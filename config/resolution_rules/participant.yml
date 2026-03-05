@@ -28,7 +28,7 @@ version: "v1.1.0"
 
 # Score thresholds for resolution_state routing.
 thresholds:
-  auto_promote: 0.75
+  auto_promote: 0.60
   review: 0.50
   hold: 0.25
 

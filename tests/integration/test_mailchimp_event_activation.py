@@ -1,7 +1,7 @@
 """Integration tests for mailchimp_event_activation pipeline.
 
 Requires a live PostgreSQL instance (via pytest-postgresql).
-The db_conn fixture applies all migrations (including 0019) before each test.
+The db_conn fixture applies all migrations (including 0019, 0020) before each test.
 """
 
 from __future__ import annotations
@@ -14,7 +14,12 @@ from pathlib import Path
 import pytest
 import psycopg
 
+import sys
+from unittest.mock import MagicMock, patch
+
 from regatta_etl.import_mailchimp_event_activation import (
+    _AudienceRow,
+    _api_upsert,
     _check_dependencies,
     _insert_activation_rows,
     _insert_activation_run,
@@ -22,7 +27,6 @@ from regatta_etl.import_mailchimp_event_activation import (
     _query_likely_registrants,
     _query_upcoming_registrants,
     _update_activation_run,
-    _AudienceRow,
     run_mailchimp_event_activation,
 )
 from regatta_etl.shared import RunCounters
@@ -490,3 +494,120 @@ class TestRunMailchimpEventActivation:
         emails = {r["email"] for r in rows}
         assert "upcoming_only@x.com" in emails
         assert "likely_only@x.com" not in emails
+
+
+# ---------------------------------------------------------------------------
+# API identity persistence integration tests
+# ---------------------------------------------------------------------------
+
+def _make_audience_row(pid: str, email: str) -> _AudienceRow:
+    return _AudienceRow(
+        email_normalized=email,
+        participant_id=pid,
+        first_name="Test",
+        last_name="Sailor",
+        display_name="Test Sailor",
+        segment_types=["upcoming_registrants"],
+        upcoming_event_count=1,
+        historical_registration_count=1,
+        is_suppressed=False,
+        suppression_reason=None,
+        yacht_name=None,
+        last_registered_event_name=None,
+        generated_at="2026-01-01T00:00:00+00:00",
+    )
+
+
+def _build_mock_mc(unique_email_id: str = "UID-001"):
+    """Return a sys.modules patch dict that mocks mailchimp_marketing."""
+    mock_response = MagicMock()
+    mock_response.unique_email_id = unique_email_id
+
+    mock_lists = MagicMock()
+    mock_lists.set_list_member.return_value = mock_response
+
+    mock_client_instance = MagicMock()
+    mock_client_instance.lists = mock_lists
+
+    mock_mc = MagicMock()
+    mock_mc.Client.return_value = mock_client_instance
+
+    mock_api_client = MagicMock()
+    mock_api_client.ApiClientError = Exception
+
+    return {"mailchimp_marketing": mock_mc, "mailchimp_marketing.api_client": mock_api_client}
+
+
+class TestApiIdentityPersistence:
+    """Identity link persistence for API-mode activation."""
+
+    def test_api_contact_id_persisted_on_success(self, db_conn):
+        """Successful API call persists unique_email_id into participant_mailchimp_identity."""
+        conn, _dsn = db_conn
+
+        pid = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO participant (id, full_name, normalized_full_name) "
+            "VALUES (%s, 'Api Sailor', 'api sailor')",
+            (pid,),
+        )
+        conn.commit()
+
+        row = _make_audience_row(pid, "api@example.com")
+        ctrs = RunCounters()
+
+        with patch.dict(sys.modules, _build_mock_mc("CONTACT-ABC")):
+            _api_upsert([row], "list-id", "fake-api-key-us6", ctrs, conn=conn)
+
+        assert ctrs.activation_rows_api_upserted == 1
+        assert ctrs.activation_rows_api_failed == 0
+        assert ctrs.mailchimp_identity_links_inserted == 1
+
+        links = conn.execute(
+            "SELECT mailchimp_contact_id FROM participant_mailchimp_identity "
+            "WHERE participant_id = %s::uuid",
+            (pid,),
+        ).fetchall()
+        assert len(links) == 1
+        assert links[0][0] == "CONTACT-ABC"
+
+    def test_api_contact_id_conflict_fails_row(self, db_conn):
+        """contact_id already linked to P1; API returns same ID for P2 → row fails, queue row."""
+        conn, _dsn = db_conn
+
+        pid1 = str(uuid.uuid4())
+        pid2 = str(uuid.uuid4())
+        for pid, name in [(pid1, "Sailor One"), (pid2, "Sailor Two")]:
+            conn.execute(
+                "INSERT INTO participant (id, full_name, normalized_full_name) "
+                "VALUES (%s, %s, %s)",
+                (pid, name, name.lower()),
+            )
+        # Pre-link CONTACT-SHARED to pid1
+        conn.execute(
+            """
+            INSERT INTO participant_mailchimp_identity
+                (participant_id, mailchimp_contact_id, email_normalized, source_system)
+            VALUES (%s::uuid, %s, %s, 'test')
+            """,
+            (pid1, "CONTACT-SHARED", "sailor1@example.com"),
+        )
+        conn.commit()
+
+        row = _make_audience_row(pid2, "sailor2@example.com")
+        ctrs = RunCounters()
+
+        with patch.dict(sys.modules, _build_mock_mc("CONTACT-SHARED")):
+            _api_upsert([row], "list-id", "fake-api-key-us6", ctrs, conn=conn)
+
+        assert ctrs.activation_rows_api_upserted == 0
+        assert ctrs.activation_rows_api_failed == 1
+        assert ctrs.mailchimp_contact_id_conflicts == 1
+        assert ctrs.mailchimp_identity_conflicts == 1
+
+        # Review queue row inserted
+        queue = conn.execute(
+            "SELECT reason_code FROM mailchimp_identity_review_queue"
+        ).fetchall()
+        assert len(queue) == 1
+        assert queue[0][0] == "mailchimp_contact_id_conflict"
