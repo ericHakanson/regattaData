@@ -284,7 +284,11 @@ def _strict_resolve_participant(
         # -------------------------------------------------------------- D
         source_address = trim(row.get("Address"))
         if source_address and target_address:
-            if source_address != target_address:
+            # Normalize casing and whitespace before comparing to avoid
+            # over-quarantining benign formatting differences.
+            src_addr_norm = " ".join(source_address.lower().split())
+            tgt_addr_norm = " ".join(target_address.lower().split())
+            if src_addr_norm != tgt_addr_norm:
                 _quarantine(
                     pid, "email_address_mismatch",
                     f"source={source_address!r}, target={target_address!r}",
@@ -338,50 +342,77 @@ def _upsert_mailchimp_identity(
 ) -> None:
     """Upsert participant_mailchimp_identity when LEID or EUID is present.
 
-    Checks for cross-participant LEID/EUID conflicts before upserting.
-    Conflict rows are inserted into the review queue; the upsert is skipped.
-    Curated state/tag writes are not affected by an identity conflict here.
+    Cross-participant conflict behaviour (LEID/EUID already belong to a different
+    participant): the conflict is queued for manual review and this function returns
+    without writing an identity row.  Curated participant/state/tag writes for the
+    current row are NOT blocked — LEID/EUID are auxiliary IDs, not primary identity
+    evidence.  The strict corroboration gate (_strict_resolve_participant) already
+    governs whether the row may be linked at all; this function only manages the
+    auxiliary identity bookkeeping after that gate has passed.
+
+    Same-participant/different-email case (LEID or EUID already captured on a
+    different email row for the same participant): the conflicting auxiliary ID is
+    suppressed (set to NULL) on the new row to avoid hitting the partial unique
+    index.  No conflict is queued.
     """
     if not leid and not euid:
         return
 
-    # Check LEID conflict
+    # Check LEID uniqueness.
+    # Three cases when a matching LEID row already exists:
+    #   1. Different participant → true cross-participant conflict: queue + abort.
+    #   2. Same participant, same email → ON CONFLICT update below handles it.
+    #   3. Same participant, different email → LEID is already recorded; suppress
+    #      it on this new email's row to avoid hitting the partial unique index.
     if leid:
-        conflict = conn.execute(
+        existing = conn.execute(
             """
-            SELECT participant_id FROM participant_mailchimp_identity
-            WHERE leid = %s AND participant_id != %s::uuid
+            SELECT participant_id::text, email_normalized
+            FROM participant_mailchimp_identity
+            WHERE leid = %s
             """,
-            (leid, participant_id),
+            (leid,),
         ).fetchone()
-        if conflict:
-            _insert_identity_review_queue(
-                conn, source_file_name, email_norm, participant_id,
-                "leid_conflict",
-                f"leid={leid!r} already linked to participant {conflict[0]}",
-                raw_payload,
-            )
-            counters.mailchimp_identity_conflicts += 1
-            return
+        if existing:
+            if existing[0] != participant_id:
+                # Cross-participant conflict
+                _insert_identity_review_queue(
+                    conn, source_file_name, email_norm, participant_id,
+                    "leid_conflict",
+                    f"leid={leid!r} already linked to participant {existing[0]}",
+                    raw_payload,
+                )
+                counters.mailchimp_identity_conflicts += 1
+                return
+            elif existing[1] != email_norm:
+                # Same participant, different email — LEID already captured; don't
+                # duplicate it on the new email row (would violate partial unique index).
+                leid = None
 
-    # Check EUID conflict
+    # Check EUID uniqueness (same three-case logic as LEID above).
     if euid:
-        conflict = conn.execute(
+        existing = conn.execute(
             """
-            SELECT participant_id FROM participant_mailchimp_identity
-            WHERE euid = %s AND participant_id != %s::uuid
+            SELECT participant_id::text, email_normalized
+            FROM participant_mailchimp_identity
+            WHERE euid = %s
             """,
-            (euid, participant_id),
+            (euid,),
         ).fetchone()
-        if conflict:
-            _insert_identity_review_queue(
-                conn, source_file_name, email_norm, participant_id,
-                "euid_conflict",
-                f"euid={euid!r} already linked to participant {conflict[0]}",
-                raw_payload,
-            )
-            counters.mailchimp_identity_conflicts += 1
-            return
+        if existing:
+            if existing[0] != participant_id:
+                # Cross-participant conflict
+                _insert_identity_review_queue(
+                    conn, source_file_name, email_norm, participant_id,
+                    "euid_conflict",
+                    f"euid={euid!r} already linked to participant {existing[0]}",
+                    raw_payload,
+                )
+                counters.mailchimp_identity_conflicts += 1
+                return
+            elif existing[1] != email_norm:
+                # Same participant, different email — EUID already captured.
+                euid = None
 
     import hashlib as _hashlib
     subscriber_hash = _hashlib.md5(email_norm.encode()).hexdigest()

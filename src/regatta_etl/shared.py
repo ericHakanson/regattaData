@@ -165,6 +165,19 @@ class RunCounters:
     mailchimp_identity_links_inserted: int = 0
     mailchimp_identity_links_updated: int = 0
     mailchimp_contact_id_conflicts: int = 0
+    # RocketReach enrichment counters
+    rocketreach_candidates_considered: int = 0
+    rocketreach_candidates_called: int = 0
+    rocketreach_matches_applied: int = 0
+    rocketreach_no_match: int = 0
+    rocketreach_ambiguous: int = 0
+    rocketreach_api_errors: int = 0
+    rocketreach_rate_limited: int = 0
+    rocketreach_fields_enriched: int = 0
+    rocketreach_source_links_inserted: int = 0
+    rocketreach_lookup_credits_used: int = 0
+    rocketreach_status_polls: int = 0
+    rocketreach_non_terminal_timeouts: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -253,6 +266,18 @@ class RunCounters:
             "mailchimp_identity_links_inserted": self.mailchimp_identity_links_inserted,
             "mailchimp_identity_links_updated": self.mailchimp_identity_links_updated,
             "mailchimp_contact_id_conflicts": self.mailchimp_contact_id_conflicts,
+            "rocketreach_candidates_considered": self.rocketreach_candidates_considered,
+            "rocketreach_candidates_called": self.rocketreach_candidates_called,
+            "rocketreach_matches_applied": self.rocketreach_matches_applied,
+            "rocketreach_no_match": self.rocketreach_no_match,
+            "rocketreach_ambiguous": self.rocketreach_ambiguous,
+            "rocketreach_api_errors": self.rocketreach_api_errors,
+            "rocketreach_rate_limited": self.rocketreach_rate_limited,
+            "rocketreach_fields_enriched": self.rocketreach_fields_enriched,
+            "rocketreach_source_links_inserted": self.rocketreach_source_links_inserted,
+            "rocketreach_lookup_credits_used": self.rocketreach_lookup_credits_used,
+            "rocketreach_status_polls": self.rocketreach_status_polls,
+            "rocketreach_non_terminal_timeouts": self.rocketreach_non_terminal_timeouts,
             "warnings": self.warnings,
         }
 

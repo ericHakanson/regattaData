@@ -518,10 +518,18 @@ def _make_audience_row(pid: str, email: str) -> _AudienceRow:
     )
 
 
-def _build_mock_mc(unique_email_id: str = "UID-001"):
-    """Return a sys.modules patch dict that mocks mailchimp_marketing."""
-    mock_response = MagicMock()
-    mock_response.unique_email_id = unique_email_id
+def _build_mock_mc(unique_email_id: str = "UID-001", *, as_dict: bool = True):
+    """Return a sys.modules patch dict that mocks mailchimp_marketing.
+
+    ``as_dict=True`` (default) returns a plain dict response, matching the
+    actual mailchimp_marketing library behaviour.  ``as_dict=False`` uses a
+    MagicMock object to exercise the attribute-access fallback path.
+    """
+    if as_dict:
+        mock_response = {"unique_email_id": unique_email_id, "id": unique_email_id}
+    else:
+        mock_response = MagicMock()
+        mock_response.unique_email_id = unique_email_id
 
     mock_lists = MagicMock()
     mock_lists.set_list_member.return_value = mock_response
@@ -556,7 +564,8 @@ class TestApiIdentityPersistence:
         row = _make_audience_row(pid, "api@example.com")
         ctrs = RunCounters()
 
-        with patch.dict(sys.modules, _build_mock_mc("CONTACT-ABC")):
+        # as_dict=True mirrors actual mailchimp_marketing dict response
+        with patch.dict(sys.modules, _build_mock_mc("CONTACT-ABC", as_dict=True)):
             _api_upsert([row], "list-id", "fake-api-key-us6", ctrs, conn=conn)
 
         assert ctrs.activation_rows_api_upserted == 1
@@ -570,6 +579,34 @@ class TestApiIdentityPersistence:
         ).fetchall()
         assert len(links) == 1
         assert links[0][0] == "CONTACT-ABC"
+
+    def test_api_contact_id_persisted_object_response(self, db_conn):
+        """Attribute-style response (as_dict=False) also persists contact ID."""
+        conn, _dsn = db_conn
+
+        pid = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO participant (id, full_name, normalized_full_name) "
+            "VALUES (%s, 'Attr Sailor', 'attr sailor')",
+            (pid,),
+        )
+        conn.commit()
+
+        row = _make_audience_row(pid, "attr@example.com")
+        ctrs = RunCounters()
+
+        with patch.dict(sys.modules, _build_mock_mc("CONTACT-OBJ", as_dict=False)):
+            _api_upsert([row], "list-id", "fake-api-key-us6", ctrs, conn=conn)
+
+        assert ctrs.activation_rows_api_upserted == 1
+        assert ctrs.mailchimp_identity_links_inserted == 1
+
+        row_db = conn.execute(
+            "SELECT mailchimp_contact_id FROM participant_mailchimp_identity "
+            "WHERE participant_id = %s::uuid",
+            (pid,),
+        ).fetchone()
+        assert row_db[0] == "CONTACT-OBJ"
 
     def test_api_contact_id_conflict_fails_row(self, db_conn):
         """contact_id already linked to P1; API returns same ID for P2 → row fails, queue row."""
@@ -611,3 +648,53 @@ class TestApiIdentityPersistence:
         ).fetchall()
         assert len(queue) == 1
         assert queue[0][0] == "mailchimp_contact_id_conflict"
+
+    def test_api_contact_id_same_participant_second_email_no_index_crash(self, db_conn):
+        """Same participant processed under a second email with the same contact ID.
+
+        mailchimp_contact_id is globally unique (partial index).  If the same
+        participant already has the contact ID on email1's row, processing email2
+        must not crash: the contact ID is suppressed on the second row.
+        """
+        conn, _dsn = db_conn
+
+        pid = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO participant (id, full_name, normalized_full_name) "
+            "VALUES (%s, 'Dual Email', 'dual email')",
+            (pid,),
+        )
+        # Pre-link contact ID to pid / email1
+        conn.execute(
+            """
+            INSERT INTO participant_mailchimp_identity
+                (participant_id, mailchimp_contact_id, email_normalized, source_system)
+            VALUES (%s::uuid, %s, %s, 'test')
+            """,
+            (pid, "CONTACT-DUAL", "dual1@example.com"),
+        )
+        conn.commit()
+
+        # Activate pid under email2 — API returns the same contact ID
+        row = _make_audience_row(pid, "dual2@example.com")
+        ctrs = RunCounters()
+
+        with patch.dict(sys.modules, _build_mock_mc("CONTACT-DUAL", as_dict=True)):
+            _api_upsert([row], "list-id", "fake-api-key-us6", ctrs, conn=conn)
+
+        # Row succeeds — no crash, no conflict queue row
+        assert ctrs.activation_rows_api_upserted == 1
+        assert ctrs.activation_rows_api_failed == 0
+        assert ctrs.mailchimp_contact_id_conflicts == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM mailchimp_identity_review_queue"
+        ).fetchone()[0] == 0
+
+        # email2 row exists; contact_id is NULL (suppressed) to avoid index violation
+        row_db = conn.execute(
+            "SELECT mailchimp_contact_id FROM participant_mailchimp_identity "
+            "WHERE participant_id = %s::uuid AND email_normalized = %s",
+            (pid, "dual2@example.com"),
+        ).fetchone()
+        assert row_db is not None
+        assert row_db[0] is None  # suppressed

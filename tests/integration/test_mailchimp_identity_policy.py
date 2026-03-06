@@ -470,3 +470,89 @@ def test_no_identity_link_without_leid_or_euid(db_conn, tmp_path):
     assert conn.execute(
         "SELECT COUNT(*) FROM participant_mailchimp_identity"
     ).fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Identity link: same-participant-different-email LEID/EUID reuse
+# ---------------------------------------------------------------------------
+
+def test_same_participant_second_email_with_same_leid_no_db_error(db_conn, tmp_path):
+    """Same participant seen with a second email using the same LEID.
+
+    The LEID is already captured on the first email's identity row.  The second
+    row should not raise a unique-index violation: LEID is suppressed on the
+    new row and the upsert completes cleanly.  No conflict is queued.
+    """
+    conn, dsn = db_conn
+
+    # First run: creates participant + identity link for email1
+    ctrs1, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="same@example.com", first="Same", last="Person",
+                  leid="LEID-REUSED", euid=""),
+    ])
+    assert ctrs1.participants_inserted == 1
+    assert ctrs1.mailchimp_identity_links_inserted == 1
+
+    # Retrieve the participant_id created
+    pid = conn.execute(
+        "SELECT participant_id::text FROM participant_mailchimp_identity "
+        "WHERE leid = 'LEID-REUSED'"
+    ).fetchone()[0]
+
+    # Seed a second email contact point for the same participant so the name
+    # corroboration check can match it on re-ingestion with email2.
+    conn.execute(
+        """
+        INSERT INTO participant_contact_point
+            (participant_id, contact_type, contact_subtype,
+             contact_value_raw, contact_value_normalized, is_primary, source_system)
+        VALUES (%s::uuid, 'email', 'primary', %s, %s, false, 'test')
+        """,
+        (pid, "same2@example.com", "same2@example.com"),
+    )
+    conn.commit()
+
+    # Second run: same participant matched via email2, same LEID
+    ctrs2, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="same2@example.com", first="Same", last="Person",
+                  leid="LEID-REUSED", euid=""),
+    ])
+
+    # No DB errors, no conflict queue rows
+    assert ctrs2.db_phase_errors == 0
+    assert ctrs2.mailchimp_identity_conflicts == 0
+    assert len(_queue_rows(conn)) == 0
+
+    # A new identity row is inserted for email2 (LEID is NULL on it)
+    assert ctrs2.mailchimp_identity_links_inserted == 1
+    rows = conn.execute(
+        "SELECT email_normalized, leid FROM participant_mailchimp_identity "
+        "WHERE participant_id = %s::uuid ORDER BY email_normalized",
+        (pid,),
+    ).fetchall()
+    assert len(rows) == 2
+    emails = {r[0]: r[1] for r in rows}
+    assert emails["same@example.com"] == "LEID-REUSED"   # original row keeps LEID
+    assert emails["same2@example.com"] is None            # suppressed on second row
+
+
+# ---------------------------------------------------------------------------
+# Address mismatch: normalization prevents over-quarantine
+# ---------------------------------------------------------------------------
+
+def test_address_case_whitespace_difference_not_quarantined(db_conn, tmp_path):
+    """Same address with different casing/whitespace is treated as matching."""
+    conn, dsn = db_conn
+
+    _seed_participant(conn, name="Alice Smith", email="alice@example.com",
+                      address="1 Main St, Bar Harbor, ME 04609")
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="alice@example.com", first="Alice", last="Smith",
+                  # Extra spaces + different casing — should not quarantine
+                  address="1  Main  St,  Bar  Harbor,  ME  04609".upper()),
+    ])
+
+    assert ctrs.rows_rejected == 0
+    assert ctrs.mailchimp_identity_rows_quarantined == 0
+    assert ctrs.participants_matched_existing == 1

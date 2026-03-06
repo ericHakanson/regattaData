@@ -430,6 +430,7 @@ def _process_row(
         "resolution_source_to_candidate", "resolution_score", "resolution_promote",
         "resolution_manual_apply", "resolution_lifecycle",
         "lineage_report", "purge_check",
+        "participant_enrichment_rocketreach",
     ]),
     show_default=True,
     help="Ingestion mode",
@@ -587,6 +588,81 @@ def _process_row(
     show_default=True,
     help="[lineage_report|purge_check] Minimum %% of source rows that must be linked",
 )
+# participant_enrichment_rocketreach flags
+@click.option(
+    "--rocketreach-api-key-env",
+    default="ROCKETREACH_API_KEY",
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Env var name holding RocketReach API key",
+)
+@click.option(
+    "--max-candidates",
+    default=500,
+    type=int,
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Max candidate participants to process per run",
+)
+@click.option(
+    "--candidate-states",
+    default="review,hold,reject",
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Comma-separated resolution_state values to target",
+)
+@click.option(
+    "--require-missing",
+    default="email_or_phone",
+    type=click.Choice(["email", "phone", "email_or_phone", "none"]),
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Field(s) that must be missing for candidate to be eligible",
+)
+@click.option(
+    "--cooldown-days",
+    default=30,
+    type=int,
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Skip candidates enriched within this many days",
+)
+@click.option(
+    "--source-system-label",
+    default="rocketreach_api",
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Source-system label for provenance links",
+)
+@click.option(
+    "--timeout-seconds",
+    default=20.0,
+    type=float,
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Per-lookup timeout (seconds)",
+)
+@click.option(
+    "--max-retries",
+    default=3,
+    type=int,
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Max 429 retry attempts",
+)
+@click.option(
+    "--qps-limit",
+    default=2.0,
+    type=float,
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Max lookup requests per second",
+)
+@click.option(
+    "--rocketreach-environment",
+    default="production",
+    type=click.Choice(["production", "sandbox"]),
+    show_default=True,
+    help="[participant_enrichment_rocketreach] API environment label (informational)",
+)
+@click.option(
+    "--max-api-failure-rate",
+    default=0.10,
+    type=float,
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Warn when API failure rate exceeds this fraction",
+)
 def main(
     mode: str,
     db_dsn: str,
@@ -649,6 +725,18 @@ def main(
     lifecycle_op: str | None,
     canonical_threshold_pct: float,
     source_threshold_pct: float,
+    # participant_enrichment_rocketreach
+    rocketreach_api_key_env: str,
+    max_candidates: int,
+    candidate_states: str,
+    require_missing: str,
+    cooldown_days: int,
+    source_system_label: str,
+    timeout_seconds: float,
+    max_retries: int,
+    qps_limit: float,
+    rocketreach_environment: str,
+    max_api_failure_rate: float,
 ) -> None:
     """Unified Regattaman ingestion CLI."""
     run_id = run_id or str(uuid.uuid4())
@@ -1120,6 +1208,77 @@ def main(
             raise
         finally:
             conn.close()
+        return
+    elif mode == "participant_enrichment_rocketreach":
+        from regatta_etl.import_rocketreach_enrichment import (
+            RocketReachEnrichmentCounters,
+            build_enrichment_report,
+            run_rocketreach_enrichment,
+        )
+        api_key = os.environ.get(rocketreach_api_key_env, "")
+        if not api_key and not dry_run:
+            click.echo(
+                f"[{run_id}] FATAL: env var {rocketreach_api_key_env!r} must be set",
+                err=True,
+            )
+            sys.exit(1)
+        states = [s.strip() for s in candidate_states.split(",") if s.strip()]
+        rr_counters = RocketReachEnrichmentCounters()
+        click.echo(
+            f"[{run_id}] participant_enrichment_rocketreach "
+            f"max_candidates={max_candidates} states={states} "
+            f"require_missing={require_missing} cooldown_days={cooldown_days} "
+            f"environment={rocketreach_environment} dry_run={dry_run}"
+        )
+        conn = psycopg.connect(db_dsn, autocommit=False)
+        try:
+            run_rocketreach_enrichment(
+                conn=conn,
+                run_id=run_id,
+                api_key=api_key,
+                candidate_states=states,
+                require_missing=require_missing,
+                cooldown_days=cooldown_days,
+                max_candidates=max_candidates,
+                source_system=source_system_label,
+                timeout_seconds=timeout_seconds,
+                max_retries=max_retries,
+                qps_limit=qps_limit,
+                max_api_failure_rate=max_api_failure_rate,
+                dry_run=dry_run,
+                counters=rr_counters,
+            )
+            report = build_enrichment_report(rr_counters, dry_run=dry_run)
+            click.echo(report)
+            if dry_run or rr_counters.db_phase_errors > 0:
+                conn.rollback()
+                if dry_run:
+                    click.echo(f"[{run_id}] DRY RUN — rolled back.")
+                else:
+                    click.echo(
+                        f"[{run_id}] {rr_counters.db_phase_errors} DB errors — rolled back.",
+                        err=True,
+                    )
+                    sys.exit(1)
+            else:
+                conn.commit()
+                click.echo(f"[{run_id}] Committed.")
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        report_path = write_run_report(
+            run_id, started_at, mode, dry_run,
+            {
+                "candidate_states": states,
+                "require_missing": require_missing,
+                "max_candidates": max_candidates,
+                "environment": rocketreach_environment,
+            },
+            rr_counters,  # type: ignore[arg-type]
+        )
+        click.echo(f"[{run_id}] Run report: {report_path}")
         return
     elif mode == "purge_check":
         from regatta_etl.resolution_lineage import build_lineage_report, run_lineage_report

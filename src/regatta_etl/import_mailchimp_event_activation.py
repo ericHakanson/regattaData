@@ -574,36 +574,49 @@ def _persist_api_contact_id(
     Returns True on success, False if a cross-participant conflict is detected
     (in which case a review-queue row is inserted and ctrs are updated).
     """
-    # Check for cross-participant contact_id conflict
-    conflict = conn.execute(
+    # Check for existing row with this contact_id.
+    # Three cases (mirrors the LEID/EUID logic in _upsert_mailchimp_identity):
+    #   1. Different participant → cross-participant conflict: queue + return False.
+    #   2. Same participant, same email → ON CONFLICT below handles it (no action here).
+    #   3. Same participant, different email → contact_id already captured on that email's
+    #      row; suppress it on this row to avoid hitting the partial unique index.
+    contact_id_for_upsert = mailchimp_contact_id
+    existing = conn.execute(
         """
-        SELECT participant_id FROM participant_mailchimp_identity
-        WHERE mailchimp_contact_id = %s AND participant_id != %s::uuid
+        SELECT participant_id::text, email_normalized
+        FROM participant_mailchimp_identity
+        WHERE mailchimp_contact_id = %s
         """,
-        (mailchimp_contact_id, participant_id),
+        (mailchimp_contact_id,),
     ).fetchone()
-    if conflict:
-        conn.execute(
-            """
-            INSERT INTO mailchimp_identity_review_queue
-                (source_file_name, email_normalized, candidate_participant_id,
-                 reason_code, reason_detail, raw_payload)
-            VALUES (%s, %s, %s::uuid, %s, %s, %s::jsonb)
-            """,
-            (
-                "mailchimp_event_activation",
-                email_normalized,
-                participant_id,
-                "mailchimp_contact_id_conflict",
-                f"contact_id={mailchimp_contact_id!r} already linked to "
-                f"participant {conflict[0]}",
-                json.dumps({"mailchimp_contact_id": mailchimp_contact_id,
-                            "participant_id": participant_id}),
-            ),
-        )
-        ctrs.mailchimp_contact_id_conflicts += 1
-        ctrs.mailchimp_identity_conflicts += 1
-        return False
+    if existing:
+        if existing[0] != participant_id:
+            # Cross-participant conflict
+            conn.execute(
+                """
+                INSERT INTO mailchimp_identity_review_queue
+                    (source_file_name, email_normalized, candidate_participant_id,
+                     reason_code, reason_detail, raw_payload)
+                VALUES (%s, %s, %s::uuid, %s, %s, %s::jsonb)
+                """,
+                (
+                    "mailchimp_event_activation",
+                    email_normalized,
+                    participant_id,
+                    "mailchimp_contact_id_conflict",
+                    f"contact_id={mailchimp_contact_id!r} already linked to "
+                    f"participant {existing[0]}",
+                    json.dumps({"mailchimp_contact_id": mailchimp_contact_id,
+                                "participant_id": participant_id}),
+                ),
+            )
+            ctrs.mailchimp_contact_id_conflicts += 1
+            ctrs.mailchimp_identity_conflicts += 1
+            return False
+        elif existing[1] != email_normalized:
+            # Same participant, different email — contact_id already recorded; suppress
+            # it here to avoid a unique-index violation on the new email's row.
+            contact_id_for_upsert = None
 
     # Upsert identity link with contact ID and subscriber hash
     result = conn.execute(
@@ -620,7 +633,7 @@ def _persist_api_contact_id(
                                             EXCLUDED.subscriber_hash)
         RETURNING (xmax = 0) AS was_inserted
         """,
-        (participant_id, mailchimp_contact_id, subscriber_hash, email_normalized,
+        (participant_id, contact_id_for_upsert, subscriber_hash, email_normalized,
          "mailchimp_event_activation", "mailchimp_event_activation"),
     ).fetchone()
     if result and result[0]:
@@ -706,9 +719,14 @@ def _api_upsert(
         if not api_success:
             continue
 
-        # Persist returned contact ID when conn is available
+        # Persist returned contact ID when conn is available.
+        # mailchimp_marketing returns plain dicts, so use .get() for dicts
+        # and fall back to getattr() for any object-style response.
         if conn is not None:
-            mailchimp_contact_id = getattr(response, "unique_email_id", None)
+            if isinstance(response, dict):
+                mailchimp_contact_id = response.get("unique_email_id")
+            else:
+                mailchimp_contact_id = getattr(response, "unique_email_id", None)
             if mailchimp_contact_id:
                 ok = _persist_api_contact_id(
                     conn, row.participant_id, row.email_normalized,
