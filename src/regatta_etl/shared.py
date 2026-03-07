@@ -165,6 +165,7 @@ class RunCounters:
     mailchimp_identity_links_inserted: int = 0
     mailchimp_identity_links_updated: int = 0
     mailchimp_contact_id_conflicts: int = 0
+    mailchimp_missing_name_unique_email_accepted: int = 0
     # RocketReach enrichment counters
     rocketreach_candidates_considered: int = 0
     rocketreach_candidates_called: int = 0
@@ -266,6 +267,7 @@ class RunCounters:
             "mailchimp_identity_links_inserted": self.mailchimp_identity_links_inserted,
             "mailchimp_identity_links_updated": self.mailchimp_identity_links_updated,
             "mailchimp_contact_id_conflicts": self.mailchimp_contact_id_conflicts,
+            "mailchimp_missing_name_unique_email_accepted": self.mailchimp_missing_name_unique_email_accepted,
             "rocketreach_candidates_considered": self.rocketreach_candidates_considered,
             "rocketreach_candidates_called": self.rocketreach_candidates_called,
             "rocketreach_matches_applied": self.rocketreach_matches_applied,

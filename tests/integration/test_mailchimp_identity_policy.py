@@ -75,7 +75,8 @@ def _write_empty(path: Path) -> None:
         writer.writeheader()
 
 
-def _run(conn, dsn, tmp_path, rows, *, max_reject_rate=1.0):
+def _run(conn, dsn, tmp_path, rows, *, max_reject_rate=1.0,
+         allow_unique_email_missing_name_link=False):
     """Run the ingestion pipeline against a single set of subscribed rows."""
     sub = tmp_path / f"{uuid.uuid4()}_sub.csv"
     unsub = tmp_path / f"{uuid.uuid4()}_unsub.csv"
@@ -104,6 +105,7 @@ def _run(conn, dsn, tmp_path, rows, *, max_reject_rate=1.0):
         cleaned_path=str(clean),
         max_reject_rate=max_reject_rate,
         dry_run=False,
+        allow_unique_email_missing_name_link=allow_unique_email_missing_name_link,
     )
     return ctrs, rejects_path
 
@@ -556,3 +558,154 @@ def test_address_case_whitespace_difference_not_quarantined(db_conn, tmp_path):
     assert ctrs.rows_rejected == 0
     assert ctrs.mailchimp_identity_rows_quarantined == 0
     assert ctrs.participants_matched_existing == 1
+
+
+# ---------------------------------------------------------------------------
+# Policy v2.1 optional exception: unique email + missing source name
+# ---------------------------------------------------------------------------
+
+def test_missing_source_name_unique_email_flag_off_quarantined(db_conn, tmp_path):
+    """Flag off (default): missing source name with unique email → quarantine (existing behavior)."""
+    conn, dsn = db_conn
+
+    _seed_participant(conn, name="Alice Smith", email="alice@example.com")
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="alice@example.com", first="", last=""),
+    ], allow_unique_email_missing_name_link=False)
+
+    assert ctrs.rows_rejected == 1
+    assert ctrs.mailchimp_identity_rows_quarantined == 1
+    assert ctrs.mailchimp_missing_name_unique_email_accepted == 0
+    assert ctrs.participants_matched_existing == 0
+
+    queue = _queue_rows(conn)
+    assert len(queue) == 1
+    assert queue[0]["reason_code"] == "missing_name_for_email_match"
+
+
+def test_missing_source_name_unique_email_flag_on_accepted(db_conn, tmp_path):
+    """Flag on: missing source name with unique email → accepted; curated writes proceed."""
+    conn, dsn = db_conn
+
+    pid = _seed_participant(conn, name="Alice Smith", email="alice@example.com")
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="alice@example.com", first="", last=""),
+    ], allow_unique_email_missing_name_link=True)
+
+    assert ctrs.rows_rejected == 0
+    assert ctrs.mailchimp_identity_rows_quarantined == 0
+    assert ctrs.mailchimp_missing_name_unique_email_accepted == 1
+    assert ctrs.participants_matched_existing == 1
+
+    # No review queue rows
+    assert len(_queue_rows(conn)) == 0
+
+    # Curated state row was written
+    ct = conn.execute("SELECT COUNT(*) FROM mailchimp_contact_state").fetchone()[0]
+    assert ct == 1
+
+    # Counter appears in to_dict
+    d = ctrs.to_dict()
+    assert d["mailchimp_missing_name_unique_email_accepted"] == 1
+
+
+def test_missing_name_flag_on_phone_mismatch_still_quarantined(db_conn, tmp_path):
+    """Flag on + missing name, but phone mismatch → still quarantined (C check enforced)."""
+    conn, dsn = db_conn
+
+    _seed_participant(conn, name="Alice Smith", email="alice@example.com",
+                      phone="2075550101")
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="alice@example.com", first="", last="",
+                  phone="9995551234"),
+    ], allow_unique_email_missing_name_link=True)
+
+    assert ctrs.rows_rejected == 1
+    assert ctrs.mailchimp_identity_rows_quarantined == 1
+    # Counter only reflects fully-accepted rows (C check quarantined this one)
+    assert ctrs.mailchimp_missing_name_unique_email_accepted == 0
+
+    queue = _queue_rows(conn)
+    assert len(queue) == 1
+    assert queue[0]["reason_code"] == "email_phone_mismatch"
+
+
+def test_missing_name_flag_on_address_mismatch_still_quarantined(db_conn, tmp_path):
+    """Flag on + missing name, but address mismatch → still quarantined (D check enforced)."""
+    conn, dsn = db_conn
+
+    _seed_participant(conn, name="Alice Smith", email="alice@example.com",
+                      address="1 Main St, Bar Harbor, ME 04609")
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="alice@example.com", first="", last="",
+                  address="99 Different Rd, Portland, ME 04101"),
+    ], allow_unique_email_missing_name_link=True)
+
+    assert ctrs.rows_rejected == 1
+    assert ctrs.mailchimp_identity_rows_quarantined == 1
+    # Counter only reflects fully-accepted rows (D check quarantined this one)
+    assert ctrs.mailchimp_missing_name_unique_email_accepted == 0
+
+    queue = _queue_rows(conn)
+    assert len(queue) == 1
+    assert queue[0]["reason_code"] == "email_address_mismatch"
+
+
+def test_missing_name_flag_on_ambiguous_email_still_quarantined(db_conn, tmp_path):
+    """Flag on: ambiguous email (step A) is never relaxed — still quarantined."""
+    conn, dsn = db_conn
+
+    shared_email = "shared2@example.com"
+    for name in ("Q One", "Q Two"):
+        pid2 = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO participant (id, full_name, normalized_full_name) "
+            "VALUES (%s, %s, %s)",
+            (pid2, name, name.lower()),
+        )
+        conn.execute(
+            """
+            INSERT INTO participant_contact_point
+                (participant_id, contact_type, contact_subtype,
+                 contact_value_raw, contact_value_normalized, is_primary, source_system)
+            VALUES (%s, 'email', 'primary', %s, %s, true, 'test')
+            """,
+            (pid2, shared_email, shared_email),
+        )
+    conn.commit()
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email=shared_email, first="", last=""),
+    ], allow_unique_email_missing_name_link=True)
+
+    assert ctrs.rows_rejected == 1
+    assert ctrs.mailchimp_identity_rows_quarantined == 1
+    assert ctrs.mailchimp_missing_name_unique_email_accepted == 0
+
+    queue = _queue_rows(conn)
+    assert len(queue) == 1
+    assert queue[0]["reason_code"] == "ambiguous_email_match"
+
+
+def test_name_mismatch_flag_on_still_quarantined(db_conn, tmp_path):
+    """Flag on: email_name_mismatch (both names present, different) is never relaxed."""
+    conn, dsn = db_conn
+
+    _seed_participant(conn, name="Alice Smith", email="alice@example.com")
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="alice@example.com", first="Bob", last="Jones"),
+    ], allow_unique_email_missing_name_link=True)
+
+    assert ctrs.rows_rejected == 1
+    assert ctrs.mailchimp_identity_rows_quarantined == 1
+    assert ctrs.mailchimp_missing_name_unique_email_accepted == 0
+    assert ctrs.participants_matched_existing == 0
+
+    queue = _queue_rows(conn)
+    assert len(queue) == 1
+    assert queue[0]["reason_code"] == "email_name_mismatch"

@@ -191,6 +191,53 @@ Integration tests:
 4. API response contact ID linkage and cross-participant conflict fail path.
 5. Contact-ID backfill path from subscriber hash when contact ID is absent in CSV export.
 
+## 11.1 Policy v2.1 Optional Exception: Unique Email + Missing Source Name
+
+### Purpose
+
+Reduce review-queue volume for Mailchimp rows that lack first/last name fields when
+the email uniquely identifies a participant in the database.
+
+### Default
+
+This exception is **off by default**.  The strict quarantine behavior (Policy v2) remains
+the safe default.  The exception must be explicitly enabled via the
+`--allow-unique-email-missing-name-link` CLI flag.
+
+### Applicability
+
+The exception applies only to the `missing_name_for_email_match` case:
+- The source row has no parseable first/last name, **or** the matched participant
+  has no `normalized_full_name` (defensive — functionally unreachable).
+- The email resolves to **exactly one** participant contact-point.
+
+### Non-relaxed rules
+
+The following conflicts are **never** relaxed by this flag:
+- `ambiguous_email_match` — multiple participants share the email.
+- `email_name_mismatch` — both sides have names but they differ.
+- `email_phone_mismatch` — both sides have phone and they differ.
+- `email_address_mismatch` — both sides have address and they differ.
+
+### Counter
+
+When a row is accepted via this exception, the counter
+`mailchimp_missing_name_unique_email_accepted` is incremented.  The row is
+**not** counted as quarantined or rejected.
+
+### Acceptance query
+
+```sql
+-- Check remaining open quarantine volume after enabling the flag
+SELECT reason_code, COUNT(*)
+FROM mailchimp_identity_review_queue
+WHERE status = 'open'
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Confirm exception counter in run report
+-- (field: mailchimp_missing_name_unique_email_accepted)
+```
+
 ## 12. Acceptance Criteria
 
 1. No curated participant auto-link occurs on email-only evidence.

@@ -207,6 +207,7 @@ def _strict_resolve_participant(
     raw_payload: str,
     counters: RunCounters,
     rejects: RejectWriter,
+    allow_unique_email_missing_name_link: bool = False,
 ) -> str | None:
     """Resolve participant per Policy v2 strict identity rules.
 
@@ -215,6 +216,12 @@ def _strict_resolve_participant(
     file, and increments the quarantine / rejection counters.  On
     name-fallback ambiguous match: writes to reject file only (not a review
     queue case).
+
+    When allow_unique_email_missing_name_link=True (Policy v2.1 optional
+    exception): a missing-name situation on an otherwise unique email match is
+    accepted instead of quarantined.  Phone/address hard-conflict checks still
+    apply.  email_name_mismatch (both names present but different) is never
+    relaxed by this flag.
     """
     def _quarantine(pid: str | None, reason_code: str, reason_detail: str | None) -> None:
         _insert_identity_review_queue(
@@ -251,15 +258,19 @@ def _strict_resolve_participant(
         source_full = _build_full_name(source_first, source_last)
         source_name_norm = normalize_name(source_full) if source_full else None
 
+        used_missing_name_exception = False
         if source_name_norm is None or target_name is None:
-            _quarantine(
-                pid, "missing_name_for_email_match",
-                f"source_has_name={source_name_norm is not None}, "
-                f"target_has_name={target_name is not None}",
-            )
-            return None
-
-        if source_name_norm != target_name:
+            if not allow_unique_email_missing_name_link:
+                _quarantine(
+                    pid, "missing_name_for_email_match",
+                    f"source_has_name={source_name_norm is not None}, "
+                    f"target_has_name={target_name is not None}",
+                )
+                return None
+            # Policy v2.1 optional exception: continue to C/D checks.
+            # Counter incremented only on successful return below.
+            used_missing_name_exception = True
+        elif source_name_norm != target_name:
             _quarantine(
                 pid, "email_name_mismatch",
                 f"source={source_name_norm!r}, target={target_name!r}",
@@ -296,6 +307,8 @@ def _strict_resolve_participant(
                 return None
 
         # All checks passed — link to existing participant
+        if used_missing_name_exception:
+            counters.mailchimp_missing_name_unique_email_accepted += 1
         counters.participants_matched_existing += 1
         return pid
 
@@ -631,6 +644,7 @@ def _process_row(
     source_file_name: str,
     counters: RunCounters,
     rejects: RejectWriter,
+    allow_unique_email_missing_name_link: bool = False,
 ) -> None:
     """Process one row.  Caller manages savepoint.
 
@@ -704,6 +718,7 @@ def _process_row(
         conn, row,
         email_norm,  # type: ignore[arg-type]  # validated non-null above
         source_file_name, audience_status, raw_payload, counters, rejects,
+        allow_unique_email_missing_name_link=allow_unique_email_missing_name_link,
     )
     if participant_id is None:
         return  # quarantined or ambiguous-name reject; raw capture persists
@@ -785,6 +800,7 @@ def _stream_process_file(
     run_id: str,
     counters: RunCounters,
     rejects: RejectWriter,
+    allow_unique_email_missing_name_link: bool = False,
 ) -> None:
     """Open file and stream rows directly into the DB phase with per-row savepoints.
 
@@ -803,6 +819,7 @@ def _stream_process_file(
                 _process_row(
                     conn, row, audience_status, status_col,
                     source_file_name, counters, rejects,
+                    allow_unique_email_missing_name_link=allow_unique_email_missing_name_link,
                 )
                 conn.execute(f"RELEASE SAVEPOINT {sp_name}")
             except AmbiguousMatchError as exc:
@@ -844,6 +861,7 @@ def _run_mailchimp_audience(
     cleaned_path: str,
     max_reject_rate: float,
     dry_run: bool,
+    allow_unique_email_missing_name_link: bool = False,
 ) -> None:
     files = [
         (Path(subscribed_path),   "subscribed"),
@@ -866,6 +884,7 @@ def _run_mailchimp_audience(
                     _stream_process_file(
                         conn, csv_path, audience_status,
                         run_id, counters, rejects,
+                        allow_unique_email_missing_name_link=allow_unique_email_missing_name_link,
                     )
             finally:
                 conn.rollback()
@@ -895,6 +914,7 @@ def _run_mailchimp_audience(
                     _stream_process_file(
                         conn, csv_path, audience_status,
                         run_id, counters, rejects,
+                        allow_unique_email_missing_name_link=allow_unique_email_missing_name_link,
                     )
             except Exception as exc:
                 conn.rollback()
@@ -936,6 +956,7 @@ def _run_mailchimp_audience(
         f"{counters.rows_rejected} rejected, "
         f"{counters.mailchimp_identity_rows_quarantined} identity-quarantined, "
         f"{counters.mailchimp_identity_conflicts} identity-conflicts, "
+        f"{counters.mailchimp_missing_name_unique_email_accepted} missing-name-accepted, "
         f"{counters.participants_inserted} participants inserted, "
         f"{counters.participants_matched_existing} matched, "
         f"{counters.mailchimp_identity_links_inserted} identity-links-inserted, "

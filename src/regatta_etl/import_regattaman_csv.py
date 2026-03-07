@@ -477,6 +477,12 @@ def _process_row(
 @click.option("--subscribed-path", default=None, type=click.Path(), help="[mailchimp_audience] Subscribed audience CSV")
 @click.option("--unsubscribed-path", default=None, type=click.Path(), help="[mailchimp_audience] Unsubscribed audience CSV")
 @click.option("--cleaned-path", default=None, type=click.Path(), help="[mailchimp_audience] Cleaned audience CSV")
+@click.option(
+    "--allow-unique-email-missing-name-link/--no-allow-unique-email-missing-name-link",
+    default=False,
+    show_default=True,
+    help="[mailchimp_audience] Policy v2.1: accept unique email match when source name is absent (default off).",
+)
 # mailchimp_event_activation flags
 @click.option(
     "--event-window-days",
@@ -705,6 +711,7 @@ def main(
     subscribed_path: str | None,
     unsubscribed_path: str | None,
     cleaned_path: str | None,
+    allow_unique_email_missing_name_link: bool,
     # mailchimp_event_activation
     event_window_days: int,
     segment_type: str,
@@ -888,6 +895,7 @@ def main(
             cleaned_path=cleaned_path,  # type: ignore[arg-type]
             max_reject_rate=max_reject_rate,
             dry_run=dry_run,
+            allow_unique_email_missing_name_link=allow_unique_email_missing_name_link,
         )
     elif mode == "mailchimp_event_activation":
         _validate_mailchimp_event_activation_flags(
