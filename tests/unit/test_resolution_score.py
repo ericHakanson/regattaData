@@ -122,6 +122,7 @@ class TestParticipantFeatures:
             "phone_exact": True,
             "dob_exact": True,
             "normalized_name_exact": True,
+            "address_present": False,  # no child address evidence in this row
         }
 
     def test_none_present(self):

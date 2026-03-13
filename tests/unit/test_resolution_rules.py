@@ -480,7 +480,11 @@ class TestActualYamlFiles:
         assert rs.entity_type == "registration"
 
     def test_all_rule_files_have_valid_threshold_ordering(self, rules_dir: Path):
+        import yaml as _yaml
         for yml_path in rules_dir.glob("*.yml"):
+            raw = _yaml.safe_load(yml_path.read_text())
+            if not isinstance(raw, dict) or "entity_type" not in raw:
+                continue  # skip non-entity-type config files (e.g. source_trust.yml)
             rs = load_rule_set(yml_path)
             assert rs.threshold_hold <= rs.threshold_review, yml_path.name
             assert rs.threshold_review <= rs.threshold_auto_promote, yml_path.name

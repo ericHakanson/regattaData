@@ -7,6 +7,9 @@ Prevent incorrect person merges between Mailchimp and RegattaData by enforcing s
 Secondary objective:
 Persist a durable Mailchimp contact identifier on the participant record model so downstream activation is traceable and conflict-safe.
 
+Related downstream requirement:
+Mailchimp-resolved participant evidence must later flow into the candidate layer per `docs/requirements/mailchimp-participant-candidate-evidence-flow-spec.md`. This policy remains authoritative for whether a Mailchimp row is eligible to participate in that projection.
+
 ## 2. Policy Decision
 
 1. Email-only auto-linking is not acceptable for curated participant linkage.

@@ -431,6 +431,7 @@ def _process_row(
         "resolution_manual_apply", "resolution_lifecycle",
         "lineage_report", "purge_check",
         "participant_enrichment_rocketreach",
+        "participant_under_combination_remediation",
     ]),
     show_default=True,
     help="Ingestion mode",
@@ -1285,6 +1286,44 @@ def main(
                 "environment": rocketreach_environment,
             },
             rr_counters,  # type: ignore[arg-type]
+        )
+        click.echo(f"[{run_id}] Run report: {report_path}")
+        return
+    elif mode == "participant_under_combination_remediation":
+        from regatta_etl.resolution_source_to_candidate import (
+            build_remediation_report,
+            run_under_combination_remediation,
+        )
+        click.echo(
+            f"[{run_id}] participant_under_combination_remediation dry_run={dry_run}"
+        )
+        conn = psycopg.connect(db_dsn, autocommit=False)
+        try:
+            uc_ctrs = run_under_combination_remediation(conn, dry_run=dry_run)
+            report = build_remediation_report(uc_ctrs, dry_run=dry_run)
+            click.echo(report)
+            if dry_run or uc_ctrs.db_errors > 0:
+                conn.rollback()
+                if dry_run:
+                    click.echo(f"[{run_id}] DRY RUN — rolled back.")
+                else:
+                    click.echo(
+                        f"[{run_id}] {uc_ctrs.db_errors} DB errors — rolled back.",
+                        err=True,
+                    )
+                    sys.exit(1)
+            else:
+                conn.commit()
+                click.echo(f"[{run_id}] Committed.")
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        report_path = write_run_report(
+            run_id, started_at, mode, dry_run,
+            {},
+            uc_ctrs,  # type: ignore[arg-type]
         )
         click.echo(f"[{run_id}] Run report: {report_path}")
         return

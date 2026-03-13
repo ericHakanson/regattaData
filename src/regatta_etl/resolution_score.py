@@ -61,6 +61,11 @@ class ScoreCounters:
     new_auto_promote_club: int = 0
     new_auto_promote_participant: int = 0
     new_auto_promote_yacht: int = 0
+    # Child-evidence usage counters (participant only)
+    participant_child_email_used: int = 0
+    participant_child_phone_used: int = 0
+    participant_child_address_used: int = 0
+    participant_address_only_hold: int = 0
     db_errors: int = 0
     warnings: list[str] = field(default_factory=list)
 
@@ -77,6 +82,10 @@ class ScoreCounters:
             "new_auto_promote_club": self.new_auto_promote_club,
             "new_auto_promote_participant": self.new_auto_promote_participant,
             "new_auto_promote_yacht": self.new_auto_promote_yacht,
+            "participant_child_email_used": self.participant_child_email_used,
+            "participant_child_phone_used": self.participant_child_phone_used,
+            "participant_child_address_used": self.participant_child_address_used,
+            "participant_address_only_hold": self.participant_address_only_hold,
             "db_errors": self.db_errors,
             "warnings": self.warnings[:50],
         }
@@ -87,12 +96,60 @@ class ScoreCounters:
 # Map YAML feature_weight keys → boolean columns on each candidate table.
 # ---------------------------------------------------------------------------
 
+def _fetch_participant_child_evidence(
+    conn: psycopg.Connection,
+) -> dict[str, dict[str, bool]]:
+    """Return a map of candidate_participant_id → {has_email, has_phone, has_address}.
+
+    Uses two bulk queries (contacts + addresses) to avoid N+1 per-candidate lookups.
+    Only includes candidates that have at least one relevant child row.
+    """
+    result: dict[str, dict[str, bool]] = {}
+
+    # Bulk fetch: any non-null normalized contact value by type
+    contact_rows = conn.execute(
+        """
+        SELECT candidate_participant_id::text, contact_type
+        FROM candidate_participant_contact
+        WHERE normalized_value IS NOT NULL
+          AND contact_type IN ('email', 'phone')
+        """
+    ).fetchall()
+    for cid, ctype in contact_rows:
+        entry = result.setdefault(cid, {"has_email": False, "has_phone": False, "has_address": False})
+        if ctype == "email":
+            entry["has_email"] = True
+        elif ctype == "phone":
+            entry["has_phone"] = True
+
+    # Bulk fetch: address existence
+    address_rows = conn.execute(
+        """
+        SELECT DISTINCT candidate_participant_id::text
+        FROM candidate_participant_address
+        """
+    ).fetchall()
+    for (cid,) in address_rows:
+        entry = result.setdefault(cid, {"has_email": False, "has_phone": False, "has_address": False})
+        entry["has_address"] = True
+
+    return result
+
+
 def _features_participant(row: dict[str, Any]) -> dict[str, bool]:
+    # email/phone: top-level field OR child contact evidence (precomputed in row)
+    has_email = bool(row["best_email"]) or bool(row.get("_child_email"))
+    has_phone = bool(row["best_phone"]) or bool(row.get("_child_phone"))
+    # address_present only activates when no email or phone evidence exists.
+    # This keeps address as a conservative lift for contact-poor candidates only —
+    # it must not amplify the score of candidates already bearing email/phone signals.
+    has_address = bool(row.get("_child_address")) and not has_email and not has_phone
     return {
-        "email_exact":           bool(row["best_email"]),
-        "phone_exact":           bool(row["best_phone"]),
+        "email_exact":           has_email,
+        "phone_exact":           has_phone,
         "dob_exact":             bool(row["date_of_birth"]),
         "normalized_name_exact": bool(row["normalized_name"]),
+        "address_present":       has_address,
     }
 
 
@@ -165,6 +222,13 @@ _SELECT_COLS: dict[str, str] = {
 }
 
 
+# Features excluded from NBA generation.
+# These are child-table-derived signals that operators cannot directly enrich
+# via manual action, so generating "missing_X" enrichment NBAs for them is
+# misleading and creates queue noise.
+_NON_NBA_FEATURES: frozenset[str] = frozenset({"address_present"})
+
+
 # ---------------------------------------------------------------------------
 # NBA (next_best_action) writer
 # ---------------------------------------------------------------------------
@@ -214,6 +278,8 @@ def _write_nbas(
 
     inserted = 0
     for feature_name, present in features.items():
+        if feature_name in _NON_NBA_FEATURES:
+            continue  # child-evidence features are not operator-enrichable
         if present:
             continue
         weight = rule_set.feature_weights.get(feature_name, 0.0)
@@ -260,17 +326,46 @@ def _score_entity_type(
     ).fetchall()
     col_names = [c.strip() for c in cols.split(",")]
 
+    # Precompute child evidence map once for participant scoring (avoids N+1).
+    child_evidence: dict[str, dict[str, bool]] = {}
+    if entity_type == "participant":
+        child_evidence = _fetch_participant_child_evidence(conn)
+
     for idx, raw_row in enumerate(rows):
         row = dict(zip(col_names, raw_row))
         pk = str(row["id"])
         is_promoted: bool = bool(row["is_promoted"])
         current_state: str = str(row["resolution_state"])
 
+        # Augment participant rows with child evidence flags.
+        if entity_type == "participant":
+            ev = child_evidence.get(pk, {})
+            row["_child_email"]   = ev.get("has_email", False)
+            row["_child_phone"]   = ev.get("has_phone", False)
+            row["_child_address"] = ev.get("has_address", False)
+
         sp = f"score_{entity_type}_{idx}"
         conn.execute(f"SAVEPOINT {sp}")
         try:
             features = extractor(row)
             score, state, reasons = compute_score(rule_set, features)
+
+            # Append child-evidence origin annotations to confidence_reasons.
+            if entity_type == "participant":
+                if row.get("_child_email") and not bool(row["best_email"]):
+                    reasons.append("evidence:child_email_present")
+                    ctrs.participant_child_email_used += 1
+                if row.get("_child_phone") and not bool(row["best_phone"]):
+                    reasons.append("evidence:child_phone_present")
+                    ctrs.participant_child_phone_used += 1
+                # address_present only contributed to the score when both email and phone
+                # are absent (see _features_participant conditional logic).
+                if features.get("address_present"):
+                    reasons.append("evidence:child_address_present")
+                    ctrs.participant_child_address_used += 1
+                # Track address-only candidates that land in hold
+                if state == "hold" and features.get("address_present"):
+                    ctrs.participant_address_only_hold += 1
 
             # Determine the state we intend to write.
             # Promoted candidates are locked to 'auto_promote' regardless of score.
@@ -410,6 +505,11 @@ def build_score_report(ctrs: ScoreCounters, dry_run: bool = False) -> str:
         f"  NBAs written:              {ctrs.nbas_written}",
         f"  staged transitions:        {ctrs.state_transitions_staged}",
         f"  capped transitions:        {ctrs.state_transitions_capped}",
+        f"Child evidence (participant):",
+        f"  child email used:          {ctrs.participant_child_email_used}",
+        f"  child phone used:          {ctrs.participant_child_phone_used}",
+        f"  child address used:        {ctrs.participant_child_address_used}",
+        f"  address-only → hold:       {ctrs.participant_address_only_hold}",
         f"DB errors:                   {ctrs.db_errors}",
     ]
     if ctrs.warnings:

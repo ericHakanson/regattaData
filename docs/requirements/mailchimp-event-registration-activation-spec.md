@@ -21,6 +21,7 @@ Assumes existing tables/pipelines are present:
 1. Canonical data: `canonical_participant`, `canonical_event`, `canonical_registration`.
 2. Mailchimp ingestion data: `mailchimp_audience_row`, `mailchimp_contact_state`, `mailchimp_contact_tag`.
 3. Resolution/promotion pipeline already run for events/registrations (and optionally participant when available).
+4. If participant-level Mailchimp evidence is expected to influence candidate scoring before activation, implement `docs/requirements/mailchimp-participant-candidate-evidence-flow-spec.md` upstream of this activation pipeline.
 
 If any dependency is missing, pipeline must fail fast with clear error text.
 

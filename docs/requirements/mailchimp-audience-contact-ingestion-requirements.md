@@ -14,6 +14,8 @@ Primary goals:
 Policy note:
 1. Strict identity behavior for production is governed by `docs/requirements/mailchimp-strict-identity-and-contact-id-policy-spec.md`.
 2. Where this document conflicts with that policy, the strict policy takes precedence.
+3. Candidate-layer projection of Mailchimp-resolved participant evidence is governed by `docs/requirements/mailchimp-participant-candidate-evidence-flow-spec.md`.
+4. Where this document describes curated participant/contact writes, that candidate-evidence-flow spec governs how the evidence must later reach `candidate_participant_contact` / `candidate_participant_address` for scoring.
 
 ## Baseline Profile (Current Files)
 1. `subscribed`: 889 rows, 21 columns.

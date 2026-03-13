@@ -1,7 +1,33 @@
 entity_type: participant
 source_system: "regattaman_csv_export|regattaman_public_scrape_csv|mailchimp_audience_csv|jotform_waiver_csv|airtable_copy_csv|yacht_scoring_csv"
-version: "v1.1.0"
+version: "v1.2.0"
 
+# v1.2.0 changes (child-evidence scoring):
+#   Added address_present feature (weight 0.35) for candidate_participant_address evidence.
+#   email_exact / phone_exact now also satisfied by child candidate_participant_contact rows.
+#   Scoring engine precomputes child-evidence maps to avoid N+1 queries.
+#
+# Conservative address policy (R4 / I2):
+#   Address evidence alone must NOT reach 'review' or 'auto_promote'.
+#   Target: address-only candidates (no email, no phone) move from 'reject' → 'hold'.
+#
+#   IMPORTANT: address_present is conditional — the scoring engine only sets it True
+#   when BOTH email and phone evidence are absent.  This prevents address from
+#   amplifying the score of already email/phone-bearing candidates.
+#
+#   Score arithmetic for name + address (no email, no phone):
+#     + normalized_name_exact : 0.10
+#     + address_present       : 0.35  (only activates when email=absent AND phone=absent)
+#     - missing_email         : 0.10
+#     - missing_phone         : 0.05
+#     = 0.30  → hold  (threshold: 0.25 ≤ score < 0.50)  ✓
+#
+#   Verifications:
+#     0.30 < 0.50 → does NOT reach 'review'       ✓
+#     0.30 < 0.60 → does NOT reach 'auto_promote' ✓
+#   Email + name + address (address_present is suppressed because email present):
+#     email(0.55) + name(0.10) - missing_phone(0.05) = 0.60 → same as without address ✓
+#
 # v1.1.0 changes (promotion-enable):
 #   auto_promote lowered from 0.90 → 0.75.
 #   review    lowered from 0.75 → 0.50.
@@ -13,9 +39,9 @@ version: "v1.1.0"
 # these participants were unreachably stuck in 'review'.
 #
 # Risk tradeoffs:
-#   - Participants with email alone score 0.50 after missing_phone penalty (0.55 - 0.05).
-#     Under the new thresholds they enter 'review', not auto_promote — deliberate.
-#     Adding a phone enrichment NBA will guide operators toward the missing signal.
+#   - Email without name (0.55 - 0.05 = 0.50) → review; deliberate, needs name confirmation.
+#   - Email + name without phone (0.55 + 0.10 - 0.05 = 0.60) → auto_promote at threshold.
+#     This is the boundary case: score equals the auto_promote threshold exactly.
 #   - Name-only participants score ≈ 0 (0.10 - 0.10 - 0.05 ≈ -0.05, clamped to 0.00)
 #     and remain in 'reject', preserving protection against false merges on common names.
 #   - hard_blocks (conflicting_dob, conflicting_high_confidence_email) unchanged.
@@ -33,12 +59,14 @@ thresholds:
   hold: 0.25
 
 # Feature weights: each feature is a boolean detected by the scoring pipeline.
-# Weights sum to 1.0 for a fully-attributed participant.
+# email_exact / phone_exact are satisfied by top-level fields OR child contact rows.
+# address_present is satisfied by any candidate_participant_address child row.
 feature_weights:
-  email_exact: 0.55        # confirmed normalized email present
-  phone_exact: 0.20        # confirmed normalized phone present
+  email_exact: 0.55        # confirmed normalized email present (top-level OR child contact)
+  phone_exact: 0.20        # confirmed normalized phone present (top-level OR child contact)
   dob_exact: 0.15          # date_of_birth present
   normalized_name_exact: 0.10  # well-formed normalized_name present
+  address_present: 0.35    # candidate_participant_address child row present (only when no email/phone)
 
 # Hard blocks: any detected condition in this list forces score=0, state=reject.
 hard_blocks:

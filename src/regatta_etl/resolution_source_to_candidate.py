@@ -48,7 +48,7 @@ Tables intentionally skipped (logged in pipeline report):
   raw_asset                  — GCS references only
   airtable_xref_*            — lookup/xref tables
   yacht_scoring_xref_*       — lookup/xref tables
-  mailchimp_contact_state    — supplemental to mailchimp_audience_row
+  mailchimp_contact_state    — used inline as Mailchimp resolution anchor (participant path)
   mailchimp_contact_tag      — supplemental to mailchimp_audience_row
 """
 
@@ -98,7 +98,7 @@ _SKIPPED_TABLES: list[tuple[str, str]] = [
     ("yacht_scoring_xref_entry",   "lookup_xref_table"),
     ("yacht_scoring_xref_yacht",   "lookup_xref_table"),
     ("yacht_scoring_xref_participant", "lookup_xref_table"),
-    ("mailchimp_contact_state",    "supplemental_to_mailchimp_audience_row"),
+    ("mailchimp_contact_state",    "used_inline_as_mailchimp_resolution_anchor"),
     ("mailchimp_contact_tag",      "supplemental_to_mailchimp_audience_row"),
     ("bhyc_member_raw_row",        "inline_candidate_linking_in_bhyc_pipeline"),
     ("bhyc_member_xref_participant", "lookup_xref_table"),
@@ -161,17 +161,12 @@ class SourceToCandidateCounters:
     # Skipped rows (expected, not errors)
     rows_skipped_no_xref_link: int = 0    # raw row has no operational xref (pipeline not run)
     rows_skipped_no_owner_name: int = 0   # yacht_scoring entry row with no owner name
+    # Under-combination prevention
+    participants_under_combination_reused: int = 0
+    participants_under_combination_ambiguous: int = 0
     # Errors
     db_errors: int = 0
     warnings: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        """Return a JSON-serialisable summary (warnings truncated to 50 entries)."""
-        import dataclasses
-        d = dataclasses.asdict(self)
-        d["warnings"] = d["warnings"][:50]
-        return d
-
 
     def to_dict(self) -> dict[str, Any]:
         d = {k: v for k, v in self.__dict__.items() if k != "warnings"}
@@ -422,6 +417,60 @@ def _upsert_role(
 
 
 # ---------------------------------------------------------------------------
+# Under-combination prevention helpers
+# ---------------------------------------------------------------------------
+
+_AMBIGUOUS = "ambiguous"
+
+
+def _find_email_bearing_candidate_by_name(
+    conn: psycopg.Connection,
+    normalized_name: str,
+) -> str | None:
+    """Return the id of the unique email-bearing candidate_participant with this name.
+
+    Returns:
+        str UUID   — exactly one email-bearing candidate found; reuse it.
+        _AMBIGUOUS — multiple email-bearing candidates found; do not guess.
+        None       — zero email-bearing candidates found; use normal path.
+    """
+    rows = conn.execute(
+        """
+        SELECT id
+        FROM candidate_participant
+        WHERE normalized_name = %s
+          AND best_email IS NOT NULL
+        ORDER BY is_promoted DESC, quality_score DESC NULLS LAST, updated_at DESC, id ASC
+        """,
+        (normalized_name,),
+    ).fetchall()
+
+    if len(rows) == 1:
+        return str(rows[0][0])
+    if len(rows) > 1:
+        return _AMBIGUOUS  # type: ignore[return-value]
+    return None
+
+
+def _enrich_candidate_by_id(
+    conn: psycopg.Connection,
+    table: str,
+    candidate_id: str,
+    fields: dict[str, Any],
+) -> None:
+    """Fill-nulls-only UPDATE for a candidate row we already hold the id for."""
+    set_parts = [
+        f"{col} = COALESCE({table}.{col}, %s)"
+        for col in fields
+        if col != "created_at"
+    ]
+    set_parts.append("updated_at = now()")
+    sql = f"UPDATE {table} SET {', '.join(set_parts)} WHERE id = %s"
+    vals = [v for col, v in fields.items() if col != "created_at"] + [candidate_id]
+    conn.execute(sql, vals)
+
+
+# ---------------------------------------------------------------------------
 # Club ingestion
 # ---------------------------------------------------------------------------
 
@@ -612,24 +661,38 @@ def _ingest_participants_from_participant_table(
         best_email = row[4]
         best_phone = row[5]
 
-        fp = participant_fingerprint(norm_name, best_email)
+        fields = {
+            "display_name": display_name,
+            "normalized_name": norm_name,
+            "date_of_birth": str(dob) if dob else None,
+            "best_email": best_email,
+            "best_phone": best_phone,
+        }
+        reuse_cid: str | None = None
+        if best_email is None and norm_name:
+            lookup = _find_email_bearing_candidate_by_name(conn, norm_name)
+            if lookup == _AMBIGUOUS:
+                ctrs.participants_under_combination_ambiguous += 1
+                ctrs.warnings.append(
+                    f"under_combination_ambiguous: participant pk={pk} norm_name={norm_name!r}"
+                )
+            elif lookup is not None:
+                reuse_cid = lookup
+                ctrs.participants_under_combination_reused += 1
+
         try:
-            cid, created = _upsert_candidate(
-                conn,
-                "candidate_participant",
-                fp,
-                {
-                    "display_name": display_name,
-                    "normalized_name": norm_name,
-                    "date_of_birth": str(dob) if dob else None,
-                    "best_email": best_email,
-                    "best_phone": best_phone,
-                },
-            )
-            if created:
-                ctrs.participants_candidate_created += 1
-            else:
+            if reuse_cid is not None:
+                cid = reuse_cid
+                created = False
+                _enrich_candidate_by_id(conn, "candidate_participant", cid, fields)
                 ctrs.participants_candidate_enriched += 1
+            else:
+                fp = participant_fingerprint(norm_name, best_email)
+                cid, created = _upsert_candidate(conn, "candidate_participant", fp, fields)
+                if created:
+                    ctrs.participants_candidate_created += 1
+                else:
+                    ctrs.participants_candidate_enriched += 1
 
             # Link source row
             inserted = _link_source(conn, "participant", cid, "participant", pk, "operational_db")
@@ -714,23 +777,39 @@ def _ingest_participants_from_jotform(
 
         norm_name = normalize_name(raw_name)
         norm_email = normalize_email(raw_email) if raw_email else None
-        fp = participant_fingerprint(norm_name, norm_email)
+
+        jotform_fields = {
+            "display_name": raw_name,
+            "normalized_name": norm_name,
+            "best_email": norm_email,
+        }
+        reuse_cid_jf: str | None = None
+        if norm_email is None and norm_name:
+            lookup = _find_email_bearing_candidate_by_name(conn, norm_name)
+            if lookup == _AMBIGUOUS:
+                ctrs.participants_under_combination_ambiguous += 1
+                ctrs.warnings.append(
+                    f"under_combination_ambiguous: jotform pk={pk} norm_name={norm_name!r}"
+                )
+            elif lookup is not None:
+                reuse_cid_jf = lookup
+                ctrs.participants_under_combination_reused += 1
 
         try:
-            cid, created = _upsert_candidate(
-                conn,
-                "candidate_participant",
-                fp,
-                {
-                    "display_name": raw_name,
-                    "normalized_name": norm_name,
-                    "best_email": norm_email,
-                },
-            )
-            if created:
-                ctrs.participants_candidate_created += 1
-            else:
+            if reuse_cid_jf is not None:
+                cid = reuse_cid_jf
+                created = False
+                _enrich_candidate_by_id(conn, "candidate_participant", cid, jotform_fields)
                 ctrs.participants_candidate_enriched += 1
+            else:
+                fp = participant_fingerprint(norm_name, norm_email)
+                cid, created = _upsert_candidate(
+                    conn, "candidate_participant", fp, jotform_fields,
+                )
+                if created:
+                    ctrs.participants_candidate_created += 1
+                else:
+                    ctrs.participants_candidate_enriched += 1
 
             inserted = _link_source(
                 conn, "participant", cid,
@@ -761,75 +840,190 @@ def _ingest_participants_from_mailchimp(
     conn: psycopg.Connection,
     ctrs: SourceToCandidateCounters,
 ) -> None:
-    """Ingest mailchimp_audience_row rows → candidate_participant."""
-    rows = conn.execute(
-        """
-        SELECT id, raw_payload, row_hash, source_system, source_email_normalized
-        FROM mailchimp_audience_row
-        ORDER BY ingested_at
-        """
+    """Ingest Mailchimp-resolved participants → candidate_participant child evidence.
+
+    Uses mailchimp_contact_state.participant_id as the identity anchor — only rows
+    that passed strict Mailchimp identity policy are projected.  Quarantined rows
+    (no mailchimp_contact_state entry) are never projected into candidate evidence.
+
+    For each resolved participant:
+      - finds the existing candidate derived from the operational participant table
+      - enriches candidate_participant_contact with email (from mcs.email_normalized)
+        and phone (from participant_contact_point)
+      - enriches candidate_participant_address from participant_address
+      - links all contributing mailchimp_audience_row ids as source evidence
+    """
+    # All distinct resolved participant_ids (quarantined rows never reach contact_state).
+    pid_rows = conn.execute(
+        "SELECT DISTINCT participant_id::text FROM mailchimp_contact_state ORDER BY participant_id"
     ).fetchall()
 
-    for row in rows:
-        pk = str(row[0])
-        payload: dict = row[1] if isinstance(row[1], dict) else json.loads(row[1])
-        row_hash = row[2]
-        source_system = row[3] or "mailchimp_audience_csv"
-        norm_email_col = row[4]
+    for (participant_id,) in pid_rows:
+        # All audience rows that resolved to this participant (may span multiple files).
+        mc_rows = conn.execute(
+            """
+            SELECT mcs.email_normalized,
+                   mcs.source_system,
+                   mar.id::text  AS audience_row_id,
+                   mar.row_hash  AS audience_row_hash
+            FROM mailchimp_contact_state mcs
+            JOIN mailchimp_audience_row mar
+              ON mar.source_file_name = mcs.source_file_name
+             AND mar.row_hash         = mcs.row_hash
+            WHERE mcs.participant_id = %s
+            ORDER BY mcs.ingested_at ASC
+            """,
+            (participant_id,),
+        ).fetchall()
 
-        # Extract name from payload
-        first = trim(payload.get("First Name") or payload.get("first_name", ""))
-        last = trim(payload.get("Last Name") or payload.get("last_name", ""))
-        raw_name = " ".join(filter(None, [first, last]))
-        raw_email = trim(payload.get("Email Address") or payload.get("email", ""))
-
-        if not raw_email and not norm_email_col:
-            ctrs.warnings.append(f"mailchimp pk={pk}: skipped — missing email")
+        if not mc_rows:
             continue
 
-        norm_email = normalize_email(raw_email) if raw_email else norm_email_col
-        if not raw_name:
-            raw_name = norm_email or ""
-        norm_name = normalize_name(raw_name) if raw_name else None
+        # Use the first row's email for the fallback fingerprint path only.
+        first_email_normalized = mc_rows[0][0]
+        source_system          = mc_rows[0][1] or "mailchimp_audience_csv"
 
-        fp = participant_fingerprint(norm_name, norm_email)
         try:
-            cid, created = _upsert_candidate(
-                conn,
-                "candidate_participant",
-                fp,
-                {
-                    "display_name": raw_name or None,
-                    "normalized_name": norm_name,
-                    "best_email": norm_email,
-                },
-            )
-            if created:
-                ctrs.participants_candidate_created += 1
-            else:
+            # ── Step 1: Resolve candidate ─────────────────────────────────────
+            # Prefer the candidate already linked from the participant table path.
+            link_row = conn.execute(
+                """
+                SELECT candidate_entity_id::text
+                FROM candidate_source_link
+                WHERE candidate_entity_type = 'participant'
+                  AND source_table_name     = 'participant'
+                  AND source_row_pk         = %s
+                LIMIT 1
+                """,
+                (participant_id,),
+            ).fetchone()
+
+            if link_row:
+                cid = str(link_row[0])
                 ctrs.participants_candidate_enriched += 1
-
-            inserted = _link_source(
-                conn, "participant", cid,
-                "mailchimp_audience_row", pk,
-                source_system, row_hash,
-            )
-            if inserted:
-                ctrs.source_links_inserted += 1
             else:
-                ctrs.source_links_skipped_duplicate += 1
-
-            if norm_email:
-                _upsert_contact(
-                    conn, cid, "email", raw_email or norm_email, norm_email, True,
-                    "mailchimp_audience_row", pk,
+                # Fallback: participant table ingestion hasn't run yet.
+                # Derive candidate from the participant record itself.
+                p_rec = conn.execute(
+                    """
+                    SELECT p.normalized_full_name,
+                           (SELECT contact_value_normalized
+                            FROM participant_contact_point
+                            WHERE participant_id = p.id
+                              AND contact_type = 'email'
+                            ORDER BY is_primary DESC, created_at ASC
+                            LIMIT 1) AS best_email
+                    FROM participant p
+                    WHERE p.id = %s
+                    """,
+                    (participant_id,),
+                ).fetchone()
+                if not p_rec:
+                    ctrs.warnings.append(
+                        f"participants/mailchimp participant_id={participant_id}: "
+                        "participant row not found — skipped"
+                    )
+                    continue
+                norm_name = p_rec[0]
+                best_email = p_rec[1]
+                fp = participant_fingerprint(norm_name, best_email or first_email_normalized)
+                cid, created = _upsert_candidate(
+                    conn,
+                    "candidate_participant",
+                    fp,
+                    {
+                        "display_name": norm_name,
+                        "normalized_name": norm_name,
+                        "best_email": best_email or first_email_normalized,
+                    },
                 )
-                ctrs.participant_contacts_linked += 1
+                if created:
+                    ctrs.participants_candidate_created += 1
+                else:
+                    ctrs.participants_candidate_enriched += 1
+
+            # ── Step 2: Email child evidence — all distinct emails ────────────
+            # A participant may have multiple mailchimp_contact_state rows with
+            # different email_normalized values (multi-email identity case).
+            # Write a child contact row for each distinct email.
+            seen_emails: set[str] = set()
+            for mc_email, _, mc_audience_row_id, _ in mc_rows:
+                if mc_email and mc_email not in seen_emails:
+                    _upsert_contact(
+                        conn, cid, "email",
+                        raw_value=mc_email,
+                        normalized_value=mc_email,
+                        is_primary=False,
+                        source_table="mailchimp_audience_row",
+                        source_pk=mc_audience_row_id,
+                    )
+                    ctrs.participant_contacts_linked += 1
+                    seen_emails.add(mc_email)
+
+            # ── Step 3: Phone child evidence from participant_contact_point ───
+            phone_rows = conn.execute(
+                """
+                SELECT id, contact_value_raw, contact_value_normalized, is_primary
+                FROM participant_contact_point
+                WHERE participant_id = %s AND contact_type = 'phone'
+                ORDER BY is_primary DESC, created_at ASC
+                """,
+                (participant_id,),
+            ).fetchall()
+            for pr in phone_rows:
+                if pr[2]:  # normalized_value required
+                    _upsert_contact(
+                        conn, cid, "phone",
+                        raw_value=pr[1],
+                        normalized_value=pr[2],
+                        is_primary=bool(pr[3]),
+                        source_table="participant_contact_point",
+                        source_pk=str(pr[0]),
+                    )
+                    ctrs.participant_contacts_linked += 1
+
+            # ── Step 4: Address child evidence from participant_address ────────
+            addr_rows = conn.execute(
+                """
+                SELECT id, address_raw, line1, city, state, postal_code, country_code, is_primary
+                FROM participant_address
+                WHERE participant_id = %s
+                ORDER BY created_at ASC
+                """,
+                (participant_id,),
+            ).fetchall()
+            for ar in addr_rows:
+                if ar[1]:  # address_raw required
+                    _upsert_address(
+                        conn, cid,
+                        address_raw=ar[1],
+                        source_table="participant_address",
+                        source_pk=str(ar[0]),
+                        line1=ar[2], city=ar[3], state=ar[4],
+                        postal_code=ar[5], country_code=ar[6],
+                        is_primary=bool(ar[7]),
+                    )
+                    ctrs.participant_addresses_linked += 1
+
+            # ── Step 5: Source links for each contributing audience_row ────────
+            for _, row_source_system, audience_row_id, audience_row_hash in mc_rows:
+                inserted = _link_source(
+                    conn, "participant", cid,
+                    "mailchimp_audience_row", audience_row_id,
+                    row_source_system or "mailchimp_audience_csv",
+                    audience_row_hash,
+                )
+                if inserted:
+                    ctrs.source_links_inserted += 1
+                else:
+                    ctrs.source_links_skipped_duplicate += 1
 
             ctrs.participants_ingested += 1
         except Exception as exc:
             ctrs.db_errors += 1
-            ctrs.warnings.append(f"participants/mailchimp pk={pk}: {exc}")
+            ctrs.warnings.append(
+                f"participants/mailchimp participant_id={participant_id}: {exc}"
+            )
 
 
 def _ingest_participants_from_airtable(
@@ -944,21 +1138,47 @@ def _ingest_participants_from_yacht_scoring(
             ctrs.rows_skipped_no_owner_name += 1
             continue
 
-        fp = participant_fingerprint(norm_name, None)
+        # Contact/address evidence — schema-tolerant; most rows today have none
+        ys_email_raw = trim(payload.get("email") or payload.get("ownerEmail") or "")
+        ys_phone_raw = trim(payload.get("phone") or payload.get("ownerPhone") or "")
+        ys_location_raw = trim(payload.get("ownerLocation") or payload.get("address") or "")
+        ys_email_norm = normalize_email(ys_email_raw) if ys_email_raw else None
+        ys_phone_norm = normalize_phone(ys_phone_raw) if ys_phone_raw else None
+
+        ys_fields: dict = {"display_name": raw_name, "normalized_name": norm_name}
+        if ys_email_norm:
+            ys_fields["best_email"] = ys_email_norm
+        if ys_phone_norm:
+            ys_fields["best_phone"] = ys_phone_norm
+
+        # Under-combination lookup only applies when THIS row has no email
+        reuse_cid_ys: str | None = None
+        if ys_email_norm is None:
+            lookup = _find_email_bearing_candidate_by_name(conn, norm_name)
+            if lookup == _AMBIGUOUS:
+                ctrs.participants_under_combination_ambiguous += 1
+                ctrs.warnings.append(
+                    f"under_combination_ambiguous: yacht_scoring pk={pk} norm_name={norm_name!r}"
+                )
+            elif lookup is not None:
+                reuse_cid_ys = lookup
+                ctrs.participants_under_combination_reused += 1
+
         try:
-            cid, created = _upsert_candidate(
-                conn,
-                "candidate_participant",
-                fp,
-                {
-                    "display_name": raw_name,
-                    "normalized_name": norm_name,
-                },
-            )
-            if created:
-                ctrs.participants_candidate_created += 1
-            else:
+            if reuse_cid_ys is not None:
+                cid = reuse_cid_ys
+                created = False
+                _enrich_candidate_by_id(conn, "candidate_participant", cid, ys_fields)
                 ctrs.participants_candidate_enriched += 1
+            else:
+                fp = participant_fingerprint(norm_name, ys_email_norm)
+                cid, created = _upsert_candidate(
+                    conn, "candidate_participant", fp, ys_fields,
+                )
+                if created:
+                    ctrs.participants_candidate_created += 1
+                else:
+                    ctrs.participants_candidate_enriched += 1
 
             inserted = _link_source(
                 conn, "participant", cid,
@@ -971,6 +1191,26 @@ def _ingest_participants_from_yacht_scoring(
                 ctrs.source_links_skipped_duplicate += 1
 
             _upsert_role(conn, cid, "owner", source_context=f"yacht_scoring_{asset_type}")
+
+            # Attach contact/address child evidence when payload provides it
+            if ys_email_norm:
+                _upsert_contact(
+                    conn, cid, "email", ys_email_raw, ys_email_norm, False,
+                    "yacht_scoring_raw_row", pk,
+                )
+                ctrs.participant_contacts_linked += 1
+            if ys_phone_norm:
+                _upsert_contact(
+                    conn, cid, "phone", ys_phone_raw, ys_phone_norm, False,
+                    "yacht_scoring_raw_row", pk,
+                )
+                ctrs.participant_contacts_linked += 1
+            if ys_location_raw:
+                _upsert_address(
+                    conn, cid, ys_location_raw,
+                    "yacht_scoring_raw_row", pk,
+                )
+                ctrs.participant_addresses_linked += 1
 
             ctrs.participants_ingested += 1
         except Exception as exc:
@@ -1003,25 +1243,41 @@ def _ingest_participants_from_related_contacts(
             continue
 
         norm_name = normalize_name(raw_name)
-        fp = participant_fingerprint(norm_name, email_norm)
+
+        rc_fields = {
+            "display_name": raw_name,
+            "normalized_name": norm_name,
+            "best_email": email_norm,
+            "best_phone": phone_norm,
+        }
+        reuse_cid_rc: str | None = None
+        if email_norm is None and norm_name:
+            lookup = _find_email_bearing_candidate_by_name(conn, norm_name)
+            if lookup == _AMBIGUOUS:
+                ctrs.participants_under_combination_ambiguous += 1
+                ctrs.warnings.append(
+                    f"under_combination_ambiguous: related_contact pk={pk} norm_name={norm_name!r}"
+                )
+            elif lookup is not None:
+                reuse_cid_rc = lookup
+                ctrs.participants_under_combination_reused += 1
 
         candidate_role = "emergency_contact" if contact_type == "emergency" else "guardian"
         try:
-            cid, created = _upsert_candidate(
-                conn,
-                "candidate_participant",
-                fp,
-                {
-                    "display_name": raw_name,
-                    "normalized_name": norm_name,
-                    "best_email": email_norm,
-                    "best_phone": phone_norm,
-                },
-            )
-            if created:
-                ctrs.participants_candidate_created += 1
-            else:
+            if reuse_cid_rc is not None:
+                cid = reuse_cid_rc
+                created = False
+                _enrich_candidate_by_id(conn, "candidate_participant", cid, rc_fields)
                 ctrs.participants_candidate_enriched += 1
+            else:
+                fp = participant_fingerprint(norm_name, email_norm)
+                cid, created = _upsert_candidate(
+                    conn, "candidate_participant", fp, rc_fields,
+                )
+                if created:
+                    ctrs.participants_candidate_created += 1
+                else:
+                    ctrs.participants_candidate_enriched += 1
 
             inserted = _link_source(
                 conn, "participant", cid,
@@ -1875,6 +2131,9 @@ def build_pipeline_report(
         "Skipped Rows (expected):",
         f"  no xref link:        {ctrs.rows_skipped_no_xref_link}",
         f"  no owner name (ys):  {ctrs.rows_skipped_no_owner_name}",
+        "Under-Combination Prevention:",
+        f"  reused email-bearer: {ctrs.participants_under_combination_reused}",
+        f"  ambiguous (skipped): {ctrs.participants_under_combination_ambiguous}",
         f"DB errors:             {ctrs.db_errors}",
     ]
 
@@ -1890,5 +2149,358 @@ def build_pipeline_report(
         if len(ctrs.warnings) > 20:
             lines.append(f"  ... and {len(ctrs.warnings) - 20} more")
 
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Under-combination remediation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class UnderCombinationRemediationCounters:
+    groups_examined: int = 0
+    groups_merged: int = 0
+    loser_rows_deleted: int = 0
+    links_transferred: int = 0
+    contacts_transferred: int = 0
+    addresses_transferred: int = 0
+    roles_transferred: int = 0
+    conflicts_skipped: int = 0
+    db_errors: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        d = {k: v for k, v in self.__dict__.items() if k != "warnings"}
+        d["warnings"] = self.warnings
+        return d
+
+
+def run_under_combination_remediation(
+    conn: psycopg.Connection,
+    dry_run: bool = False,
+) -> "UnderCombinationRemediationCounters":
+    """Consolidate existing split candidate_participant pairs.
+
+    A split pair is a normalized_name that has both:
+    - at least one candidate with best_email IS NOT NULL (winner candidate)
+    - at least one candidate with best_email IS NULL (loser candidate)
+
+    For each such group:
+    1. Select winner via deterministic ranking.
+    2. Validate each null-email candidate as an eligible loser
+       (resolution_state='reject', is_promoted=false, best_email IS NULL).
+    3. Transfer source links, contacts, addresses, roles to winner.
+    4. Fill winner nulls only (COALESCE).
+    5. Write audit log entry.
+    6. Delete loser.
+
+    Dry-run: reports planned actions but writes nothing.
+    """
+    ctrs = UnderCombinationRemediationCounters()
+
+    # Find split groups
+    split_names = conn.execute(
+        """
+        SELECT normalized_name
+        FROM candidate_participant
+        WHERE normalized_name IS NOT NULL
+        GROUP BY normalized_name
+        HAVING BOOL_OR(best_email IS NULL) AND BOOL_OR(best_email IS NOT NULL)
+        ORDER BY normalized_name
+        """
+    ).fetchall()
+
+    for (norm_name,) in split_names:
+        ctrs.groups_examined += 1
+
+        # Fetch all candidates for this name, ranked
+        candidates = conn.execute(
+            """
+            SELECT id, best_email, is_promoted, quality_score, updated_at,
+                   resolution_state, display_name
+            FROM candidate_participant
+            WHERE normalized_name = %s
+            ORDER BY
+                (best_email IS NOT NULL) DESC,
+                is_promoted DESC,
+                quality_score DESC NULLS LAST,
+                updated_at DESC,
+                id ASC
+            """,
+            (norm_name,),
+        ).fetchall()
+
+        # Winner = first candidate (has email per ORDER BY)
+        winner = candidates[0]
+        winner_id = str(winner[0])
+        winner_email = winner[1]
+
+        if winner_email is None:
+            ctrs.conflicts_skipped += 1
+            ctrs.warnings.append(
+                f"remediation_skip: norm_name={norm_name!r} — winner has no email; "
+                "cannot determine winner deterministically"
+            )
+            continue
+
+        # Eligible losers: null email, reject state, not promoted
+        losers = [
+            c for c in candidates[1:]
+            if c[1] is None and c[5] == "reject" and not c[2]
+        ]
+
+        if not losers:
+            # All null-email candidates are ineligible (promoted or wrong state)
+            ineligible = [c for c in candidates[1:] if c[1] is None]
+            if ineligible:
+                ctrs.conflicts_skipped += 1
+                ctrs.warnings.append(
+                    f"remediation_skip: norm_name={norm_name!r} — "
+                    f"{len(ineligible)} null-email candidate(s) ineligible for merge "
+                    "(promoted or not in reject state)"
+                )
+            continue
+
+        # Process each eligible loser
+        group_errors = 0
+        for loser in losers:
+            loser_id = str(loser[0])
+            sp = f"remediation_{ctrs.groups_examined}_{ctrs.loser_rows_deleted}"
+            try:
+                if not dry_run:
+                    conn.execute(f"SAVEPOINT {sp}")
+
+                # 1. Transfer candidate_source_link rows
+                links = conn.execute(
+                    """
+                    SELECT candidate_entity_type, source_table_name, source_row_pk,
+                           source_row_hash, source_system, link_score, link_reason
+                    FROM candidate_source_link
+                    WHERE candidate_entity_id = %s
+                    """,
+                    (loser_id,),
+                ).fetchall()
+                for lnk in links:
+                    if not dry_run:
+                        conn.execute(
+                            """
+                            INSERT INTO candidate_source_link
+                                (candidate_entity_type, candidate_entity_id, source_table_name,
+                                 source_row_pk, source_row_hash, source_system,
+                                 link_score, link_reason)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (candidate_entity_type, candidate_entity_id,
+                                         source_table_name, source_row_pk)
+                            DO NOTHING
+                            """,
+                            (
+                                lnk[0], winner_id, lnk[1], lnk[2], lnk[3], lnk[4], lnk[5],
+                                json.dumps(lnk[6]) if lnk[6] is not None else "{}",
+                            ),
+                        )
+                    ctrs.links_transferred += 1
+
+                # 2. Transfer candidate_participant_contact rows
+                contacts = conn.execute(
+                    """
+                    SELECT contact_type, raw_value, normalized_value, is_primary,
+                           source_table_name, source_row_pk
+                    FROM candidate_participant_contact
+                    WHERE candidate_participant_id = %s
+                    """,
+                    (loser_id,),
+                ).fetchall()
+                for c in contacts:
+                    if not dry_run:
+                        if c[2] is not None:
+                            conn.execute(
+                                """
+                                INSERT INTO candidate_participant_contact
+                                    (candidate_participant_id, contact_type, raw_value,
+                                     normalized_value, is_primary, source_table_name, source_row_pk)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (candidate_participant_id, contact_type, normalized_value)
+                                    WHERE normalized_value IS NOT NULL
+                                DO NOTHING
+                                """,
+                                (winner_id, c[0], c[1], c[2], c[3], c[4], c[5]),
+                            )
+                        else:
+                            conn.execute(
+                                """
+                                INSERT INTO candidate_participant_contact
+                                    (candidate_participant_id, contact_type, raw_value,
+                                     normalized_value, is_primary, source_table_name, source_row_pk)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (candidate_participant_id, contact_type, raw_value)
+                                    WHERE normalized_value IS NULL
+                                DO NOTHING
+                                """,
+                                (winner_id, c[0], c[1], None, c[3], c[4], c[5]),
+                            )
+                    ctrs.contacts_transferred += 1
+
+                # 3. Transfer candidate_participant_address rows
+                addresses = conn.execute(
+                    """
+                    SELECT address_raw, line1, city, state, postal_code, country_code,
+                           is_primary, source_table_name, source_row_pk
+                    FROM candidate_participant_address
+                    WHERE candidate_participant_id = %s
+                    """,
+                    (loser_id,),
+                ).fetchall()
+                for a in addresses:
+                    if not dry_run:
+                        conn.execute(
+                            """
+                            INSERT INTO candidate_participant_address
+                                (candidate_participant_id, address_raw, line1, city, state,
+                                 postal_code, country_code, is_primary,
+                                 source_table_name, source_row_pk)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (candidate_participant_id, address_raw) DO NOTHING
+                            """,
+                            (winner_id, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]),
+                        )
+                    ctrs.addresses_transferred += 1
+
+                # 4. Transfer candidate_participant_role_assignment rows
+                roles = conn.execute(
+                    """
+                    SELECT role, candidate_event_id, candidate_registration_id, source_context
+                    FROM candidate_participant_role_assignment
+                    WHERE candidate_participant_id = %s
+                    """,
+                    (loser_id,),
+                ).fetchall()
+                for r in roles:
+                    if not dry_run:
+                        conn.execute(
+                            """
+                            INSERT INTO candidate_participant_role_assignment
+                                (candidate_participant_id, role, candidate_event_id,
+                                 candidate_registration_id, source_context)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (
+                                candidate_participant_id,
+                                role,
+                                COALESCE(candidate_event_id::text, ''),
+                                COALESCE(candidate_registration_id::text, '')
+                            ) DO NOTHING
+                            """,
+                            (winner_id, r[0], r[1], r[2], r[3]),
+                        )
+                    ctrs.roles_transferred += 1
+
+                # 5. Fill winner nulls (COALESCE enrichment) from loser top-level fields
+                if not dry_run:
+                    conn.execute(
+                        """
+                        UPDATE candidate_participant SET
+                            display_name    = COALESCE(candidate_participant.display_name,
+                                                       src.display_name),
+                            date_of_birth   = COALESCE(candidate_participant.date_of_birth,
+                                                       src.date_of_birth),
+                            best_phone      = COALESCE(candidate_participant.best_phone,
+                                                       src.best_phone),
+                            updated_at      = now()
+                        FROM (SELECT display_name, date_of_birth, best_phone
+                              FROM candidate_participant WHERE id = %s) src
+                        WHERE candidate_participant.id = %s
+                        """,
+                        (loser_id, winner_id),
+                    )
+
+                # 6. Write audit log
+                if not dry_run:
+                    conn.execute(
+                        """
+                        INSERT INTO resolution_manual_action_log
+                            (entity_type, candidate_entity_id, canonical_entity_id,
+                             action_type, reason_code, actor, source)
+                        VALUES ('participant', %s, NULL, 'merge',
+                                'under_combination_consolidation',
+                                'pipeline_under_combination_fix', 'pipeline')
+                        """,
+                        (loser_id,),
+                    )
+
+                # 7. Repoint candidate_registration FK references from loser -> winner
+                if not dry_run:
+                    conn.execute(
+                        """
+                        UPDATE candidate_registration
+                           SET candidate_primary_participant_id = %s,
+                               updated_at = now()
+                         WHERE candidate_primary_participant_id = %s
+                        """,
+                        (winner_id, loser_id),
+                    )
+
+                # 8. Delete loser's original source links (already copied to winner)
+                if not dry_run:
+                    conn.execute(
+                        "DELETE FROM candidate_source_link WHERE candidate_entity_id = %s",
+                        (loser_id,),
+                    )
+
+                # 9. Delete loser
+                if not dry_run:
+                    conn.execute(
+                        "DELETE FROM candidate_participant WHERE id = %s",
+                        (loser_id,),
+                    )
+                    conn.execute(f"RELEASE SAVEPOINT {sp}")
+
+                ctrs.loser_rows_deleted += 1
+
+            except Exception as exc:
+                group_errors += 1
+                ctrs.db_errors += 1
+                ctrs.warnings.append(
+                    f"remediation_error: norm_name={norm_name!r} loser_id={loser_id}: {exc}"
+                )
+                if not dry_run:
+                    try:
+                        conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                        conn.execute(f"RELEASE SAVEPOINT {sp}")
+                    except Exception:
+                        pass
+                continue
+
+        if losers and group_errors == 0:
+            ctrs.groups_merged += 1
+
+    return ctrs
+
+
+def build_remediation_report(
+    ctrs: UnderCombinationRemediationCounters,
+    dry_run: bool = False,
+) -> str:
+    """Return a human-readable text report of a remediation run."""
+    lines = [
+        "=" * 60,
+        "Under-Combination Remediation Report",
+        f"  dry_run: {dry_run}",
+        "=" * 60,
+        f"  groups examined:      {ctrs.groups_examined}",
+        f"  groups merged:        {ctrs.groups_merged}",
+        f"  loser rows deleted:   {ctrs.loser_rows_deleted}",
+        f"  links transferred:    {ctrs.links_transferred}",
+        f"  contacts transferred: {ctrs.contacts_transferred}",
+        f"  addresses transferred:{ctrs.addresses_transferred}",
+        f"  roles transferred:    {ctrs.roles_transferred}",
+        f"  conflicts skipped:    {ctrs.conflicts_skipped}",
+        f"  db errors:            {ctrs.db_errors}",
+    ]
+    if ctrs.warnings:
+        lines.append(f"\nWarnings ({len(ctrs.warnings)}):")
+        for w in ctrs.warnings[:20]:
+            lines.append(f"  {w}")
+        if len(ctrs.warnings) > 20:
+            lines.append(f"  ... and {len(ctrs.warnings) - 20} more")
     lines.append("=" * 60)
     return "\n".join(lines)
