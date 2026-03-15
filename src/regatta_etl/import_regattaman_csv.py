@@ -432,6 +432,7 @@ def _process_row(
         "lineage_report", "purge_check",
         "participant_enrichment_rocketreach",
         "participant_under_combination_remediation",
+        "participant_hold_geo_prepare",
     ]),
     show_default=True,
     help="Ingestion mode",
@@ -670,6 +671,31 @@ def _process_row(
     show_default=True,
     help="[participant_enrichment_rocketreach] Warn when API failure rate exceeds this fraction",
 )
+# participant_hold_geo_prepare flags
+@click.option(
+    "--geo-states",
+    default="hold",
+    show_default=True,
+    help="[participant_hold_geo_prepare] Comma-separated resolution_state values to process",
+)
+@click.option(
+    "--include-country-only/--no-include-country-only",
+    default=False,
+    show_default=True,
+    help="[participant_hold_geo_prepare] Allow country_only hints to qualify as enrichment_ready",
+)
+@click.option(
+    "--allow-freeform-partial/--no-allow-freeform-partial",
+    default=False,
+    show_default=True,
+    help="[participant_hold_geo_prepare] Allow freeform_partial hints to qualify as enrichment_ready",
+)
+@click.option(
+    "--require-geo-ready/--no-require-geo-ready",
+    default=False,
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Restrict to candidates with enrichment_ready geo readiness",
+)
 def main(
     mode: str,
     db_dsn: str,
@@ -745,6 +771,11 @@ def main(
     qps_limit: float,
     rocketreach_environment: str,
     max_api_failure_rate: float,
+    # participant_hold_geo_prepare
+    geo_states: str,
+    include_country_only: bool,
+    allow_freeform_partial: bool,
+    require_geo_ready: bool,
 ) -> None:
     """Unified Regattaman ingestion CLI."""
     run_id = run_id or str(uuid.uuid4())
@@ -1256,6 +1287,7 @@ def main(
                 max_api_failure_rate=max_api_failure_rate,
                 dry_run=dry_run,
                 counters=rr_counters,
+                require_geo_ready=require_geo_ready,
             )
             report = build_enrichment_report(rr_counters, dry_run=dry_run)
             click.echo(report)
@@ -1324,6 +1356,56 @@ def main(
             run_id, started_at, mode, dry_run,
             {},
             uc_ctrs,  # type: ignore[arg-type]
+        )
+        click.echo(f"[{run_id}] Run report: {report_path}")
+        return
+    elif mode == "participant_hold_geo_prepare":
+        from regatta_etl.participant_hold_geo_prepare import (
+            HoldGeoPrepareCounters,
+            build_geo_prepare_report,
+            run_hold_geo_prepare,
+        )
+        geo_state_list = [s.strip() for s in geo_states.split(",") if s.strip()]
+        click.echo(
+            f"[{run_id}] participant_hold_geo_prepare "
+            f"states={geo_state_list} max_candidates={max_candidates} "
+            f"include_country_only={include_country_only} "
+            f"allow_freeform_partial={allow_freeform_partial} dry_run={dry_run}"
+        )
+        conn = psycopg.connect(db_dsn, autocommit=False)
+        try:
+            geo_ctrs = run_hold_geo_prepare(
+                conn=conn,
+                max_candidates=max_candidates if max_candidates > 0 else None,
+                states=geo_state_list,
+                include_country_only=include_country_only,
+                allow_freeform_partial=allow_freeform_partial,
+                dry_run=dry_run,
+            )
+            report = build_geo_prepare_report(geo_ctrs, dry_run=dry_run)
+            click.echo(report)
+            if dry_run or geo_ctrs.db_errors > 0:
+                conn.rollback()
+                if dry_run:
+                    click.echo(f"[{run_id}] DRY RUN — rolled back.")
+                else:
+                    click.echo(
+                        f"[{run_id}] {geo_ctrs.db_errors} DB errors — rolled back.",
+                        err=True,
+                    )
+                    sys.exit(1)
+            else:
+                conn.commit()
+                click.echo(f"[{run_id}] Committed.")
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        report_path = write_run_report(
+            run_id, started_at, mode, dry_run,
+            {"geo_states": geo_state_list, "max_candidates": max_candidates},
+            geo_ctrs,  # type: ignore[arg-type]
         )
         click.echo(f"[{run_id}] Run report: {report_path}")
         return

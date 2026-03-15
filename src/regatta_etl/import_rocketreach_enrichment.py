@@ -415,9 +415,18 @@ def _select_candidates(
     require_missing: str,
     cooldown_days: int,
     max_candidates: int,
+    require_geo_ready: bool = False,
 ) -> list[dict]:
     """Return up to max_candidates eligible candidate_participant rows."""
     missing_clause = _missing_filter_clause(require_missing)
+    geo_clause = (
+        """AND EXISTS (
+              SELECT 1 FROM candidate_participant_enrichment_readiness cper
+              WHERE cper.candidate_participant_id = cp.id
+                AND cper.readiness_status = 'enrichment_ready'
+          )"""
+        if require_geo_ready else ""
+    )
     sql = f"""
         SELECT
             cp.id,
@@ -437,6 +446,7 @@ def _select_candidates(
               WHERE rer.candidate_participant_id = cp.id
                 AND rer.created_at > NOW() - (%s * INTERVAL '1 day')
           )
+          {geo_clause}
         ORDER BY cp.quality_score DESC, cp.updated_at DESC, cp.id ASC
         LIMIT %s
     """
@@ -922,6 +932,7 @@ def run_rocketreach_enrichment(
     dry_run: bool,
     counters: RocketReachEnrichmentCounters,
     client: RocketReachClientProtocol | None = None,
+    require_geo_ready: bool = False,
 ) -> RocketReachEnrichmentCounters:
     """Run the RocketReach enrichment pipeline.
 
@@ -968,7 +979,8 @@ def run_rocketreach_enrichment(
 
     # Select candidates
     candidates = _select_candidates(
-        conn, candidate_states, require_missing, cooldown_days, max_candidates
+        conn, candidate_states, require_missing, cooldown_days, max_candidates,
+        require_geo_ready=require_geo_ready,
     )
     counters.rocketreach_candidates_considered = len(candidates)
 
