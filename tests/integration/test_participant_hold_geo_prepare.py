@@ -501,6 +501,117 @@ class TestRocketReachGeoReadyFilter:
 
 
 # ---------------------------------------------------------------------------
+# Test: stale readiness invalidation
+# ---------------------------------------------------------------------------
+
+class TestStaleReadinessInvalidation:
+    def test_candidate_leaving_hold_gets_invalidated(self, db_conn):
+        """Candidate previously enrichment_ready that moves to review state is
+        invalidated to not_hold on the next run so RocketReach cannot select it."""
+        conn, _ = db_conn
+        cid = _seed_candidate(conn)
+        _seed_address(conn, cid, "Portland ME USA")
+        conn.commit()
+
+        # Run 1: candidate is hold → enrichment_ready
+        run_hold_geo_prepare(conn, states=["hold"])
+        conn.commit()
+
+        readiness_1 = conn.execute(
+            "SELECT readiness_status FROM candidate_participant_enrichment_readiness "
+            "WHERE candidate_participant_id = %s",
+            (cid,),
+        ).fetchone()[0]
+        assert readiness_1 == "enrichment_ready"
+
+        # Move candidate out of hold
+        conn.execute(
+            "UPDATE candidate_participant SET resolution_state = 'review' WHERE id = %s",
+            (cid,),
+        )
+        conn.commit()
+
+        # Run 2: candidate is no longer hold → stale row should be invalidated
+        ctrs = run_hold_geo_prepare(conn, states=["hold"])
+        conn.commit()
+
+        assert ctrs.geo_candidates_invalidated >= 1
+
+        readiness_2 = conn.execute(
+            "SELECT readiness_status, reason_code "
+            "FROM candidate_participant_enrichment_readiness "
+            "WHERE candidate_participant_id = %s",
+            (cid,),
+        ).fetchone()
+        assert readiness_2[0] == "not_hold"
+        assert readiness_2[1] == "invalidated_out_of_scope"
+
+    def test_invalidated_candidate_excluded_from_rocketreach_filter(self, db_conn):
+        """After invalidation, require_geo_ready=True must not select the candidate."""
+        conn, _ = db_conn
+        cid = _seed_candidate(conn, normalized_name="stale alice")
+        _seed_address(conn, cid, "Portland ME USA")
+        conn.commit()
+
+        run_hold_geo_prepare(conn, states=["hold"])
+        conn.commit()
+
+        # Move out of hold
+        conn.execute(
+            "UPDATE candidate_participant SET resolution_state = 'review' WHERE id = %s",
+            (cid,),
+        )
+        conn.commit()
+
+        # Invalidation run
+        run_hold_geo_prepare(conn, states=["hold"])
+        conn.commit()
+
+        from regatta_etl.import_rocketreach_enrichment import _select_candidates
+        # RocketReach selects from 'review' state — but readiness is now not_hold
+        candidates = _select_candidates(
+            conn,
+            candidate_states=["review"],
+            require_missing="none",
+            cooldown_days=0,
+            max_candidates=100,
+            require_geo_ready=True,
+        )
+        ids = {str(c["id"]) for c in candidates}
+        assert cid not in ids
+
+    def test_non_enrichment_ready_rows_not_touched_by_invalidation(self, db_conn):
+        """Only enrichment_ready rows are subject to invalidation; too_vague etc. are preserved."""
+        conn, _ = db_conn
+        cid = _seed_candidate(conn)
+        _seed_address(conn, cid, "USA")  # → too_vague
+        conn.commit()
+
+        run_hold_geo_prepare(conn, states=["hold"])
+        conn.commit()
+
+        # Move out of hold
+        conn.execute(
+            "UPDATE candidate_participant SET resolution_state = 'review' WHERE id = %s",
+            (cid,),
+        )
+        conn.commit()
+
+        ctrs = run_hold_geo_prepare(conn, states=["hold"])
+        conn.commit()
+
+        # too_vague was not enrichment_ready, so invalidation counter should be 0
+        assert ctrs.geo_candidates_invalidated == 0
+
+        readiness = conn.execute(
+            "SELECT readiness_status FROM candidate_participant_enrichment_readiness "
+            "WHERE candidate_participant_id = %s",
+            (cid,),
+        ).fetchone()[0]
+        assert readiness == "too_vague"  # unchanged
+
+
+# ---------------------------------------------------------------------------
 # Test: max_candidates limit
 # ---------------------------------------------------------------------------
 

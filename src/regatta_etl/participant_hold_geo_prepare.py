@@ -457,6 +457,7 @@ class HoldGeoPrepareCounters:
     geo_candidates_junk_location: int = 0
     geo_candidates_multi_location_conflict: int = 0
     geo_candidates_already_has_contact: int = 0
+    geo_candidates_invalidated: int = 0   # stale enrichment_ready rows cleared
     db_errors: int = 0
     warnings: list[str] = field(default_factory=list)
 
@@ -567,6 +568,33 @@ def run_hold_geo_prepare(
     ctrs = HoldGeoPrepareCounters()
     target_states = states or ["hold"]
     limit_sql = f"LIMIT {int(max_candidates)}" if max_candidates is not None else ""
+
+    # Invalidate stale enrichment_ready rows for candidates that are no longer
+    # in scope: wrong state, promoted, or lost all usable address rows.
+    # This prevents RocketReach (require_geo_ready=True) from selecting
+    # candidates whose readiness was computed under now-stale conditions.
+    result = conn.execute(
+        """
+        UPDATE candidate_participant_enrichment_readiness cper
+        SET readiness_status = 'not_hold',
+            reason_code      = 'invalidated_out_of_scope',
+            evaluated_at     = now()
+        WHERE cper.readiness_status = 'enrichment_ready'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM candidate_participant cp
+              JOIN candidate_participant_address cpa
+                ON cpa.candidate_participant_id = cp.id
+              WHERE cp.id = cper.candidate_participant_id
+                AND cp.resolution_state = ANY(%s)
+                AND cp.is_promoted = false
+                AND cpa.address_raw IS NOT NULL
+                AND cpa.address_raw <> ''
+          )
+        """,
+        (target_states,),
+    )
+    ctrs.geo_candidates_invalidated = result.rowcount
 
     # Fetch hold candidates that have at least one address child row.
     # DISTINCT to avoid duplicate rows if a candidate has multiple addresses.
@@ -730,6 +758,7 @@ def build_geo_prepare_report(ctrs: HoldGeoPrepareCounters, dry_run: bool = False
         f"  junk_location:                {ctrs.geo_candidates_junk_location}",
         f"  multi_location_conflict:      {ctrs.geo_candidates_multi_location_conflict}",
         f"  already_has_contact:          {ctrs.geo_candidates_already_has_contact}",
+        f"  invalidated (out-of-scope):   {ctrs.geo_candidates_invalidated}",
         f"DB errors:                      {ctrs.db_errors}",
     ]
     if ctrs.warnings:
