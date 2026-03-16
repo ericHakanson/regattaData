@@ -680,3 +680,39 @@ class TestGeoAwarePayload:
             conn, "run-1", candidate, _OkStub(), "rocketreach_api", counters,
         )
         assert counters.rocketreach_geo_ready_candidates_called == 1
+
+    def test_normalized_name_preferred_over_display_name_in_payload(self):
+        """When normalized_name and display_name differ, normalized_name is sent to
+        RocketReach and written into request_payload — not the raw display_name."""
+        from regatta_etl.import_rocketreach_enrichment import _process_candidate
+
+        candidate = _make_candidate(
+            normalized_name="ryan conway",          # clean normalized form
+            display_name="Conway, Ryan",            # inverted raw display form
+            best_email=None,
+            best_city="Westport",
+            best_state_region="CT",
+            best_country_code="USA",
+        )
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = (
+            "00000000-0000-0000-0000-000000000099",
+        )
+
+        captured: dict = {}
+
+        class _CapturingStub:
+            def lookup(self, email, counters, **kwargs):
+                captured.update(kwargs)
+                return LookupResult(
+                    row_status="complete", profiles=[], person_id=None,
+                    credits_used=True, error_code=None,
+                )
+
+        counters = _make_counters()
+        _process_candidate(
+            conn, "run-1", candidate, _CapturingStub(), "rocketreach_api", counters,
+        )
+        # The outbound name must be the normalized form, not the inverted display form
+        assert captured.get("name") == "ryan conway"
+        assert captured.get("name") != "Conway, Ryan"

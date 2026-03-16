@@ -787,7 +787,10 @@ def _process_candidate(
 ) -> None:
     """Process one candidate: lookup → gate → apply → audit row."""
     candidate_id = str(candidate["id"])
-    name = candidate["display_name"] or candidate["normalized_name"] or ""
+    # Prefer normalized_name for the outbound request — it is the same value that
+    # _is_plausible_person_name() validates, so the gate and the payload are consistent.
+    # Fall back to display_name only when normalized_name is absent.
+    name = candidate["normalized_name"] or candidate["display_name"] or ""
     email = normalize_email(candidate["best_email"]) if candidate["best_email"] else None
 
     # Geo context from readiness join (None when no readiness row)
