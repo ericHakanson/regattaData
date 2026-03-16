@@ -53,6 +53,13 @@ _BACKOFF_MAX = 64.0
 # RocketReach confidence is 0–100; treat < 50 as no_match.
 _MIN_CONFIDENCE = 50
 
+# Person-name quality gate constants
+_NAME_ORG_TOKENS: frozenset[str] = frozenset({
+    "club", "team", "yacht", "sailing", "marina", "cruising",
+    "corinthian", "association", "corps", "committee",
+})
+_MAX_NAME_TOKENS = 5
+
 
 # ---------------------------------------------------------------------------
 # LookupResult — returned by every client implementation
@@ -73,11 +80,39 @@ class LookupResult:
 # Client protocol — injectable for tests
 # ---------------------------------------------------------------------------
 
+def _is_plausible_person_name(name: str | None) -> bool:
+    """Return True if name looks like a plausible individual person.
+
+    Fails closed: rejects names that contain org-like tokens, ambiguous
+    separators, or an improbably large number of tokens.
+    """
+    if not name:
+        return False
+    cleaned = name.strip()
+    if len(cleaned) < 2:
+        return False
+    # Multi-person or list-like separators
+    if "&" in cleaned or "/" in cleaned:
+        return False
+    tokens = cleaned.lower().split()
+    # Org or program tokens
+    if any(t in _NAME_ORG_TOKENS for t in tokens):
+        return False
+    # Too many tokens → likely concatenated labels
+    if len(tokens) > _MAX_NAME_TOKENS:
+        return False
+    return True
+
+
 class RocketReachClientProtocol(Protocol):
     def lookup(
         self,
         email: str | None,
         counters: "RocketReachEnrichmentCounters",
+        name: str | None = None,
+        city: str | None = None,
+        state: str | None = None,
+        country: str | None = None,
     ) -> LookupResult: ...
 
 
@@ -113,6 +148,10 @@ class RocketReachClient:
         self,
         email: str | None,
         counters: "RocketReachEnrichmentCounters",
+        name: str | None = None,
+        city: str | None = None,
+        state: str | None = None,
+        country: str | None = None,
     ) -> LookupResult:
         """Submit a person lookup and poll until terminal state or timeout.
 
@@ -120,15 +159,26 @@ class RocketReachClient:
         metrics (rate limits, polls, credits, errors).
         """
         url = self.base_url + _API_LOOKUP_PATH
-        if not email:
+        # Require at least email, OR name + at least one geo field
+        if not email and not (name and (city or state or country)):
             return LookupResult(
                 row_status="skipped",
                 profiles=[],
                 person_id=None,
                 credits_used=False,
-                error_code="rocketreach_email_required",
+                error_code="rocketreach_insufficient_lookup_params",
             )
-        params: dict[str, Any] = {"email": email}
+        params: dict[str, Any] = {}
+        if email:
+            params["email"] = email
+        if name:
+            params["name"] = name
+        if city:
+            params["city"] = city
+        if state:
+            params["state"] = state
+        if country:
+            params["country"] = country
 
         resp, lookup_error = self._lookup_with_retry(url, params, counters)
         if resp is None:
@@ -341,6 +391,10 @@ class _NullRocketReachClient:
         self,
         email: str | None,
         counters: "RocketReachEnrichmentCounters",
+        name: str | None = None,
+        city: str | None = None,
+        state: str | None = None,
+        country: str | None = None,
     ) -> LookupResult:
         return LookupResult(
             row_status="skipped",
@@ -359,6 +413,8 @@ class _NullRocketReachClient:
 class RocketReachEnrichmentCounters:
     rocketreach_candidates_considered: int = 0
     rocketreach_candidates_called: int = 0
+    rocketreach_geo_ready_candidates_called: int = 0   # subset with geo context
+    rocketreach_non_person_name: int = 0               # skipped by name-quality gate
     rocketreach_matches_applied: int = 0
     rocketreach_no_match: int = 0
     rocketreach_ambiguous: int = 0
@@ -376,6 +432,8 @@ class RocketReachEnrichmentCounters:
         return {
             "rocketreach_candidates_considered": self.rocketreach_candidates_considered,
             "rocketreach_candidates_called": self.rocketreach_candidates_called,
+            "rocketreach_geo_ready_candidates_called": self.rocketreach_geo_ready_candidates_called,
+            "rocketreach_non_person_name": self.rocketreach_non_person_name,
             "rocketreach_matches_applied": self.rocketreach_matches_applied,
             "rocketreach_no_match": self.rocketreach_no_match,
             "rocketreach_ambiguous": self.rocketreach_ambiguous,
@@ -416,17 +474,31 @@ def _select_candidates(
     cooldown_days: int,
     max_candidates: int,
     require_geo_ready: bool = False,
+    geo_country: str | None = None,
+    geo_states: list[str] | None = None,
 ) -> list[dict]:
-    """Return up to max_candidates eligible candidate_participant rows."""
+    """Return up to max_candidates eligible candidate_participant rows.
+
+    Always LEFT JOINs candidate_participant_enrichment_readiness so that
+    geo hint columns (best_city / best_state_region / best_country_code) are
+    available for every returned row (NULL when no readiness row exists).
+    """
     missing_clause = _missing_filter_clause(require_missing)
-    geo_clause = (
-        """AND EXISTS (
-              SELECT 1 FROM candidate_participant_enrichment_readiness cper
-              WHERE cper.candidate_participant_id = cp.id
-                AND cper.readiness_status = 'enrichment_ready'
-          )"""
-        if require_geo_ready else ""
-    )
+
+    extra_conditions: list[str] = []
+    extra_params: list = []
+
+    if require_geo_ready:
+        extra_conditions.append("cper.readiness_status = 'enrichment_ready'")
+    if geo_country:
+        extra_conditions.append("cper.best_country_code = %s")
+        extra_params.append(geo_country)
+    if geo_states:
+        extra_conditions.append("cper.best_state_region = ANY(%s)")
+        extra_params.append(geo_states)
+
+    extra_where = "".join(f"\n          AND {c}" for c in extra_conditions)
+
     sql = f"""
         SELECT
             cp.id,
@@ -435,8 +507,13 @@ def _select_candidates(
             cp.best_email,
             cp.best_phone,
             cp.quality_score,
-            cp.resolution_state
+            cp.resolution_state,
+            cper.best_city,
+            cper.best_state_region,
+            cper.best_country_code
         FROM candidate_participant cp
+        LEFT JOIN candidate_participant_enrichment_readiness cper
+            ON cper.candidate_participant_id = cp.id
         WHERE cp.is_promoted = false
           AND cp.resolution_state = ANY(%s)
           AND {missing_clause}
@@ -445,14 +522,15 @@ def _select_candidates(
               FROM rocketreach_enrichment_row rer
               WHERE rer.candidate_participant_id = cp.id
                 AND rer.created_at > NOW() - (%s * INTERVAL '1 day')
-          )
-          {geo_clause}
+          ){extra_where}
         ORDER BY cp.quality_score DESC, cp.updated_at DESC, cp.id ASC
         LIMIT %s
     """
-    rows = conn.execute(sql, (candidate_states, cooldown_days, max_candidates)).fetchall()
+    params: list = [candidate_states, cooldown_days] + extra_params + [max_candidates]
+    rows = conn.execute(sql, params).fetchall()
     cols = ["id", "display_name", "normalized_name", "best_email", "best_phone",
-            "quality_score", "resolution_state"]
+            "quality_score", "resolution_state",
+            "best_city", "best_state_region", "best_country_code"]
     return [dict(zip(cols, row)) for row in rows]
 
 
@@ -705,14 +783,38 @@ def _process_candidate(
     client: RocketReachClientProtocol,
     source_system: str,
     counters: RocketReachEnrichmentCounters,
+    require_person_name_quality: bool = True,
 ) -> None:
     """Process one candidate: lookup → gate → apply → audit row."""
     candidate_id = str(candidate["id"])
     name = candidate["display_name"] or candidate["normalized_name"] or ""
     email = normalize_email(candidate["best_email"]) if candidate["best_email"] else None
 
-    if not email:
-        # Strict email-first policy: skip without making API call.
+    # Geo context from readiness join (None when no readiness row)
+    geo_city: str | None = candidate.get("best_city")
+    geo_state: str | None = candidate.get("best_state_region")
+    geo_country: str | None = candidate.get("best_country_code")
+    has_geo_context = bool(geo_city or geo_state or geo_country)
+
+    # Person-name quality gate — runs before any billable API call
+    if require_person_name_quality and not _is_plausible_person_name(
+        candidate.get("normalized_name")
+    ):
+        counters.rocketreach_non_person_name += 1
+        _insert_enrichment_row(
+            conn, run_id, candidate_id,
+            request_payload={"name": name},
+            response_payload={},
+            provider_person_id=None,
+            match_confidence=None,
+            status="skipped",
+            error_code="rocketreach_non_person_name",
+            applied_field_mask=None,
+        )
+        return
+
+    # Email required unless geo context provides a sufficient lookup anchor
+    if not email and not has_geo_context:
         _insert_enrichment_row(
             conn, run_id, candidate_id,
             request_payload={"email": None, "name": name},
@@ -726,9 +828,28 @@ def _process_candidate(
         return
 
     counters.rocketreach_candidates_called += 1
-    request_payload = {"email": email, "name": name}
+    if has_geo_context:
+        counters.rocketreach_geo_ready_candidates_called += 1
 
-    result = client.lookup(email=email, counters=counters)
+    # Build request payload — name always included; geo fields when available
+    request_payload: dict[str, Any] = {"name": name}
+    if email:
+        request_payload["email"] = email
+    if geo_city:
+        request_payload["city"] = geo_city
+    if geo_state:
+        request_payload["state"] = geo_state
+    if geo_country:
+        request_payload["country"] = geo_country
+
+    result = client.lookup(
+        email=email,
+        counters=counters,
+        name=name if name else None,
+        city=geo_city,
+        state=geo_state,
+        country=geo_country,
+    )
 
     # Map raw row_status to enrichment_row.status
     if result.row_status == "rate_limited":
@@ -933,6 +1054,9 @@ def run_rocketreach_enrichment(
     counters: RocketReachEnrichmentCounters,
     client: RocketReachClientProtocol | None = None,
     require_geo_ready: bool = False,
+    geo_country: str | None = None,
+    geo_states: list[str] | None = None,
+    require_person_name_quality: bool = True,
 ) -> RocketReachEnrichmentCounters:
     """Run the RocketReach enrichment pipeline.
 
@@ -981,6 +1105,8 @@ def run_rocketreach_enrichment(
     candidates = _select_candidates(
         conn, candidate_states, require_missing, cooldown_days, max_candidates,
         require_geo_ready=require_geo_ready,
+        geo_country=geo_country,
+        geo_states=geo_states,
     )
     counters.rocketreach_candidates_considered = len(candidates)
 
@@ -990,7 +1116,8 @@ def run_rocketreach_enrichment(
         conn.execute(f"SAVEPOINT {sp_name}")
         try:
             _process_candidate(
-                conn, run_id, candidate, client, source_system, counters
+                conn, run_id, candidate, client, source_system, counters,
+                require_person_name_quality=require_person_name_quality,
             )
             conn.execute(f"RELEASE SAVEPOINT {sp_name}")
         except Exception as exc:
@@ -1049,6 +1176,8 @@ def build_enrichment_report(
         f"{tag}RocketReach Enrichment Report",
         f"  considered:      {counters.rocketreach_candidates_considered}",
         f"  called:          {counters.rocketreach_candidates_called}",
+        f"  geo_ready_called:{counters.rocketreach_geo_ready_candidates_called}",
+        f"  non_person_name: {counters.rocketreach_non_person_name}",
         f"  matched/applied: {counters.rocketreach_matches_applied}",
         f"  no_match:        {counters.rocketreach_no_match}",
         f"  ambiguous:       {counters.rocketreach_ambiguous}",

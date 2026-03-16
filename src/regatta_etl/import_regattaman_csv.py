@@ -696,6 +696,22 @@ def _process_row(
     show_default=True,
     help="[participant_enrichment_rocketreach] Restrict to candidates with enrichment_ready geo readiness",
 )
+@click.option(
+    "--rocketreach-geo-country",
+    default=None,
+    help="[participant_enrichment_rocketreach] Filter to this country code (e.g. USA)",
+)
+@click.option(
+    "--rocketreach-geo-states",
+    default=None,
+    help="[participant_enrichment_rocketreach] Comma-separated state codes (e.g. NY,CT,MA)",
+)
+@click.option(
+    "--require-person-name-quality/--no-require-person-name-quality",
+    default=True,
+    show_default=True,
+    help="[participant_enrichment_rocketreach] Skip candidates whose name fails person-name quality gate",
+)
 def main(
     mode: str,
     db_dsn: str,
@@ -771,11 +787,14 @@ def main(
     qps_limit: float,
     rocketreach_environment: str,
     max_api_failure_rate: float,
+    require_geo_ready: bool,
+    rocketreach_geo_country: str | None,
+    rocketreach_geo_states: str | None,
+    require_person_name_quality: bool,
     # participant_hold_geo_prepare
     geo_states: str,
     include_country_only: bool,
     allow_freeform_partial: bool,
-    require_geo_ready: bool,
 ) -> None:
     """Unified Regattaman ingestion CLI."""
     run_id = run_id or str(uuid.uuid4())
@@ -1288,6 +1307,12 @@ def main(
                 dry_run=dry_run,
                 counters=rr_counters,
                 require_geo_ready=require_geo_ready,
+                geo_country=rocketreach_geo_country or None,
+                geo_states=(
+                    [s.strip() for s in rocketreach_geo_states.split(",") if s.strip()]
+                    if rocketreach_geo_states else None
+                ),
+                require_person_name_quality=require_person_name_quality,
             )
             report = build_enrichment_report(rr_counters, dry_run=dry_run)
             click.echo(report)

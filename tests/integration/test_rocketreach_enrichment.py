@@ -38,12 +38,15 @@ class _StubClient:
 
     def __init__(self, responses: list[LookupResult]) -> None:
         self._iter = iter(responses)
+        self.last_kwargs: dict = {}
 
     def lookup(
         self,
         email: str | None,
         counters: RocketReachEnrichmentCounters,
+        **kwargs,
     ) -> LookupResult:
+        self.last_kwargs = {"email": email, **kwargs}
         return next(self._iter)
 
 
@@ -126,6 +129,10 @@ def _run(
     cooldown_days: int = 30,
     max_candidates: int = 100,
     dry_run: bool = False,
+    require_geo_ready: bool = False,
+    geo_country: str | None = None,
+    geo_states: list[str] | None = None,
+    require_person_name_quality: bool = True,
 ) -> RocketReachEnrichmentCounters:
     counters = RocketReachEnrichmentCounters()
     run_rocketreach_enrichment(
@@ -144,8 +151,41 @@ def _run(
         dry_run=dry_run,
         counters=counters,
         client=client,
+        require_geo_ready=require_geo_ready,
+        geo_country=geo_country,
+        geo_states=geo_states,
+        require_person_name_quality=require_person_name_quality,
     )
     return counters
+
+
+def _seed_enrichment_readiness(
+    conn: psycopg.Connection,
+    candidate_id: str,
+    readiness_status: str = "enrichment_ready",
+    reason_code: str = "geo_ready",
+    best_city: str | None = None,
+    best_state_region: str | None = None,
+    best_country_code: str | None = None,
+) -> None:
+    """Insert a candidate_participant_enrichment_readiness row."""
+    conn.execute(
+        """
+        INSERT INTO candidate_participant_enrichment_readiness
+            (candidate_participant_id, readiness_status, reason_code,
+             best_city, best_state_region, best_country_code,
+             evaluated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, now())
+        ON CONFLICT (candidate_participant_id) DO UPDATE
+          SET readiness_status   = EXCLUDED.readiness_status,
+              reason_code        = EXCLUDED.reason_code,
+              best_city          = EXCLUDED.best_city,
+              best_state_region  = EXCLUDED.best_state_region,
+              best_country_code  = EXCLUDED.best_country_code,
+              evaluated_at       = now()
+        """,
+        (candidate_id, readiness_status, reason_code, best_city, best_state_region, best_country_code),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -700,3 +740,401 @@ class TestCounterSemantics:
         assert called == 3
         assert failures == 3
         assert failures / called <= 1.0  # failure rate is exactly 1.0 here, never > 1.0
+
+
+# ---------------------------------------------------------------------------
+# Northeast geo-aware selection (spec §8.2)
+# ---------------------------------------------------------------------------
+
+class TestNortheastGeoFilter:
+    """Candidate in CT is selected; candidate in FL is excluded when Northeast
+    filter is active (geo_country='USA', geo_states=['NY','CT','RI','MA','ME','NH'])."""
+
+    _NE_STATES = ["NY", "CT", "RI", "MA", "ME", "NH"]
+
+    def test_ct_candidate_selected_when_northeast_filter_enabled(self, db_conn):
+        """A CT hold candidate with enrichment_ready status is selected."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Ryan Conway",
+            normalized_name="ryan conway",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="enrichment_ready",
+            best_city="Westport",
+            best_state_region="CT",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([_matched(emails=["ryan@example.com"])])
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=self._NE_STATES,
+        )
+        conn.commit()
+
+        assert ctrs.rocketreach_candidates_considered == 1
+        assert ctrs.rocketreach_candidates_called == 1
+
+    def test_fl_candidate_excluded_when_northeast_filter_enabled(self, db_conn):
+        """A FL hold candidate is excluded even if enrichment_ready."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Bob Florida",
+            normalized_name="bob florida",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="enrichment_ready",
+            best_city="Miami",
+            best_state_region="FL",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([])  # would raise StopIteration if called
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=self._NE_STATES,
+        )
+        conn.commit()
+
+        assert ctrs.rocketreach_candidates_considered == 0
+
+    def test_ne_selected_fl_excluded_when_both_present(self, db_conn):
+        """Only the NE candidate is selected when both NE and FL exist."""
+        conn, _ = db_conn
+        ne_id = _seed_candidate(
+            conn,
+            display_name="Alice Conn",
+            normalized_name="alice conn",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, ne_id,
+            readiness_status="enrichment_ready",
+            best_city="Greenwich",
+            best_state_region="CT",
+            best_country_code="USA",
+        )
+        fl_id = _seed_candidate(
+            conn,
+            display_name="Bob Miami",
+            normalized_name="bob miami",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, fl_id,
+            readiness_status="enrichment_ready",
+            best_city="Miami",
+            best_state_region="FL",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([_matched(emails=["alice@example.com"])])
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=self._NE_STATES,
+        )
+        conn.commit()
+
+        assert ctrs.rocketreach_candidates_considered == 1
+        assert ctrs.rocketreach_candidates_called == 1
+
+
+class TestPersonNameGateIntegration:
+    """Org-like candidate name is skipped before API call with rocketreach_non_person_name."""
+
+    def test_org_name_skipped_before_api_call(self, db_conn):
+        """A candidate with an org-like name is skipped; API is never called."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Noroton Yacht Club Junior Big Boat",
+            normalized_name="noroton yacht club junior big boat",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="enrichment_ready",
+            best_city="Darien",
+            best_state_region="CT",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([])  # raises StopIteration if lookup() called
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=["NY", "CT", "RI", "MA", "ME", "NH"],
+            require_person_name_quality=True,
+        )
+        conn.commit()
+
+        assert ctrs.rocketreach_non_person_name == 1
+        assert ctrs.rocketreach_candidates_called == 0
+
+        row = conn.execute(
+            """
+            SELECT status, error_code
+            FROM rocketreach_enrichment_row
+            WHERE candidate_participant_id = %s
+            """,
+            (cid,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "skipped"
+        assert row[1] == "rocketreach_non_person_name"
+
+    def test_plausible_name_proceeds_to_api(self, db_conn):
+        """A candidate with a plausible person name is NOT skipped by the gate."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Skip McGuire",
+            normalized_name="skip mcguire",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="enrichment_ready",
+            best_city="Newport",
+            best_state_region="RI",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([_matched(emails=["skip@example.com"])])
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=["NY", "CT", "RI", "MA", "ME", "NH"],
+            require_person_name_quality=True,
+        )
+        conn.commit()
+
+        assert ctrs.rocketreach_non_person_name == 0
+        assert ctrs.rocketreach_candidates_called == 1
+
+
+class TestGeoAwarePayloadIntegration:
+    """Selected geo-ready candidate writes request payload containing name + geography."""
+
+    def test_request_payload_contains_name_and_geo(self, db_conn):
+        """rocketreach_enrichment_row.request_payload includes name, city, state, country."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Ryan Conway",
+            normalized_name="ryan conway",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="enrichment_ready",
+            best_city="Westport",
+            best_state_region="CT",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([_matched(emails=["ryan@example.com"])])
+        _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=["NY", "CT", "RI", "MA", "ME", "NH"],
+        )
+        conn.commit()
+
+        payload = conn.execute(
+            """
+            SELECT request_payload
+            FROM rocketreach_enrichment_row
+            WHERE candidate_participant_id = %s
+            """,
+            (cid,),
+        ).fetchone()[0]
+
+        assert payload is not None
+        assert "name" in payload
+        assert payload.get("city") == "Westport"
+        assert payload.get("state") == "CT"
+        assert payload.get("country") == "USA"
+
+    def test_geo_ready_counter_incremented(self, db_conn):
+        """rocketreach_geo_ready_candidates_called is incremented for geo-context candidates."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Alice Smith",
+            normalized_name="alice smith",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="enrichment_ready",
+            best_city="Providence",
+            best_state_region="RI",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([_matched(emails=["alice@example.com"])])
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=["NY", "CT", "RI", "MA", "ME", "NH"],
+        )
+        conn.commit()
+
+        assert ctrs.rocketreach_geo_ready_candidates_called == 1
+
+    def test_geo_ready_no_email_is_not_email_required_skip(self, db_conn):
+        """A geo-ready candidate without email proceeds to API (no email_required skip)."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Charlie Brown",
+            normalized_name="charlie brown",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="enrichment_ready",
+            best_city="Boston",
+            best_state_region="MA",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([_no_match()])
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=["NY", "CT", "RI", "MA", "ME", "NH"],
+        )
+        conn.commit()
+
+        # Must NOT have written rocketreach_email_required skip row
+        row = conn.execute(
+            """
+            SELECT error_code FROM rocketreach_enrichment_row
+            WHERE candidate_participant_id = %s
+            """,
+            (cid,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] != "rocketreach_email_required"
+        # Was actually called
+        assert ctrs.rocketreach_candidates_called == 1
+
+
+class TestRequireGeoReadyBehavior:
+    """Existing require_geo_ready behavior remains intact after geo-state additions."""
+
+    def test_require_geo_ready_excludes_non_ready_candidate(self, db_conn):
+        """A candidate with readiness_status != enrichment_ready is excluded."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Vague Person",
+            normalized_name="vague person",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="too_vague",
+            reason_code="too_vague",
+            best_city=None,
+            best_state_region=None,
+            best_country_code=None,
+        )
+        conn.commit()
+
+        client = _StubClient([])  # raises StopIteration if called
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+        )
+        conn.commit()
+
+        assert ctrs.rocketreach_candidates_considered == 0
+
+    def test_require_geo_ready_selects_ready_candidate_without_state_filter(self, db_conn):
+        """A geo-ready candidate is selected when require_geo_ready=True but no state filter."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Jane Ready",
+            normalized_name="jane ready",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="enrichment_ready",
+            best_city="Chicago",
+            best_state_region="IL",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([_matched(emails=["jane@example.com"])])
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            # No geo_country or geo_states — any enrichment_ready candidate qualifies
+        )
+        conn.commit()
+
+        assert ctrs.rocketreach_candidates_considered == 1
+        assert ctrs.rocketreach_candidates_called == 1

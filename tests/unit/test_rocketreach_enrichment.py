@@ -19,6 +19,7 @@ from regatta_etl.import_rocketreach_enrichment import (
     _MappedFields,
     _extract_profiles,
     _identity_gate,
+    _is_plausible_person_name,
     _map_profile,
     _missing_filter_clause,
     build_enrichment_report,
@@ -38,6 +39,9 @@ def _make_candidate(
     best_email: str | None = "john@example.com",
     best_phone: str | None = None,
     display_name: str | None = "John Smith",
+    best_city: str | None = None,
+    best_state_region: str | None = None,
+    best_country_code: str | None = None,
 ) -> dict:
     return {
         "id": "00000000-0000-0000-0000-000000000001",
@@ -47,6 +51,9 @@ def _make_candidate(
         "best_phone": best_phone,
         "quality_score": 0.60,
         "resolution_state": "review",
+        "best_city": best_city,
+        "best_state_region": best_state_region,
+        "best_country_code": best_country_code,
     }
 
 
@@ -222,7 +229,7 @@ class TestCounterIncrements:
         )
 
         class _Stub:
-            def lookup(self, email, counters):
+            def lookup(self, email, counters, **kwargs):
                 return result
 
         counters = _make_counters()
@@ -267,7 +274,7 @@ class TestCounterIncrements:
         assert ctrs.rocketreach_matches_applied == 0
 
     def test_skipped_not_counted_as_called(self):
-        """Candidates without email are skipped before calling API."""
+        """Candidates without email or geo context are skipped before calling API."""
         from regatta_etl.import_rocketreach_enrichment import _process_candidate
 
         candidate = _make_candidate(normalized_name=None, display_name=None, best_email=None)
@@ -277,8 +284,8 @@ class TestCounterIncrements:
         )
 
         class _NeverCalled:
-            def lookup(self, email, counters):
-                raise AssertionError("Should not call API without email")
+            def lookup(self, email, counters, **kwargs):
+                raise AssertionError("Should not call API")
 
         counters = _make_counters()
         _process_candidate(conn, "run-1", candidate, _NeverCalled(), "rocketreach_api", counters)
@@ -461,3 +468,215 @@ class TestBuildReport:
         ctrs.warnings = ["w1", "w2"]
         report = build_enrichment_report(ctrs, dry_run=False)
         assert "w1" in report
+
+
+# ---------------------------------------------------------------------------
+# 9. _is_plausible_person_name
+# ---------------------------------------------------------------------------
+
+class TestIsPlausiblePersonName:
+    def test_accepts_simple_name(self):
+        assert _is_plausible_person_name("john smith") is True
+
+    def test_accepts_inverted_comma_format(self):
+        # "Conway, Ryan" normalizes to "ryan conway" — still a person name
+        assert _is_plausible_person_name("ryan conway") is True
+
+    def test_accepts_single_token_name(self):
+        assert _is_plausible_person_name("alice") is True
+
+    def test_rejects_none(self):
+        assert _is_plausible_person_name(None) is False
+
+    def test_rejects_empty(self):
+        assert _is_plausible_person_name("") is False
+
+    def test_rejects_single_char(self):
+        assert _is_plausible_person_name("X") is False
+
+    def test_rejects_ampersand(self):
+        assert _is_plausible_person_name("john & jane smith") is False
+
+    def test_rejects_slash(self):
+        assert _is_plausible_person_name("john smith / jane doe") is False
+
+    def test_rejects_org_club_token(self):
+        assert _is_plausible_person_name("noroton yacht club junior big boat") is False
+
+    def test_rejects_club_alone(self):
+        assert _is_plausible_person_name("boothbay harbor yacht club") is False
+
+    def test_rejects_team_token(self):
+        assert _is_plausible_person_name("us sailing team") is False
+
+    def test_rejects_too_many_tokens(self):
+        # More than 5 tokens
+        assert _is_plausible_person_name("one two three four five six") is False
+
+    def test_five_tokens_accepted(self):
+        assert _is_plausible_person_name("one two three four five") is True
+
+    def test_yacht_token_rejected(self):
+        assert _is_plausible_person_name("little yacht club crew") is False
+
+
+# ---------------------------------------------------------------------------
+# 10. Person-name gate in _process_candidate
+# ---------------------------------------------------------------------------
+
+class TestPersonNameGate:
+    def _run_with_gate(
+        self, candidate: dict, *, require_pnq: bool = True
+    ) -> RocketReachEnrichmentCounters:
+        from regatta_etl.import_rocketreach_enrichment import _process_candidate
+
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = (
+            "00000000-0000-0000-0000-000000000099",
+        )
+
+        class _NeverCalled:
+            def lookup(self, email, counters, **kwargs):
+                raise AssertionError("Should not call API")
+
+        counters = _make_counters()
+        _process_candidate(
+            conn, "run-1", candidate, _NeverCalled(), "rocketreach_api", counters,
+            require_person_name_quality=require_pnq,
+        )
+        return counters
+
+    def test_org_name_skipped_with_gate(self):
+        candidate = _make_candidate(
+            normalized_name="noroton yacht club junior big boat",
+            best_email="club@example.com",
+        )
+        ctrs = self._run_with_gate(candidate)
+        assert ctrs.rocketreach_non_person_name == 1
+        assert ctrs.rocketreach_candidates_called == 0
+
+    def test_org_name_proceeds_without_gate(self):
+        """When gate is disabled, org-like names are not filtered."""
+        from regatta_etl.import_rocketreach_enrichment import _process_candidate, LookupResult
+
+        candidate = _make_candidate(
+            normalized_name="noroton yacht club",
+            best_email="club@example.com",
+        )
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = (
+            "00000000-0000-0000-0000-000000000099",
+        )
+        called = []
+
+        class _CountingStub:
+            def lookup(self, email, counters, **kwargs):
+                called.append(1)
+                return LookupResult(
+                    row_status="complete", profiles=[], person_id=None,
+                    credits_used=True, error_code=None,
+                )
+
+        counters = _make_counters()
+        _process_candidate(
+            conn, "run-1", candidate, _CountingStub(), "rocketreach_api", counters,
+            require_person_name_quality=False,
+        )
+        assert len(called) == 1
+        assert counters.rocketreach_non_person_name == 0
+
+
+# ---------------------------------------------------------------------------
+# 11. Geo-aware payload construction
+# ---------------------------------------------------------------------------
+
+class TestGeoAwarePayload:
+    def test_geo_context_included_in_request_payload(self):
+        """Candidate with geo context → request_payload includes city/state/country."""
+        from regatta_etl.import_rocketreach_enrichment import _process_candidate
+
+        candidate = _make_candidate(
+            best_email=None,  # no email
+            best_city="Portland",
+            best_state_region="ME",
+            best_country_code="USA",
+        )
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = (
+            "00000000-0000-0000-0000-000000000099",
+        )
+
+        captured_kwargs: dict = {}
+
+        class _CapturingStub:
+            def lookup(self, email, counters, **kwargs):
+                captured_kwargs.update(kwargs)
+                return LookupResult(
+                    row_status="complete", profiles=[], person_id=None,
+                    credits_used=True, error_code=None,
+                )
+
+        counters = _make_counters()
+        _process_candidate(
+            conn, "run-1", candidate, _CapturingStub(), "rocketreach_api", counters,
+        )
+        assert captured_kwargs.get("city") == "Portland"
+        assert captured_kwargs.get("state") == "ME"
+        assert captured_kwargs.get("country") == "USA"
+
+    def test_no_email_with_geo_does_not_hit_email_required(self):
+        """No email + geo context → API called, not email_required skip."""
+        from regatta_etl.import_rocketreach_enrichment import _process_candidate
+
+        candidate = _make_candidate(
+            best_email=None,
+            best_city="Portland",
+            best_state_region="ME",
+            best_country_code="USA",
+        )
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = (
+            "00000000-0000-0000-0000-000000000099",
+        )
+
+        class _OkStub:
+            def lookup(self, email, counters, **kwargs):
+                return LookupResult(
+                    row_status="complete", profiles=[], person_id=None,
+                    credits_used=True, error_code=None,
+                )
+
+        counters = _make_counters()
+        _process_candidate(
+            conn, "run-1", candidate, _OkStub(), "rocketreach_api", counters,
+        )
+        assert counters.rocketreach_candidates_called == 1
+        assert counters.rocketreach_geo_ready_candidates_called == 1
+
+    def test_geo_ready_counter_incremented(self):
+        """Candidate with geo context increments geo_ready_candidates_called."""
+        from regatta_etl.import_rocketreach_enrichment import _process_candidate
+
+        candidate = _make_candidate(
+            best_email="john@example.com",
+            best_city="Portland",
+            best_state_region="ME",
+            best_country_code="USA",
+        )
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = (
+            "00000000-0000-0000-0000-000000000099",
+        )
+
+        class _OkStub:
+            def lookup(self, email, counters, **kwargs):
+                return LookupResult(
+                    row_status="complete", profiles=[], person_id=None,
+                    credits_used=True, error_code=None,
+                )
+
+        counters = _make_counters()
+        _process_candidate(
+            conn, "run-1", candidate, _OkStub(), "rocketreach_api", counters,
+        )
+        assert counters.rocketreach_geo_ready_candidates_called == 1
