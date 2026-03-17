@@ -250,7 +250,8 @@ class TestFillNullEnrichment:
             """,
             (cid,),
         ).fetchone()
-        assert row == ("skipped", "rocketreach_email_required")
+        # No email → unsupported search mode (name+location not supported by RR docs)
+        assert row == ("skipped", "rocketreach_unsupported_search_mode")
         assert ctrs.rocketreach_candidates_called == 0
         assert ctrs.rocketreach_matches_applied == 0
 
@@ -759,7 +760,7 @@ class TestNortheastGeoFilter:
             conn,
             display_name="Ryan Conway",
             normalized_name="ryan conway",
-            best_email=None,
+            best_email="ryan@example.com",
             resolution_state="hold",
         )
         _seed_enrichment_readiness(
@@ -824,7 +825,7 @@ class TestNortheastGeoFilter:
             conn,
             display_name="Alice Conn",
             normalized_name="alice conn",
-            best_email=None,
+            best_email="alice@example.com",
             resolution_state="hold",
         )
         _seed_enrichment_readiness(
@@ -921,7 +922,7 @@ class TestPersonNameGateIntegration:
             conn,
             display_name="Skip McGuire",
             normalized_name="skip mcguire",
-            best_email=None,
+            best_email="skip@example.com",
             resolution_state="hold",
         )
         _seed_enrichment_readiness(
@@ -959,7 +960,7 @@ class TestGeoAwarePayloadIntegration:
             conn,
             display_name="Ryan Conway",
             normalized_name="ryan conway",
-            best_email=None,
+            best_email="ryan@example.com",
             resolution_state="hold",
         )
         _seed_enrichment_readiness(
@@ -1004,7 +1005,7 @@ class TestGeoAwarePayloadIntegration:
             conn,
             display_name="Alice Smith",
             normalized_name="alice smith",
-            best_email=None,
+            best_email="alice@example.com",
             resolution_state="hold",
         )
         _seed_enrichment_readiness(
@@ -1029,8 +1030,13 @@ class TestGeoAwarePayloadIntegration:
 
         assert ctrs.rocketreach_geo_ready_candidates_called == 1
 
-    def test_geo_ready_no_email_is_not_email_required_skip(self, db_conn):
-        """A geo-ready candidate without email proceeds to API (no email_required skip)."""
+    def test_geo_ready_no_email_is_skipped_as_unsupported(self, db_conn):
+        """A geo-ready candidate without email is skipped as unsupported_search_mode.
+
+        Updated from the previous 'geo-only is ok' assertion: per official
+        RocketReach docs, name+location alone is not a supported search shape.
+        No-email candidates now fail closed with rocketreach_unsupported_search_mode.
+        """
         conn, _ = db_conn
         cid = _seed_candidate(
             conn,
@@ -1048,7 +1054,7 @@ class TestGeoAwarePayloadIntegration:
         )
         conn.commit()
 
-        client = _StubClient([_no_match()])
+        client = _StubClient([])  # raises StopIteration if lookup() called
         ctrs = _run(
             conn, client,
             candidate_states=["hold"],
@@ -1059,18 +1065,18 @@ class TestGeoAwarePayloadIntegration:
         )
         conn.commit()
 
-        # Must NOT have written rocketreach_email_required skip row
         row = conn.execute(
             """
-            SELECT error_code FROM rocketreach_enrichment_row
+            SELECT status, error_code FROM rocketreach_enrichment_row
             WHERE candidate_participant_id = %s
             """,
             (cid,),
         ).fetchone()
         assert row is not None
-        assert row[0] != "rocketreach_email_required"
-        # Was actually called
-        assert ctrs.rocketreach_candidates_called == 1
+        assert row[0] == "skipped"
+        assert row[1] == "rocketreach_unsupported_search_mode"
+        assert ctrs.rocketreach_candidates_called == 0
+        assert ctrs.rocketreach_unsupported_search_mode == 1
 
 
 class TestRequireGeoReadyBehavior:
@@ -1114,7 +1120,7 @@ class TestRequireGeoReadyBehavior:
             conn,
             display_name="Jane Ready",
             normalized_name="jane ready",
-            best_email=None,
+            best_email="jane@example.com",
             resolution_state="hold",
         )
         _seed_enrichment_readiness(
@@ -1138,3 +1144,210 @@ class TestRequireGeoReadyBehavior:
 
         assert ctrs.rocketreach_candidates_considered == 1
         assert ctrs.rocketreach_candidates_called == 1
+
+
+# ---------------------------------------------------------------------------
+# Unsupported search mode — fail-closed (spec §7.2)
+# ---------------------------------------------------------------------------
+
+class TestUnsupportedSearchModeIntegration:
+    """Hold candidates with no email are skipped with rocketreach_unsupported_search_mode.
+
+    Per official RocketReach /api/v2/person/lookup docs, name+location alone is
+    not a supported search shape.  Candidates without email must fail closed.
+    """
+
+    _NE_STATES = ["NY", "CT", "RI", "MA", "ME", "NH"]
+
+    def test_no_email_hold_candidate_skipped_before_api_call(self, db_conn):
+        """Geo-ready hold candidate with no email is skipped, not called."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Ryan Conway",
+            normalized_name="ryan conway",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="enrichment_ready",
+            best_city="Westport",
+            best_state_region="CT",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([])  # raises StopIteration if lookup() called
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=self._NE_STATES,
+        )
+        conn.commit()
+
+        assert ctrs.rocketreach_unsupported_search_mode == 1
+        assert ctrs.rocketreach_candidates_called == 0
+
+    def test_unsupported_enrichment_row_written(self, db_conn):
+        """rocketreach_enrichment_row is written with the unsupported skip reason."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Skip McGuire",
+            normalized_name="skip mcguire",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="enrichment_ready",
+            best_city="Newport",
+            best_state_region="RI",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([])
+        _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=self._NE_STATES,
+        )
+        conn.commit()
+
+        row = conn.execute(
+            """
+            SELECT status, error_code
+            FROM rocketreach_enrichment_row
+            WHERE candidate_participant_id = %s
+            """,
+            (cid,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "skipped"
+        assert row[1] == "rocketreach_unsupported_search_mode"
+
+    def test_unsupported_counter_distinct_from_non_person_name(self, db_conn):
+        """unsupported_search_mode and non_person_name are counted separately."""
+        conn, _ = db_conn
+        # Org name — skipped as non_person_name
+        org_id = _seed_candidate(
+            conn,
+            display_name="Noroton Yacht Club",
+            normalized_name="noroton yacht club",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, org_id,
+            readiness_status="enrichment_ready",
+            best_city="Darien",
+            best_state_region="CT",
+            best_country_code="USA",
+        )
+        # Person name, no email — skipped as unsupported
+        person_id = _seed_candidate(
+            conn,
+            display_name="Alice Smith",
+            normalized_name="alice smith",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, person_id,
+            readiness_status="enrichment_ready",
+            best_city="Greenwich",
+            best_state_region="CT",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([])
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=self._NE_STATES,
+            require_person_name_quality=True,
+        )
+        conn.commit()
+
+        assert ctrs.rocketreach_non_person_name == 1
+        assert ctrs.rocketreach_unsupported_search_mode == 1
+        assert ctrs.rocketreach_candidates_called == 0
+
+    def test_email_candidate_proceeds_through_unsupported_gate(self, db_conn):
+        """Email-bearing candidates are not affected by the unsupported gate."""
+        conn, _ = db_conn
+        cid = _seed_candidate(
+            conn,
+            display_name="Jane Email",
+            normalized_name="jane email",
+            best_email="jane@example.com",
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, cid,
+            readiness_status="enrichment_ready",
+            best_city="Boston",
+            best_state_region="MA",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([_matched(emails=["jane@example.com"])])
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=self._NE_STATES,
+        )
+        conn.commit()
+
+        assert ctrs.rocketreach_unsupported_search_mode == 0
+        assert ctrs.rocketreach_candidates_called == 1
+
+    def test_northeast_geo_filter_still_excludes_fl(self, db_conn):
+        """All prior geo filters remain active alongside the unsupported-mode gate."""
+        conn, _ = db_conn
+        fl_id = _seed_candidate(
+            conn,
+            display_name="Bob Florida",
+            normalized_name="bob florida",
+            best_email=None,
+            resolution_state="hold",
+        )
+        _seed_enrichment_readiness(
+            conn, fl_id,
+            readiness_status="enrichment_ready",
+            best_city="Miami",
+            best_state_region="FL",
+            best_country_code="USA",
+        )
+        conn.commit()
+
+        client = _StubClient([])
+        ctrs = _run(
+            conn, client,
+            candidate_states=["hold"],
+            require_missing="none",
+            require_geo_ready=True,
+            geo_country="USA",
+            geo_states=self._NE_STATES,
+        )
+        conn.commit()
+
+        # FL candidate excluded at selection — never reaches unsupported gate
+        assert ctrs.rocketreach_candidates_considered == 0
+        assert ctrs.rocketreach_unsupported_search_mode == 0

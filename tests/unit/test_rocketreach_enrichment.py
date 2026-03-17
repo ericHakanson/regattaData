@@ -17,6 +17,7 @@ from regatta_etl.import_rocketreach_enrichment import (
     LookupResult,
     RocketReachEnrichmentCounters,
     _MappedFields,
+    _determine_search_mode,
     _extract_profiles,
     _identity_gate,
     _is_plausible_person_name,
@@ -592,11 +593,15 @@ class TestPersonNameGate:
 
 class TestGeoAwarePayload:
     def test_geo_context_included_in_request_payload(self):
-        """Candidate with geo context → request_payload includes city/state/country."""
+        """Email-bearing candidate with geo context → payload includes city/state/country.
+
+        Geo fields are included as optional narrowing alongside the email anchor.
+        name+geo-only (no email) is now caught by the unsupported-search-mode gate.
+        """
         from regatta_etl.import_rocketreach_enrichment import _process_candidate
 
         candidate = _make_candidate(
-            best_email=None,  # no email
+            best_email="john@example.com",  # email required for supported search mode
             best_city="Portland",
             best_state_region="ME",
             best_country_code="USA",
@@ -624,8 +629,13 @@ class TestGeoAwarePayload:
         assert captured_kwargs.get("state") == "ME"
         assert captured_kwargs.get("country") == "USA"
 
-    def test_no_email_with_geo_does_not_hit_email_required(self):
-        """No email + geo context → API called, not email_required skip."""
+    def test_no_email_with_geo_is_unsupported_not_called(self):
+        """No email + geo context → unsupported skip (name+location not supported by RR docs).
+
+        This test was updated from the previous 'geo-only is ok' behavior.
+        Per official RocketReach /api/v2/person/lookup docs, name+location alone
+        is not a supported search shape — only email, name+employer, or linkedin_url.
+        """
         from regatta_etl.import_rocketreach_enrichment import _process_candidate
 
         candidate = _make_candidate(
@@ -639,19 +649,16 @@ class TestGeoAwarePayload:
             "00000000-0000-0000-0000-000000000099",
         )
 
-        class _OkStub:
-            def lookup(self, email, counters, **kwargs):
-                return LookupResult(
-                    row_status="complete", profiles=[], person_id=None,
-                    credits_used=True, error_code=None,
-                )
+        class _NeverCalled:
+            def lookup(self, *a, **kw):
+                raise AssertionError("lookup() must not be called for unsupported mode")
 
         counters = _make_counters()
         _process_candidate(
-            conn, "run-1", candidate, _OkStub(), "rocketreach_api", counters,
+            conn, "run-1", candidate, _NeverCalled(), "rocketreach_api", counters,
         )
-        assert counters.rocketreach_candidates_called == 1
-        assert counters.rocketreach_geo_ready_candidates_called == 1
+        assert counters.rocketreach_candidates_called == 0
+        assert counters.rocketreach_unsupported_search_mode == 1
 
     def test_geo_ready_counter_incremented(self):
         """Candidate with geo context increments geo_ready_candidates_called."""
@@ -689,7 +696,7 @@ class TestGeoAwarePayload:
         candidate = _make_candidate(
             normalized_name="ryan conway",          # clean normalized form
             display_name="Conway, Ryan",            # inverted raw display form
-            best_email=None,
+            best_email="ryan@example.com",          # email required for supported search
             best_city="Westport",
             best_state_region="CT",
             best_country_code="USA",
@@ -716,3 +723,124 @@ class TestGeoAwarePayload:
         # The outbound name must be the normalized form, not the inverted display form
         assert captured.get("name") == "ryan conway"
         assert captured.get("name") != "Conway, Ryan"
+
+
+# ---------------------------------------------------------------------------
+# Search mode determination (R1/I2)
+# ---------------------------------------------------------------------------
+
+class TestDetermineSearchMode:
+    """_determine_search_mode() returns the correct mode per RocketReach docs.
+
+    Official docs (https://docs.rocketreach.co/reference/people-lookup-api):
+      Supported anchors: email, name+employer, linkedin_url, profile id.
+      name+location alone is NOT supported.
+    """
+
+    def test_email_candidate_returns_email_lookup(self):
+        candidate = _make_candidate(best_email="john@example.com")
+        assert _determine_search_mode(candidate) == "email_lookup"
+
+    def test_no_email_no_geo_returns_unsupported(self):
+        candidate = _make_candidate(best_email=None, best_city=None,
+                                    best_state_region=None, best_country_code=None)
+        assert _determine_search_mode(candidate) == "unsupported"
+
+    def test_no_email_with_geo_returns_unsupported(self):
+        """name+location is not a supported RocketReach search shape."""
+        candidate = _make_candidate(best_email=None, best_city="Westport",
+                                    best_state_region="CT", best_country_code="USA")
+        assert _determine_search_mode(candidate) == "unsupported"
+
+    def test_empty_email_string_returns_unsupported(self):
+        candidate = _make_candidate(best_email="")
+        assert _determine_search_mode(candidate) == "unsupported"
+
+
+# ---------------------------------------------------------------------------
+# Unsupported search mode — fail-closed skip (R3/I3)
+# ---------------------------------------------------------------------------
+
+class TestUnsupportedSearchModeSkip:
+    """No-email candidates are skipped before any API call."""
+
+    def test_no_email_skipped_with_unsupported_reason(self):
+        """Candidate with no email produces skipped row, no API call."""
+        from regatta_etl.import_rocketreach_enrichment import _process_candidate
+
+        candidate = _make_candidate(
+            best_email=None,
+            best_city="Westport",
+            best_state_region="CT",
+            best_country_code="USA",
+        )
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = (
+            "00000000-0000-0000-0000-000000000099",
+        )
+
+        class _NeverCalled:
+            def lookup(self, *a, **kw):
+                raise AssertionError("lookup() must not be called for unsupported mode")
+
+        counters = _make_counters()
+        _process_candidate(
+            conn, "run-1", candidate, _NeverCalled(), "rocketreach_api", counters,
+        )
+        assert counters.rocketreach_unsupported_search_mode == 1
+        assert counters.rocketreach_candidates_called == 0
+
+        # Check the enrichment row written by the mock
+        call_args = conn.execute.call_args_list
+        # The INSERT call will have 'rocketreach_unsupported_search_mode' in its params
+        insert_params = [str(a) for a in call_args]
+        assert any("rocketreach_unsupported_search_mode" in p for p in insert_params)
+
+    def test_no_email_does_not_increment_candidates_called(self):
+        """rocketreach_candidates_called must stay 0 for unsupported candidates."""
+        from regatta_etl.import_rocketreach_enrichment import _process_candidate
+
+        candidate = _make_candidate(best_email=None)
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = (
+            "00000000-0000-0000-0000-000000000099",
+        )
+
+        class _NeverCalled:
+            def lookup(self, *a, **kw):
+                raise AssertionError("must not be called")
+
+        counters = _make_counters()
+        _process_candidate(
+            conn, "run-1", candidate, _NeverCalled(), "rocketreach_api", counters,
+        )
+        assert counters.rocketreach_candidates_called == 0
+        assert counters.rocketreach_unsupported_search_mode == 1
+
+    def test_email_candidate_still_calls_api(self):
+        """Email-bearing candidates proceed to the API as before."""
+        from regatta_etl.import_rocketreach_enrichment import _process_candidate
+
+        candidate = _make_candidate(best_email="john@example.com")
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = (
+            "00000000-0000-0000-0000-000000000099",
+        )
+
+        call_count = {"n": 0}
+
+        class _CountingStub:
+            def lookup(self, email, counters, **kwargs):
+                call_count["n"] += 1
+                return LookupResult(
+                    row_status="complete", profiles=[], person_id=None,
+                    credits_used=True, error_code=None,
+                )
+
+        counters = _make_counters()
+        _process_candidate(
+            conn, "run-1", candidate, _CountingStub(), "rocketreach_api", counters,
+        )
+        assert call_count["n"] == 1
+        assert counters.rocketreach_unsupported_search_mode == 0
+        assert counters.rocketreach_candidates_called == 1

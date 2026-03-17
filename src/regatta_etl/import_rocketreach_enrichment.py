@@ -104,6 +104,30 @@ def _is_plausible_person_name(name: str | None) -> bool:
     return True
 
 
+def _determine_search_mode(candidate: dict) -> str:
+    """Return the RocketReach search mode for a candidate.
+
+    Per official RocketReach /api/v2/person/lookup documentation
+    (https://docs.rocketreach.co/reference/people-lookup-api), supported
+    search anchors are:
+
+      1. email address          → 'email_lookup'
+      2. name + current_employer  (we do not collect employer for hold pool)
+      3. linkedin_url             (not collected)
+      4. RocketReach profile id   (not collected)
+
+    name + location (city/state/country) alone is NOT a documented supported
+    search shape and produces HTTP 400 errors in practice.  Candidates without
+    a usable email are therefore unsupported under the current data model.
+
+    Returns: 'email_lookup' or 'unsupported'
+    """
+    email = normalize_email(candidate.get("best_email") or "")
+    if email:
+        return "email_lookup"
+    return "unsupported"
+
+
 class RocketReachClientProtocol(Protocol):
     def lookup(
         self,
@@ -415,6 +439,7 @@ class RocketReachEnrichmentCounters:
     rocketreach_candidates_called: int = 0
     rocketreach_geo_ready_candidates_called: int = 0   # subset with geo context
     rocketreach_non_person_name: int = 0               # skipped by name-quality gate
+    rocketreach_unsupported_search_mode: int = 0       # no supported RR anchor (no email)
     rocketreach_matches_applied: int = 0
     rocketreach_no_match: int = 0
     rocketreach_ambiguous: int = 0
@@ -434,6 +459,7 @@ class RocketReachEnrichmentCounters:
             "rocketreach_candidates_called": self.rocketreach_candidates_called,
             "rocketreach_geo_ready_candidates_called": self.rocketreach_geo_ready_candidates_called,
             "rocketreach_non_person_name": self.rocketreach_non_person_name,
+            "rocketreach_unsupported_search_mode": self.rocketreach_unsupported_search_mode,
             "rocketreach_matches_applied": self.rocketreach_matches_applied,
             "rocketreach_no_match": self.rocketreach_no_match,
             "rocketreach_ambiguous": self.rocketreach_ambiguous,
@@ -816,16 +842,20 @@ def _process_candidate(
         )
         return
 
-    # Email required unless geo context provides a sufficient lookup anchor
-    if not email and not has_geo_context:
+    # Search-mode gate — fail closed if no supported RocketReach anchor exists.
+    # Per official docs (/api/v2/person/lookup), only email, name+employer,
+    # linkedin_url, and profile id are supported.  name+location alone is not.
+    search_mode = _determine_search_mode(candidate)
+    if search_mode == "unsupported":
+        counters.rocketreach_unsupported_search_mode += 1
         _insert_enrichment_row(
             conn, run_id, candidate_id,
-            request_payload={"email": None, "name": name},
+            request_payload={"name": name, "search_mode": search_mode},
             response_payload={},
             provider_person_id=None,
             match_confidence=None,
             status="skipped",
-            error_code="rocketreach_email_required",
+            error_code="rocketreach_unsupported_search_mode",
             applied_field_mask=None,
         )
         return
@@ -1181,6 +1211,7 @@ def build_enrichment_report(
         f"  called:          {counters.rocketreach_candidates_called}",
         f"  geo_ready_called:{counters.rocketreach_geo_ready_candidates_called}",
         f"  non_person_name: {counters.rocketreach_non_person_name}",
+        f"  unsupported_mode:{counters.rocketreach_unsupported_search_mode}",
         f"  matched/applied: {counters.rocketreach_matches_applied}",
         f"  no_match:        {counters.rocketreach_no_match}",
         f"  ambiguous:       {counters.rocketreach_ambiguous}",
