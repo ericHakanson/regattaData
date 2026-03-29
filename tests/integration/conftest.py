@@ -41,6 +41,7 @@ MIGRATIONS = [
     PROJECT_ROOT / "migrations" / "0020_mailchimp_identity_policy_tables.sql",
     PROJECT_ROOT / "migrations" / "0021_rocketreach_enrichment_tables.sql",
     PROJECT_ROOT / "migrations" / "0022_hold_pool_geo_prepare.sql",
+    PROJECT_ROOT / "migrations" / "0023_regattaman_snapshot_tables.sql",
 ]
 
 # ---------------------------------------------------------------------------

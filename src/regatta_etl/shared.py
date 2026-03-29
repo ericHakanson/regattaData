@@ -179,6 +179,14 @@ class RunCounters:
     rocketreach_lookup_credits_used: int = 0
     rocketreach_status_polls: int = 0
     rocketreach_non_terminal_timeouts: int = 0
+    # Regattaman snapshot-specific counters
+    regattaman_snapshot_rows_raw_inserted: int = 0
+    regattaman_snapshot_rows_curated_processed: int = 0
+    regattaman_snapshot_rows_curated_rejected: int = 0
+    regattaman_snapshot_xref_inserted: int = 0
+    regattaman_snapshot_ratings_written: int = 0
+    regattaman_snapshot_ratings_skipped_invalid: int = 0
+    regattaman_snapshot_ownerships_inserted: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -280,6 +288,13 @@ class RunCounters:
             "rocketreach_lookup_credits_used": self.rocketreach_lookup_credits_used,
             "rocketreach_status_polls": self.rocketreach_status_polls,
             "rocketreach_non_terminal_timeouts": self.rocketreach_non_terminal_timeouts,
+            "regattaman_snapshot_rows_raw_inserted": self.regattaman_snapshot_rows_raw_inserted,
+            "regattaman_snapshot_rows_curated_processed": self.regattaman_snapshot_rows_curated_processed,
+            "regattaman_snapshot_rows_curated_rejected": self.regattaman_snapshot_rows_curated_rejected,
+            "regattaman_snapshot_xref_inserted": self.regattaman_snapshot_xref_inserted,
+            "regattaman_snapshot_ratings_written": self.regattaman_snapshot_ratings_written,
+            "regattaman_snapshot_ratings_skipped_invalid": self.regattaman_snapshot_ratings_skipped_invalid,
+            "regattaman_snapshot_ownerships_inserted": self.regattaman_snapshot_ownerships_inserted,
             "warnings": self.warnings,
         }
 

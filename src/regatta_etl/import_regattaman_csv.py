@@ -427,6 +427,7 @@ def _process_row(
         "mailchimp_audience", "mailchimp_event_activation",
         "airtable_copy", "yacht_scoring",
         "bhyc_member_directory",
+        "regattaman_snapshot",
         "resolution_source_to_candidate", "resolution_score", "resolution_promote",
         "resolution_manual_apply", "resolution_lifecycle",
         "lineage_report", "purge_check",
@@ -476,6 +477,13 @@ def _process_row(
 # mailchimp_audience flags
 @click.option("--airtable-dir", default=None, type=click.Path(), help="[airtable_copy] Directory containing all 6 Airtable CSV files")
 @click.option("--yacht-scoring-dir", default=None, type=click.Path(), help="[yacht_scoring] Root directory of Yacht Scoring CSVs")
+@click.option("--snapshot-path", default=None, type=click.Path(), help="[regattaman_snapshot] Path to Regattaman owner+yacht snapshot CSV")
+@click.option(
+    "--effective-start",
+    default=None,
+    help="[regattaman_snapshot] Ownership effective_start date (YYYY-MM-DD). "
+         "Defaults to CURRENT_DATE if omitted; provide for reproducible loads.",
+)
 @click.option("--subscribed-path", default=None, type=click.Path(), help="[mailchimp_audience] Subscribed audience CSV")
 @click.option("--unsubscribed-path", default=None, type=click.Path(), help="[mailchimp_audience] Unsubscribed audience CSV")
 @click.option("--cleaned-path", default=None, type=click.Path(), help="[mailchimp_audience] Cleaned audience CSV")
@@ -719,6 +727,9 @@ def main(
     airtable_dir: str | None,
     # yacht_scoring
     yacht_scoring_dir: str | None,
+    # regattaman_snapshot
+    snapshot_path: str | None,
+    effective_start: str | None,
     # private_export
     csv_path: str | None,
     host_club_name: str | None,
@@ -908,6 +919,27 @@ def main(
         _run_airtable_copy(
             run_id, started_at, db_dsn, counters, rejects,
             airtable_dir=airtable_dir,  # type: ignore[arg-type]
+            dry_run=dry_run,
+        )
+    elif mode == "regattaman_snapshot":
+        _validate_regattaman_snapshot_flags(snapshot_path, run_id)
+        from datetime import date as _date
+        from regatta_etl.import_regattaman_snapshot import _run_regattaman_snapshot
+        parsed_effective_start: _date | None = None
+        if effective_start:
+            try:
+                parsed_effective_start = _date.fromisoformat(effective_start)
+            except ValueError:
+                click.echo(
+                    f"[{run_id}] FATAL: --effective-start must be YYYY-MM-DD, "
+                    f"got: {effective_start!r}",
+                    err=True,
+                )
+                sys.exit(1)
+        _run_regattaman_snapshot(
+            run_id, started_at, db_dsn, counters, rejects,
+            snapshot_path=snapshot_path,  # type: ignore[arg-type]
+            effective_start=parsed_effective_start,
             dry_run=dry_run,
         )
     elif mode == "private_export":
@@ -1508,6 +1540,8 @@ def main(
             "events_path": events_path,
             "airtable_dir": airtable_dir,
             "yacht_scoring_dir": yacht_scoring_dir,
+            "snapshot_path": snapshot_path,
+            "effective_start": effective_start,
         },
         counters,
     )
@@ -1649,6 +1683,18 @@ def _validate_airtable_copy_flags(
     if not airtable_dir:
         click.echo(
             f"[{run_id}] FATAL: airtable_copy mode requires: --airtable-dir",
+            err=True,
+        )
+        sys.exit(1)
+
+
+def _validate_regattaman_snapshot_flags(
+    snapshot_path: str | None,
+    run_id: str,
+) -> None:
+    if not snapshot_path:
+        click.echo(
+            f"[{run_id}] FATAL: regattaman_snapshot mode requires: --snapshot-path",
             err=True,
         )
         sys.exit(1)
