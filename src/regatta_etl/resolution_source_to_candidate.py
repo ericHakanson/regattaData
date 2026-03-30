@@ -1957,6 +1957,327 @@ def _link_ys_raw_entries_to_candidates(
 
 
 # ---------------------------------------------------------------------------
+# Manual curation ingestion (source_system='manual_curation')
+# ---------------------------------------------------------------------------
+
+def _ingest_participants_from_manual_patches(
+    conn: psycopg.Connection,
+    ctrs: SourceToCandidateCounters,
+) -> None:
+    """Apply active manual_participant_patch rows to candidate_participant.
+
+    Unlike operational sources, manual patches OVERWRITE non-null patch fields
+    (fill-nulls-only would defeat the corrective intent of a manual edit).
+
+    When patch_display_name is provided, normalized_name is recomputed so the
+    scorer reads the corrected identity value (not the stale pre-edit version).
+    """
+    rows = conn.execute(
+        """
+        SELECT id, candidate_participant_id,
+               patch_display_name, patch_date_of_birth, patch_best_email, patch_best_phone
+        FROM manual_participant_patch
+        WHERE status = 'active'
+        ORDER BY created_at
+        """
+    ).fetchall()
+
+    for row in rows:
+        pk = str(row[0])
+        candidate_id = str(row[1])
+
+        patch_fields: dict[str, Any] = {}
+        if row[2] is not None:
+            patch_fields["display_name"] = row[2]
+            # Keep normalized_name in sync so scorer and fingerprint lookups
+            # use the corrected identity value.
+            patch_fields["normalized_name"] = normalize_name(row[2])
+        if row[3] is not None:
+            patch_fields["date_of_birth"] = str(row[3])
+        if row[4] is not None:
+            patch_fields["best_email"] = row[4]
+        if row[5] is not None:
+            patch_fields["best_phone"] = row[5]
+
+        if not patch_fields:
+            continue
+
+        try:
+            set_parts = [f"{col} = %s" for col in patch_fields] + ["updated_at = now()"]
+            conn.execute(
+                f"UPDATE candidate_participant SET {', '.join(set_parts)} WHERE id = %s",
+                list(patch_fields.values()) + [candidate_id],
+            )
+            inserted = _link_source(
+                conn, "participant", candidate_id,
+                "manual_participant_patch", pk, "manual_curation",
+            )
+            if inserted:
+                ctrs.source_links_inserted += 1
+            else:
+                ctrs.source_links_skipped_duplicate += 1
+            ctrs.participants_ingested += 1
+        except Exception as exc:
+            ctrs.db_errors += 1
+            ctrs.warnings.append(f"manual/participant pk={pk}: {exc}")
+
+
+def _ingest_addresses_from_manual_patches(
+    conn: psycopg.Connection,
+    ctrs: SourceToCandidateCounters,
+) -> None:
+    """Ingest active manual_participant_address_patch rows into candidate_participant_address."""
+    rows = conn.execute(
+        """
+        SELECT id, candidate_participant_id, address_raw, line1, city, state,
+               postal_code, country_code, is_primary
+        FROM manual_participant_address_patch
+        WHERE status = 'active'
+        ORDER BY created_at
+        """
+    ).fetchall()
+
+    for row in rows:
+        pk = str(row[0])
+        candidate_id = str(row[1])
+        address_raw = row[2]
+
+        try:
+            # Manual patches use ON CONFLICT DO UPDATE (overwrite structured fields)
+            # instead of the normal DO NOTHING, so a re-patch fixing city/state
+            # on an existing address_raw actually takes effect.
+            conn.execute(
+                """
+                INSERT INTO candidate_participant_address
+                    (candidate_participant_id, address_raw, line1, city, state,
+                     postal_code, country_code, is_primary, source_table_name, source_row_pk)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (candidate_participant_id, address_raw) DO UPDATE
+                    SET line1        = COALESCE(EXCLUDED.line1,        candidate_participant_address.line1),
+                        city         = COALESCE(EXCLUDED.city,         candidate_participant_address.city),
+                        state        = COALESCE(EXCLUDED.state,        candidate_participant_address.state),
+                        postal_code  = COALESCE(EXCLUDED.postal_code,  candidate_participant_address.postal_code),
+                        country_code = COALESCE(EXCLUDED.country_code, candidate_participant_address.country_code),
+                        is_primary   = EXCLUDED.is_primary,
+                        source_table_name = EXCLUDED.source_table_name,
+                        source_row_pk     = EXCLUDED.source_row_pk,
+                        updated_at        = now()
+                """,
+                (
+                    candidate_id, address_raw,
+                    row[3], row[4], row[5], row[6], row[7], bool(row[8]),
+                    "manual_participant_address_patch", pk,
+                ),
+            )
+            ctrs.participant_addresses_linked += 1
+            inserted = _link_source(
+                conn, "participant", candidate_id,
+                "manual_participant_address_patch", pk, "manual_curation",
+            )
+            if inserted:
+                ctrs.source_links_inserted += 1
+            else:
+                ctrs.source_links_skipped_duplicate += 1
+            ctrs.participants_ingested += 1
+        except Exception as exc:
+            ctrs.db_errors += 1
+            ctrs.warnings.append(f"manual/address pk={pk}: {exc}")
+
+
+def _ingest_yachts_from_manual_patches(
+    conn: psycopg.Connection,
+    ctrs: SourceToCandidateCounters,
+) -> None:
+    """Apply active manual_yacht_patch rows to candidate_yacht (overwrite non-null fields).
+
+    When patch_name or patch_sail_number is provided, the corresponding normalized
+    fields are recomputed so the scorer and fingerprint lookups use the corrected
+    identity values (not the stale pre-edit versions).
+    """
+    rows = conn.execute(
+        """
+        SELECT id, candidate_yacht_id,
+               patch_name, patch_sail_number, patch_length_feet, patch_yacht_type
+        FROM manual_yacht_patch
+        WHERE status = 'active'
+        ORDER BY created_at
+        """
+    ).fetchall()
+
+    for row in rows:
+        pk = str(row[0])
+        candidate_id = str(row[1])
+
+        patch_fields: dict[str, Any] = {}
+        if row[2] is not None:
+            patch_fields["name"] = row[2]
+            patch_fields["normalized_name"] = slug_name(row[2])
+        if row[3] is not None:
+            patch_fields["sail_number"] = row[3]
+            patch_fields["normalized_sail_number"] = slug_name(row[3])
+        if row[4] is not None:
+            patch_fields["length_feet"] = float(row[4])
+        if row[5] is not None:
+            patch_fields["yacht_type"] = row[5]
+
+        if not patch_fields:
+            continue
+
+        try:
+            set_parts = [f"{col} = %s" for col in patch_fields] + ["updated_at = now()"]
+            conn.execute(
+                f"UPDATE candidate_yacht SET {', '.join(set_parts)} WHERE id = %s",
+                list(patch_fields.values()) + [candidate_id],
+            )
+            inserted = _link_source(
+                conn, "yacht", candidate_id,
+                "manual_yacht_patch", pk, "manual_curation",
+            )
+            if inserted:
+                ctrs.source_links_inserted += 1
+            else:
+                ctrs.source_links_skipped_duplicate += 1
+            ctrs.yachts_ingested += 1
+        except Exception as exc:
+            ctrs.db_errors += 1
+            ctrs.warnings.append(f"manual/yacht pk={pk}: {exc}")
+
+
+def _ingest_ownerships_from_manual_patches(
+    conn: psycopg.Connection,
+    ctrs: SourceToCandidateCounters,
+) -> None:
+    """Register active manual_yacht_ownership_patch rows as candidate-layer evidence.
+
+    There is no candidate_yacht_ownership table.  Instead each active 'add' patch:
+    - Creates a source_link from candidate_participant to the patch row
+    - Creates a source_link from candidate_yacht to the patch row
+    - Adds a 'yacht_owner' role_assignment to candidate_participant_role_assignment
+
+    'remove' operation patches only register a source link to record the correction
+    intent; operational removal is handled during canonical promotion/sync.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, candidate_participant_id, candidate_yacht_id,
+               role, operation, effective_start
+        FROM manual_yacht_ownership_patch
+        WHERE status = 'active'
+        ORDER BY created_at
+        """
+    ).fetchall()
+
+    for row in rows:
+        pk = str(row[0])
+        participant_cid = str(row[1])
+        yacht_cid = str(row[2])
+        role = row[3]
+        operation = row[4]
+
+        try:
+            # Source-link both candidate entities to this patch row
+            for entity_type, cid in (("participant", participant_cid), ("yacht", yacht_cid)):
+                inserted = _link_source(
+                    conn, entity_type, cid,
+                    "manual_yacht_ownership_patch", pk, "manual_curation",
+                )
+                if inserted:
+                    ctrs.source_links_inserted += 1
+                else:
+                    ctrs.source_links_skipped_duplicate += 1
+
+            # For 'add' patches, record a role assignment on the participant
+            if operation == "add":
+                role_label = "yacht_owner" if role == "owner" else "yacht_co_owner"
+                source_context = f"manual|yacht:{yacht_cid}"
+                conn.execute(
+                    """
+                    INSERT INTO candidate_participant_role_assignment
+                        (candidate_participant_id, role, source_context)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (
+                        candidate_participant_id,
+                        role,
+                        COALESCE(candidate_event_id::text, ''),
+                        COALESCE(candidate_registration_id::text, '')
+                    ) DO NOTHING
+                    """,
+                    (participant_cid, role_label, source_context),
+                )
+                ctrs.participant_roles_linked += 1
+
+            ctrs.participants_ingested += 1
+        except Exception as exc:
+            ctrs.db_errors += 1
+            ctrs.warnings.append(f"manual/ownership pk={pk}: {exc}")
+
+
+def _ingest_memberships_from_manual_patches(
+    conn: psycopg.Connection,
+    ctrs: SourceToCandidateCounters,
+) -> None:
+    """Register active manual_club_membership_patch rows as candidate-layer evidence.
+
+    There is no candidate_club_membership table.  Instead each active 'add' patch:
+    - Creates a source_link from candidate_participant to the patch row
+    - Creates a source_link from candidate_club to the patch row
+    - Adds a role_assignment (membership_role) to candidate_participant_role_assignment
+
+    'remove' operation patches only register source links.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, candidate_participant_id, candidate_club_id,
+               membership_role, operation
+        FROM manual_club_membership_patch
+        WHERE status = 'active'
+        ORDER BY created_at
+        """
+    ).fetchall()
+
+    for row in rows:
+        pk = str(row[0])
+        participant_cid = str(row[1])
+        club_cid = str(row[2])
+        membership_role = row[3]
+        operation = row[4]
+
+        try:
+            for entity_type, cid in (("participant", participant_cid), ("club", club_cid)):
+                inserted = _link_source(
+                    conn, entity_type, cid,
+                    "manual_club_membership_patch", pk, "manual_curation",
+                )
+                if inserted:
+                    ctrs.source_links_inserted += 1
+                else:
+                    ctrs.source_links_skipped_duplicate += 1
+
+            if operation == "add":
+                source_context = f"manual|club:{club_cid}"
+                conn.execute(
+                    """
+                    INSERT INTO candidate_participant_role_assignment
+                        (candidate_participant_id, role, source_context)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (
+                        candidate_participant_id,
+                        role,
+                        COALESCE(candidate_event_id::text, ''),
+                        COALESCE(candidate_registration_id::text, '')
+                    ) DO NOTHING
+                    """,
+                    (participant_cid, membership_role, source_context),
+                )
+                ctrs.participant_roles_linked += 1
+
+            ctrs.participants_ingested += 1
+        except Exception as exc:
+            ctrs.db_errors += 1
+            ctrs.warnings.append(f"manual/membership pk={pk}: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Top-level runner
 # ---------------------------------------------------------------------------
 
@@ -2073,6 +2394,26 @@ def run_source_to_candidate(
         )
         _run_step_with_savepoint(
             conn, ctrs, "participants/related_contacts", _ingest_participants_from_related_contacts
+        )
+
+    # Manual curation patches — must run after operational sources so corrections
+    # overwrite values ingested from less-authoritative upstream tables.
+    if run_participants:
+        _run_step_with_savepoint(
+            conn, ctrs, "participants/manual_patches", _ingest_participants_from_manual_patches
+        )
+        _run_step_with_savepoint(
+            conn, ctrs, "participants/manual_addresses", _ingest_addresses_from_manual_patches
+        )
+        _run_step_with_savepoint(
+            conn, ctrs, "participants/manual_ownerships", _ingest_ownerships_from_manual_patches
+        )
+        _run_step_with_savepoint(
+            conn, ctrs, "participants/manual_memberships", _ingest_memberships_from_manual_patches
+        )
+    if run_yachts:
+        _run_step_with_savepoint(
+            conn, ctrs, "yachts/manual_patches", _ingest_yachts_from_manual_patches
         )
 
     # Registrations — must run after clubs, events, yachts, participants
