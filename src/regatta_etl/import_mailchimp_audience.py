@@ -29,6 +29,7 @@ import click
 import psycopg
 
 from regatta_etl.normalize import (
+    addresses_match_for_identity,
     normalize_email,
     normalize_name,
     normalize_phone,
@@ -295,11 +296,7 @@ def _strict_resolve_participant(
         # -------------------------------------------------------------- D
         source_address = trim(row.get("Address"))
         if source_address and target_address:
-            # Normalize casing and whitespace before comparing to avoid
-            # over-quarantining benign formatting differences.
-            src_addr_norm = " ".join(source_address.lower().split())
-            tgt_addr_norm = " ".join(target_address.lower().split())
-            if src_addr_norm != tgt_addr_norm:
+            if not addresses_match_for_identity(source_address, target_address):
                 _quarantine(
                     pid, "email_address_mismatch",
                     f"source={source_address!r}, target={target_address!r}",

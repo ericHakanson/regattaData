@@ -560,6 +560,57 @@ def test_address_case_whitespace_difference_not_quarantined(db_conn, tmp_path):
     assert ctrs.participants_matched_existing == 1
 
 
+def test_address_freeform_vs_pipe_format_not_quarantined(db_conn, tmp_path):
+    """Formatting-only address differences should not trigger quarantine."""
+    conn, dsn = db_conn
+
+    _seed_participant(conn, name="Alice Smith", email="alice@example.com",
+                      address="15 Palmer St Dartmouth, MA|02748")
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="alice@example.com", first="Alice", last="Smith",
+                  address="15 Palmer St , Dartmouth, MA  2748    US"),
+    ])
+
+    assert ctrs.rows_rejected == 0
+    assert ctrs.mailchimp_identity_rows_quarantined == 0
+    assert ctrs.participants_matched_existing == 1
+
+
+def test_address_zip_plus_four_difference_not_quarantined(db_conn, tmp_path):
+    """ZIP+4 storage and a base ZIP in Mailchimp should still corroborate."""
+    conn, dsn = db_conn
+
+    _seed_participant(conn, name="Alice Smith", email="alice@example.com",
+                      address="185 Craigie Street Portland, ME|04102-2537")
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="alice@example.com", first="Alice", last="Smith",
+                  address="185 Craigie Street, Portland, ME  4102    US"),
+    ])
+
+    assert ctrs.rows_rejected == 0
+    assert ctrs.mailchimp_identity_rows_quarantined == 0
+    assert ctrs.participants_matched_existing == 1
+
+
+def test_address_missing_postal_on_target_not_quarantined(db_conn, tmp_path):
+    """Matching street/city/state should pass when only one side has a ZIP."""
+    conn, dsn = db_conn
+
+    _seed_participant(conn, name="Alice Smith", email="alice@example.com",
+                      address="3385 Michelson Drive Irvine, CA|")
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="alice@example.com", first="Alice", last="Smith",
+                  address="3385 Michelson Drive, Irvine, CA  92612    US"),
+    ])
+
+    assert ctrs.rows_rejected == 0
+    assert ctrs.mailchimp_identity_rows_quarantined == 0
+    assert ctrs.participants_matched_existing == 1
+
+
 # ---------------------------------------------------------------------------
 # Policy v2.1 optional exception: unique email + missing source name
 # ---------------------------------------------------------------------------

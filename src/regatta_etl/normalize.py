@@ -14,6 +14,15 @@ from decimal import Decimal, InvalidOperation
 
 _SENTINEL_TS = "0000-00-00 00:00:00"
 _TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+_US_COUNTRY_TOKEN_RE = re.compile(
+    r"\b(?:united states(?: of america)?|usa|us)\b",
+    re.IGNORECASE,
+)
+_TRAILING_POSTAL_RE = re.compile(
+    r"(?:\||,|\s)(\d{5}(?:-\d{4})?|\d{4})"
+    r"(?:\s*(?:united states(?: of america)?|usa|us))?\s*$",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +84,74 @@ def normalize_phone(value: str | None) -> str | None:
     if len(digits) >= 7:
         return f"+{digits}"
     return None
+
+
+def normalize_postal_code(value: str | None) -> str | None:
+    """Normalize a postal code for identity comparisons.
+
+    Current behavior is intentionally conservative and US-centric because the
+    Mailchimp address corroboration issues we are resolving are dominated by
+    leading-zero loss and ZIP+4 formatting differences.
+    """
+    v = trim(value)
+    if v is None:
+        return None
+    if re.search(r"[a-z]", v, re.IGNORECASE):
+        return None
+    digits = re.sub(r"\D", "", v)
+    if len(digits) == 9:
+        return digits[:5]
+    if len(digits) == 5:
+        return digits
+    if len(digits) == 4:
+        return f"0{digits}"
+    return None
+
+
+def normalize_address_for_identity(value: str | None) -> tuple[str | None, str | None]:
+    """Return a canonical (address_body, postal_code) pair for identity checks.
+
+    The body comparison is strict once formatting noise is removed:
+    punctuation, separators, casing, and trailing US country tokens are ignored.
+    Postal codes are normalized separately so ZIP+4 and dropped leading zeros
+    don't create false mismatches.
+    """
+    v = trim(value)
+    if v is None:
+        return (None, None)
+
+    v = unicodedata.normalize("NFKD", v)
+    v = "".join(c for c in v if not unicodedata.combining(c))
+    v = v.lower()
+
+    postal_code = None
+    trailing_postal = _TRAILING_POSTAL_RE.search(v)
+    if trailing_postal:
+        postal_code = normalize_postal_code(trailing_postal.group(1))
+        v = f"{v[:trailing_postal.start()]} {v[trailing_postal.end():]}"
+
+    v = _US_COUNTRY_TOKEN_RE.sub(" ", v)
+    v = v.replace("|", " ")
+    v = re.sub(r"[^a-z0-9]+", " ", v)
+    v = re.sub(r"\s+", " ", v).strip()
+    return (v or None, postal_code)
+
+
+def addresses_match_for_identity(source: str | None, target: str | None) -> bool:
+    """Return True when two addresses agree for strict identity corroboration.
+
+    The street/city/state body must match after removing formatting noise.
+    Postal codes are enforced only when both sides provide a parseable value,
+    which prevents incomplete stored addresses from creating false negatives.
+    """
+    source_body, source_postal = normalize_address_for_identity(source)
+    target_body, target_postal = normalize_address_for_identity(target)
+
+    if source_body != target_body:
+        return False
+    if source_postal and target_postal and source_postal != target_postal:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -403,6 +403,43 @@ class TestCandidatePromotion:
         assert row2 is not None
         assert row2[0] == "john@example.com"
 
+    def test_participant_promotion_copies_child_contact_and_address_rows(self, db_conn):
+        conn, dsn = db_conn
+        cid = _insert_candidate_participant(conn, date_of_birth=None)
+        _insert_child_contact(conn, cid, "email", "crew@example.com", "crew@example.com")
+        _insert_child_contact(conn, cid, "phone", "+12075550999", "+12075550999")
+        _insert_child_address(conn, cid, "456 Harbor Rd, Rockport, ME 04856")
+
+        ctrs = self._score_and_promote(conn, "participant")
+        assert ctrs.db_errors == 0
+
+        canonical_id = str(conn.execute(
+            "SELECT promoted_canonical_id FROM candidate_participant WHERE id = %s",
+            (cid,),
+        ).fetchone()[0])
+
+        contact_rows = conn.execute(
+            """
+            SELECT contact_type, normalized_value
+            FROM canonical_participant_contact
+            WHERE canonical_participant_id = %s
+            ORDER BY contact_type, normalized_value
+            """,
+            (canonical_id,),
+        ).fetchall()
+        address_rows = conn.execute(
+            """
+            SELECT address_raw
+            FROM canonical_participant_address
+            WHERE canonical_participant_id = %s
+            """,
+            (canonical_id,),
+        ).fetchall()
+
+        assert ("email", "crew@example.com") in contact_rows
+        assert ("phone", "+12075550999") in contact_rows
+        assert any("Harbor Rd" in row[0] for row in address_rows)
+
     def test_candidate_canonical_link_created(self, db_conn):
         conn, dsn = db_conn
         cid = _insert_candidate_participant(conn)
@@ -464,6 +501,49 @@ class TestCandidatePromotion:
             (cid,),
         ).fetchone()[0]
         assert count == 1
+
+    def test_promote_rerun_backfills_children_for_already_promoted_participant(self, db_conn):
+        conn, dsn = db_conn
+        cid = _insert_candidate_participant(conn, date_of_birth=None)
+        self._score_and_promote(conn, "participant")
+
+        canonical_id = str(conn.execute(
+            "SELECT promoted_canonical_id FROM candidate_participant WHERE id = %s",
+            (cid,),
+        ).fetchone()[0])
+
+        _insert_child_contact(conn, cid, "email", "late@example.com", "late@example.com")
+        _insert_child_address(conn, cid, "99 Yacht Lane, Rockport, ME 04856")
+
+        ctrs1 = run_promote(conn, entity_type="participant")
+        ctrs2 = run_promote(conn, entity_type="participant")
+
+        assert ctrs1.db_errors == 0
+        assert ctrs1.candidates_already_promoted >= 1
+        assert ctrs2.db_errors == 0
+
+        late_email_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM canonical_participant_contact
+            WHERE canonical_participant_id = %s
+              AND contact_type = 'email'
+              AND normalized_value = 'late@example.com'
+            """,
+            (canonical_id,),
+        ).fetchone()[0]
+        addr_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM canonical_participant_address
+            WHERE canonical_participant_id = %s
+              AND address_raw = '99 Yacht Lane, Rockport, ME 04856'
+            """,
+            (canonical_id,),
+        ).fetchone()[0]
+
+        assert late_email_count == 1
+        assert addr_count == 1
 
     def test_registration_not_promoted_when_event_not_promoted(self, db_conn):
         conn, dsn = db_conn

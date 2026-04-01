@@ -5,10 +5,13 @@ from decimal import Decimal
 from datetime import date, datetime
 
 from regatta_etl.normalize import (
+    addresses_match_for_identity,
+    normalize_address_for_identity,
     trim,
     normalize_space,
     normalize_email,
     normalize_phone,
+    normalize_postal_code,
     normalize_name,
     slug_name,
     parse_ts,
@@ -105,6 +108,61 @@ class TestNormalizePhone:
     def test_same_home_and_cell(self):
         # From CSV: owner_hphone == owner_cphone — both normalize to same value
         assert normalize_phone("2078318338") == normalize_phone("2078318338")
+
+
+# ---------------------------------------------------------------------------
+# normalize_postal_code
+# ---------------------------------------------------------------------------
+
+class TestNormalizePostalCode:
+    def test_four_digit_zip_is_zero_padded(self):
+        assert normalize_postal_code("2748") == "02748"
+
+    def test_zip_plus_four_reduces_to_base_zip(self):
+        assert normalize_postal_code("04102-2537") == "04102"
+
+    def test_invalid_postal_returns_none(self):
+        assert normalize_postal_code("0402q") is None
+
+
+# ---------------------------------------------------------------------------
+# normalize_address_for_identity / addresses_match_for_identity
+# ---------------------------------------------------------------------------
+
+class TestNormalizeAddressForIdentity:
+    def test_mailchimp_freeform_matches_stored_pipe_delimited_format(self):
+        body, postal = normalize_address_for_identity(
+            "15 Palmer St , Dartmouth, MA  2748    US"
+        )
+        assert body == "15 palmer st dartmouth ma"
+        assert postal == "02748"
+
+    def test_zip_plus_four_normalizes_to_base_zip(self):
+        body, postal = normalize_address_for_identity(
+            "185 Craigie Street Portland, ME|04102-2537"
+        )
+        assert body == "185 craigie street portland me"
+        assert postal == "04102"
+
+
+class TestAddressesMatchForIdentity:
+    def test_format_only_differences_match(self):
+        assert addresses_match_for_identity(
+            "PO Box 322, East Boothbay, ME  4544    US",
+            "PO Box 322 East Boothbay, ME|04544",
+        ) is True
+
+    def test_missing_postal_on_one_side_does_not_force_mismatch(self):
+        assert addresses_match_for_identity(
+            "3385 Michelson Drive, Irvine, CA  92612    US",
+            "3385 Michelson Drive Irvine, CA|",
+        ) is True
+
+    def test_different_address_body_still_mismatches(self):
+        assert addresses_match_for_identity(
+            "1 Main St, Bar Harbor, ME 04609",
+            "99 Different Rd, Portland, ME 04101",
+        ) is False
 
 
 # ---------------------------------------------------------------------------

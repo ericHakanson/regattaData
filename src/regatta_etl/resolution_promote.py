@@ -158,6 +158,106 @@ def _insert_canonical_participant(conn: psycopg.Connection, pk: str) -> str:
     return str(row[0])
 
 
+def _sync_canonical_participant_children(
+    conn: psycopg.Connection,
+    candidate_participant_id: str,
+    canonical_participant_id: str,
+) -> None:
+    """Copy participant child evidence into canonical tables without duplication.
+
+    This function is safe to call on first promotion and on subsequent repair
+    reruns for already-promoted participants.
+    """
+    conn.execute(
+        """
+        INSERT INTO canonical_participant_contact
+            (canonical_participant_id, contact_type, contact_subtype,
+             raw_value, normalized_value, is_primary)
+        SELECT DISTINCT
+            %s::uuid,
+            c.contact_type,
+            c.contact_subtype,
+            c.raw_value,
+            c.normalized_value,
+            c.is_primary
+        FROM candidate_participant_contact c
+        WHERE c.candidate_participant_id = %s
+          AND NOT EXISTS (
+              SELECT 1
+              FROM canonical_participant_contact existing
+              WHERE existing.canonical_participant_id = %s
+                AND existing.contact_type = c.contact_type
+                AND COALESCE(existing.contact_subtype, '') = COALESCE(c.contact_subtype, '')
+                AND existing.raw_value = c.raw_value
+                AND COALESCE(existing.normalized_value, '') = COALESCE(c.normalized_value, '')
+          )
+        """,
+        (canonical_participant_id, candidate_participant_id, canonical_participant_id),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO canonical_participant_address
+            (canonical_participant_id, address_raw, line1, city, state,
+             postal_code, country_code, is_primary)
+        SELECT DISTINCT
+            %s::uuid,
+            a.address_raw,
+            a.line1,
+            a.city,
+            a.state,
+            a.postal_code,
+            a.country_code,
+            a.is_primary
+        FROM candidate_participant_address a
+        WHERE a.candidate_participant_id = %s
+          AND NOT EXISTS (
+              SELECT 1
+              FROM canonical_participant_address existing
+              WHERE existing.canonical_participant_id = %s
+                AND existing.address_raw = a.address_raw
+          )
+        """,
+        (canonical_participant_id, candidate_participant_id, canonical_participant_id),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO canonical_participant_role_assignment
+            (canonical_participant_id, role, canonical_event_id,
+             canonical_registration_id, source_context)
+        SELECT DISTINCT
+            %s::uuid,
+            r.role,
+            event_link.canonical_entity_id,
+            reg_link.canonical_entity_id,
+            r.source_context
+        FROM candidate_participant_role_assignment r
+        LEFT JOIN candidate_canonical_link event_link
+               ON event_link.candidate_entity_type = 'event'
+              AND event_link.candidate_entity_id = r.candidate_event_id
+        LEFT JOIN candidate_canonical_link reg_link
+               ON reg_link.candidate_entity_type = 'registration'
+              AND reg_link.candidate_entity_id = r.candidate_registration_id
+        WHERE r.candidate_participant_id = %s
+          AND (r.candidate_event_id IS NULL OR event_link.canonical_entity_id IS NOT NULL)
+          AND (r.candidate_registration_id IS NULL OR reg_link.canonical_entity_id IS NOT NULL)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM canonical_participant_role_assignment existing
+              WHERE existing.canonical_participant_id = %s
+                AND existing.role = r.role
+                AND COALESCE(existing.canonical_event_id::text, '')
+                    = COALESCE(event_link.canonical_entity_id::text, '')
+                AND COALESCE(existing.canonical_registration_id::text, '')
+                    = COALESCE(reg_link.canonical_entity_id::text, '')
+                AND COALESCE(existing.source_context, '') = COALESCE(r.source_context, '')
+          )
+        """,
+        (canonical_participant_id, candidate_participant_id, canonical_participant_id),
+    )
+
+
 def _insert_canonical_registration(
     conn: psycopg.Connection,
     pk: str,
@@ -220,6 +320,15 @@ def _promote_entity_type(
             ORDER BY created_at
             """
         ).fetchall()
+    elif entity_type == "participant":
+        rows = conn.execute(
+            """
+            SELECT id, quality_score, is_promoted, promoted_canonical_id
+            FROM candidate_participant
+            WHERE resolution_state = 'auto_promote'
+            ORDER BY created_at
+            """
+        ).fetchall()
     else:
         rows = conn.execute(
             f"SELECT id, quality_score FROM {table} "
@@ -230,6 +339,11 @@ def _promote_entity_type(
     for idx, raw_row in enumerate(rows):
         pk = str(raw_row[0])
         score_before = float(raw_row[1]) if raw_row[1] is not None else None
+        was_already_promoted = False
+        stored_canonical_id = None
+        if entity_type == "participant":
+            was_already_promoted = bool(raw_row[2]) or raw_row[3] is not None
+            stored_canonical_id = str(raw_row[3]) if raw_row[3] else None
         sp = f"promote_{entity_type}_{idx}"
 
         conn.execute(f"SAVEPOINT {sp}")
@@ -239,6 +353,8 @@ def _promote_entity_type(
 
             if existing_canonical_id:
                 canonical_id = existing_canonical_id
+            elif stored_canonical_id:
+                canonical_id = stored_canonical_id
             elif entity_type == "registration":
                 # Resolve canonical FKs from already-promoted entities
                 cand_event_id  = str(raw_row[2]) if raw_row[2] else None
@@ -270,6 +386,9 @@ def _promote_entity_type(
                 inserter = _CANONICAL_INSERTERS[entity_type]
                 canonical_id = inserter(conn, pk)
 
+            if entity_type == "participant":
+                _sync_canonical_participant_children(conn, pk, canonical_id)
+
             # Record the promotion link (idempotent via UNIQUE constraint)
             conn.execute(
                 """
@@ -281,6 +400,19 @@ def _promote_entity_type(
                 """,
                 (entity_type, pk, canonical_id, score_before),
             )
+
+            if was_already_promoted:
+                conn.execute(
+                    f"""
+                    UPDATE {table}
+                    SET promoted_canonical_id = COALESCE(promoted_canonical_id, %s)
+                    WHERE id = %s
+                    """,
+                    (canonical_id, pk),
+                )
+                conn.execute(f"RELEASE SAVEPOINT {sp}")
+                ctrs.candidates_already_promoted += 1
+                continue
 
             # Update candidate as promoted
             conn.execute(
