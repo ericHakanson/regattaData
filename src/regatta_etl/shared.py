@@ -17,7 +17,9 @@ from typing import Any
 import psycopg
 
 from regatta_etl.normalize import (
-    normalize_name,
+    participant_legacy_comma_lookup_key,
+    participant_name_lookup_keys,
+    normalize_person_name_for_identity,
     parse_name_parts,
     slug_name,
     trim,
@@ -314,11 +316,26 @@ def normalize_headers(raw: dict[str, str]) -> dict[str, str]:
 
 def resolve_participant_by_name(
     conn: psycopg.Connection,
-    name_norm: str,
+    full_name: str,
 ) -> str | None:
+    keys = participant_name_lookup_keys(full_name)
+    if not keys:
+        return None
+    legacy_comma_key = participant_legacy_comma_lookup_key(full_name)
     row = conn.execute(
-        "SELECT id FROM participant WHERE normalized_full_name = %s ORDER BY id ASC LIMIT 1",
-        (name_norm,),
+        """
+        SELECT id
+        FROM participant
+        WHERE normalized_full_name = ANY(%s)
+           OR (
+                %s::text IS NOT NULL
+                AND normalized_full_name = %s
+                AND full_name LIKE '%%,%%'
+           )
+        ORDER BY id ASC
+        LIMIT 1
+        """,
+        (list(keys), legacy_comma_key, legacy_comma_key),
     ).fetchone()
     return str(row[0]) if row else None
 
@@ -328,7 +345,7 @@ def insert_participant(
     full_name: str,
 ) -> str:
     first, last = parse_name_parts(full_name)
-    norm = normalize_name(full_name)
+    norm = normalize_person_name_for_identity(full_name)
     row = conn.execute(
         """
         INSERT INTO participant (full_name, normalized_full_name, first_name, last_name)
@@ -346,12 +363,10 @@ def resolve_or_insert_coowner_participant(
     counters: RunCounters,
 ) -> str:
     """Resolve co-owner by normalized name only, inserting if absent."""
-    name_norm = normalize_name(full_name)
-    if name_norm:
-        pid = resolve_participant_by_name(conn, name_norm)
-        if pid:
-            counters.participants_matched_existing += 1
-            return pid
+    pid = resolve_participant_by_name(conn, full_name)
+    if pid:
+        counters.participants_matched_existing += 1
+        return pid
     pid = insert_participant(conn, full_name)
     counters.participants_inserted += 1
     return pid

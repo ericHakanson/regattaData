@@ -82,8 +82,8 @@ def _seed_participant(
     full_name: str = "Alice Smith",
     email: str | None = None,
 ) -> str:
-    from regatta_etl.normalize import normalize_name
-    norm = normalize_name(full_name)
+    from regatta_etl.normalize import normalize_person_name_for_identity
+    norm = normalize_person_name_for_identity(full_name)
     row = conn.execute(
         """
         INSERT INTO participant (full_name, normalized_full_name)
@@ -443,6 +443,28 @@ class TestParticipantIngestionFromJotform:
             "SELECT COUNT(*) FROM candidate_source_link WHERE candidate_entity_type = 'participant'"
         ).fetchone()[0]
         assert link_count == 2
+
+    def test_jotform_last_comma_first_matches_existing_first_last(self, db_conn):
+        """Comma-order variant should collapse to the same participant candidate."""
+        conn, _ = db_conn
+        _seed_participant(conn, "Brown, Eve", "eve@example.com")
+        payload = {"Name": "Eve Brown", "Competitor E mail": "eve@example.com"}
+        pjson = json.dumps(payload)
+        import hashlib
+        row_hash = hashlib.sha256(pjson.encode()).hexdigest()
+        conn.execute(
+            """
+            INSERT INTO jotform_waiver_submission
+                (source_file_name, source_submission_id, source_submitted_at_raw,
+                 raw_payload, row_hash)
+            VALUES ('test.csv', 'SUB-2B', '2025-01-01', %s, %s)
+            """,
+            (pjson, row_hash),
+        )
+        run_source_to_candidate(conn, entity_type="participant")
+
+        count = conn.execute("SELECT COUNT(*) FROM candidate_participant").fetchone()[0]
+        assert count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1060,8 +1082,8 @@ def _seed_mailchimp_resolved(
     Only rows with a matching mailchimp_contact_state are projected by the new
     Mailchimp candidate path (quarantined rows have no contact_state row).
     """
-    from regatta_etl.normalize import normalize_name
-    norm = normalize_name(full_name) or full_name
+    from regatta_etl.normalize import normalize_person_name_for_identity
+    norm = normalize_person_name_for_identity(full_name) or full_name
     pid = str(conn.execute(
         "INSERT INTO participant (full_name, normalized_full_name) VALUES (%s, %s) RETURNING id",
         (full_name, norm),

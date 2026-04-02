@@ -47,7 +47,6 @@ import psycopg
 
 from regatta_etl.normalize import (
     normalize_email,
-    normalize_name,
     normalize_phone,
     normalize_space,
     parse_co_owners,
@@ -196,8 +195,6 @@ def _resolve_or_insert_primary_participant(
     hphone_norm = normalize_phone(row.get("owner_hphone"))
     cphone_norm = normalize_phone(row.get("owner_cphone"))
     ownername = normalize_space(row.get("ownername")) or ""
-    name_norm = normalize_name(ownername)
-
     pid: str | None = None
 
     if email_norm:
@@ -206,8 +203,8 @@ def _resolve_or_insert_primary_participant(
         pid = _resolve_participant_by_phone(conn, hphone_norm, run_id, counters)
     if pid is None and cphone_norm:
         pid = _resolve_participant_by_phone(conn, cphone_norm, run_id, counters)
-    if pid is None and name_norm:
-        pid = resolve_participant_by_name(conn, name_norm)
+    if pid is None and ownername:
+        pid = resolve_participant_by_name(conn, ownername)
 
     if pid is not None:
         counters.participants_matched_existing += 1

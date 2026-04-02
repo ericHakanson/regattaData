@@ -65,6 +65,7 @@ from psycopg import pq
 from regatta_etl.normalize import (
     normalize_email,
     normalize_name,
+    normalize_person_name_for_identity,
     normalize_phone,
     parse_race_url,
     slug_name,
@@ -775,7 +776,7 @@ def _ingest_participants_from_jotform(
             ctrs.warnings.append(f"jotform pk={pk}: skipped — missing name")
             continue
 
-        norm_name = normalize_name(raw_name)
+        norm_name = normalize_person_name_for_identity(raw_name)
         norm_email = normalize_email(raw_email) if raw_email else None
 
         jotform_fields = {
@@ -1058,7 +1059,7 @@ def _ingest_participants_from_airtable(
             ctrs.warnings.append(f"airtable/{asset_name} pk={pk}: skipped — missing name")
             continue
 
-        norm_name = normalize_name(raw_name)
+        norm_name = normalize_person_name_for_identity(raw_name)
         norm_email = normalize_email(raw_email) if raw_email else None
         fp = participant_fingerprint(norm_name, norm_email)
 
@@ -1133,7 +1134,7 @@ def _ingest_participants_from_yacht_scoring(
             ctrs.rows_skipped_no_owner_name += 1
             continue  # Many entries lack owner name — expected
 
-        norm_name = normalize_name(raw_name)
+        norm_name = normalize_person_name_for_identity(raw_name)
         if not norm_name:
             ctrs.rows_skipped_no_owner_name += 1
             continue
@@ -1242,7 +1243,7 @@ def _ingest_participants_from_related_contacts(
             ctrs.warnings.append(f"related_contacts pk={pk}: skipped — missing name")
             continue
 
-        norm_name = normalize_name(raw_name)
+        norm_name = normalize_person_name_for_identity(raw_name)
 
         rc_fields = {
             "display_name": raw_name,
@@ -1991,7 +1992,7 @@ def _ingest_participants_from_manual_patches(
             patch_fields["display_name"] = row[2]
             # Keep normalized_name in sync so scorer and fingerprint lookups
             # use the corrected identity value.
-            patch_fields["normalized_name"] = normalize_name(row[2])
+            patch_fields["normalized_name"] = normalize_person_name_for_identity(row[2])
         if row[3] is not None:
             patch_fields["date_of_birth"] = str(row[3])
         if row[4] is not None:

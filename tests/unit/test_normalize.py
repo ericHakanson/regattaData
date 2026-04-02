@@ -7,12 +7,15 @@ from datetime import date, datetime
 from regatta_etl.normalize import (
     addresses_match_for_identity,
     normalize_address_for_identity,
+    participant_legacy_comma_lookup_key,
+    participant_name_lookup_keys,
     trim,
     normalize_space,
     normalize_email,
     normalize_phone,
     normalize_postal_code,
     normalize_name,
+    normalize_person_name_for_identity,
     slug_name,
     parse_ts,
     parse_date_from_ts,
@@ -184,6 +187,73 @@ class TestNormalizeName:
 
     def test_punctuation_removed(self):
         assert normalize_name("O'Brien") == "obrien"
+
+
+# ---------------------------------------------------------------------------
+# normalize_person_name_for_identity
+# ---------------------------------------------------------------------------
+
+class TestNormalizePersonNameForIdentity:
+    def test_equates_comma_and_non_comma_order(self):
+        assert normalize_person_name_for_identity("Smith, John") == "john smith"
+        assert normalize_person_name_for_identity("John Smith") == "john smith"
+
+    def test_handles_middle_names(self):
+        assert normalize_person_name_for_identity("Smith, John R.") == "john r smith"
+        assert normalize_person_name_for_identity("John R Smith") == "john r smith"
+
+    def test_preserves_single_token(self):
+        assert normalize_person_name_for_identity("Madonna") == "madonna"
+
+    def test_none(self):
+        assert normalize_person_name_for_identity(None) is None
+
+    def test_empty_string(self):
+        assert normalize_person_name_for_identity("") is None
+
+    def test_whitespace_only(self):
+        assert normalize_person_name_for_identity("   ") is None
+
+    def test_comma_only_input(self):
+        # ", " has no meaningful tokens — both sides trim to None/empty
+        result = normalize_person_name_for_identity(", ")
+        assert result is None
+
+    def test_two_commas_suffix(self):
+        # "Last, First, Jr." — split on first comma only:
+        # last="Last", first="First, Jr." → normalize_name strips comma → "first jr last"
+        result = normalize_person_name_for_identity("Last, First, Jr.")
+        assert result == "first jr last"
+
+    def test_non_ascii_normalized(self):
+        # Accented chars decomposed and combining marks dropped
+        assert normalize_person_name_for_identity("Müller, Hans") == "hans muller"
+
+    def test_comma_format_distinct_from_different_name(self):
+        # Regression: "Smith, John" must NOT equal "Smith, Jane"
+        assert normalize_person_name_for_identity("Smith, John") != normalize_person_name_for_identity("Smith, Jane")
+
+
+class TestParticipantNameLookupKeys:
+    def test_includes_preferred_then_legacy_for_comma_name(self):
+        assert participant_name_lookup_keys("Smith, John") == ("john smith", "smith john")
+
+    def test_dedupes_when_preferred_equals_legacy(self):
+        assert participant_name_lookup_keys("John Smith") == ("john smith",)
+
+    def test_empty(self):
+        assert participant_name_lookup_keys("   ") == ()
+
+
+class TestParticipantLegacyCommaLookupKey:
+    def test_first_last(self):
+        assert participant_legacy_comma_lookup_key("John Smith") == "smith john"
+
+    def test_last_first(self):
+        assert participant_legacy_comma_lookup_key("Smith, John") == "smith john"
+
+    def test_single_token_none(self):
+        assert participant_legacy_comma_lookup_key("Madonna") is None
 
 
 # ---------------------------------------------------------------------------

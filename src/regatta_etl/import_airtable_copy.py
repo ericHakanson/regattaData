@@ -31,7 +31,8 @@ import psycopg
 
 from regatta_etl.normalize import (
     normalize_email,
-    normalize_name,
+    participant_legacy_comma_lookup_key,
+    participant_name_lookup_keys,
     normalize_phone,
     normalize_space,
     parse_numeric,
@@ -414,15 +415,30 @@ def _resolve_by_phone_strict(
 
 def _resolve_by_name_strict(
     conn: psycopg.Connection,
-    name_norm: str,
+    full_name: str,
 ) -> str | None:
+    lookup_keys = participant_name_lookup_keys(full_name)
+    if not lookup_keys:
+        return None
+    legacy_comma_key = participant_legacy_comma_lookup_key(full_name)
     rows = conn.execute(
-        "SELECT id FROM participant WHERE normalized_full_name = %s",
-        (name_norm,),
+        """
+        SELECT id
+        FROM participant
+        WHERE normalized_full_name = ANY(%s)
+           OR (
+                %s::text IS NOT NULL
+                AND normalized_full_name = %s
+                AND full_name LIKE '%%,%%'
+           )
+        """,
+        (list(lookup_keys), legacy_comma_key, legacy_comma_key),
     ).fetchall()
     if len(rows) > 1:
         raise AmbiguousMatchError(
-            f"ambiguous_participant_match: name={name_norm!r} ({len(rows)} participants)"
+            "ambiguous_participant_match: "
+            f"name={full_name!r}, lookup_keys={list(lookup_keys)!r} "
+            f"({len(rows)} participants)"
         )
     return str(rows[0][0]) if rows else None
 
@@ -446,9 +462,7 @@ def _resolve_or_insert_participant_strict(
     if pid is None and phone_norm:
         pid = _resolve_by_phone_strict(conn, phone_norm)
     if pid is None and full_name:
-        name_norm = normalize_name(full_name)
-        if name_norm:
-            pid = _resolve_by_name_strict(conn, name_norm)
+        pid = _resolve_by_name_strict(conn, full_name)
 
     if pid is not None:
         counters.participants_matched_existing += 1
@@ -468,12 +482,10 @@ def _resolve_or_insert_participant_name_only(
     counters: RunCounters,
 ) -> str:
     """Resolve by normalized name only; raise on ambiguity; insert on no match."""
-    name_norm = normalize_name(full_name)
-    if name_norm:
-        pid = _resolve_by_name_strict(conn, name_norm)
-        if pid is not None:
-            counters.participants_matched_existing += 1
-            return pid
+    pid = _resolve_by_name_strict(conn, full_name)
+    if pid is not None:
+        counters.participants_matched_existing += 1
+        return pid
     pid = insert_participant(conn, full_name)
     counters.participants_inserted += 1
     return pid

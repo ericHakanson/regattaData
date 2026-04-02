@@ -48,7 +48,7 @@ from bs4 import BeautifulSoup
 
 from regatta_etl.normalize import (
     normalize_email,
-    normalize_name,
+    normalize_person_name_for_identity,
     normalize_phone,
     normalize_space,
     slug_name,
@@ -1213,9 +1213,7 @@ def _resolve_or_insert_participant_for_profile(
 
     # Name lookup
     if pid is None and display_name:
-        name_norm = normalize_name(display_name)
-        if name_norm:
-            pid = resolve_participant_by_name(conn, name_norm)
+        pid = resolve_participant_by_name(conn, display_name)
 
     if pid is not None:
         counters.participants_matched_existing += 1
@@ -1428,7 +1426,7 @@ def _ingest_profile(
     # ------------------------------------------------------------------ #
     # 7. Candidate participant (primary)                                   #
     # ------------------------------------------------------------------ #
-    name_norm = normalize_name(display_name or "")
+    name_norm = normalize_person_name_for_identity(display_name or "")
     best_email = normalize_email(all_emails[0]) if all_emails else None
     fp = participant_fingerprint(name_norm, best_email)
 
@@ -1516,7 +1514,7 @@ def _ingest_profile(
         if not hh_name:
             continue
 
-        hh_name_norm = normalize_name(hh_name)
+        hh_name_norm = normalize_person_name_for_identity(hh_name)
         if not hh_name_norm:
             counters.warnings.append(
                 f"household member {hh_name!r} for member_id={member_id} "
@@ -1525,7 +1523,7 @@ def _ingest_profile(
             continue
 
         # Resolve or insert household participant (name-only)
-        hh_pid = resolve_participant_by_name(conn, hh_name_norm)
+        hh_pid = resolve_participant_by_name(conn, hh_name)
         if hh_pid is None:
             hh_pid = insert_participant(conn, hh_name)
             counters.household_members_created += 1

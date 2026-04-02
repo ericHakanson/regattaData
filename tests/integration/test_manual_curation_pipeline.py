@@ -445,7 +445,7 @@ class TestNormalizedFieldUpdates:
         """Patching display_name must also update normalized_name for scorer consistency."""
         conn, _ = db_conn
         from regatta_etl.resolution_source_to_candidate import run_source_to_candidate
-        from regatta_etl.normalize import normalize_name
+        from regatta_etl.normalize import normalize_person_name_for_identity
 
         cid = _seed_candidate_participant(conn, display_name="Old Name", normalized_name="old-name")
         ph = _patch_hash("participant_patch", cid, "Smith, Alice", None, None, None)
@@ -465,7 +465,7 @@ class TestNormalizedFieldUpdates:
             (cid,),
         ).fetchone()
         assert row[0] == "Smith, Alice"
-        assert row[1] == normalize_name("Smith, Alice")
+        assert row[1] == normalize_person_name_for_identity("Smith, Alice")
 
     def test_yacht_patch_updates_normalized_name_and_sail(self, db_conn):
         """Patching name/sail_number must update normalized_name/normalized_sail_number."""

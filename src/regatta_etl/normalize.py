@@ -178,6 +178,59 @@ def normalize_name(value: str | None) -> str | None:
     return v if v else None
 
 
+def normalize_person_name_for_identity(value: str | None) -> str | None:
+    """Canonical person-name normalizer for participant identity matching.
+
+    Unlike normalize_name(), this helper canonicalizes comma-order variants:
+      - "Smith, John" -> "john smith"
+      - "John Smith"  -> "john smith"
+
+    For non-comma names, token order is preserved.
+    """
+    v = normalize_space(value)
+    if v is None:
+        return None
+
+    first, last = parse_name_parts(v)
+    canonical = " ".join(part for part in (first, last) if part)
+    if not canonical:
+        canonical = v
+    return normalize_name(canonical)
+
+
+def participant_name_lookup_keys(value: str | None) -> tuple[str, ...]:
+    """Return preferred + legacy participant-name lookup keys.
+
+    Key order:
+    1) normalize_person_name_for_identity(value)  (preferred; comma-order aware)
+    2) normalize_name(value)                      (legacy fallback)
+    """
+    keys: list[str] = []
+    preferred = normalize_person_name_for_identity(value)
+    if preferred:
+        keys.append(preferred)
+    legacy = normalize_name(value)
+    if legacy and legacy not in keys:
+        keys.append(legacy)
+    return tuple(keys)
+
+
+def participant_legacy_comma_lookup_key(value: str | None) -> str | None:
+    """Return legacy comma-order key for matching pre-FOR-205 participant rows.
+
+    Example:
+      - "John Smith"  -> "smith john"
+      - "Smith, John" -> "smith john"
+    """
+    v = normalize_space(value)
+    if not v:
+        return None
+    first, last = parse_name_parts(v)
+    if not first or not last:
+        return None
+    return normalize_name(f"{last} {first}")
+
+
 # ---------------------------------------------------------------------------
 # Rule 6: slug_name  (for normalized_name DB fields on clubs/events/yachts)
 # ---------------------------------------------------------------------------

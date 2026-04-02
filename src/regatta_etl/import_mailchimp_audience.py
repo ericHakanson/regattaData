@@ -31,7 +31,8 @@ import psycopg
 from regatta_etl.normalize import (
     addresses_match_for_identity,
     normalize_email,
-    normalize_name,
+    participant_legacy_comma_lookup_key,
+    participant_name_lookup_keys,
     normalize_phone,
     parse_ts,
     trim,
@@ -129,17 +130,32 @@ def _resolve_participant_by_email(
 
 def _resolve_participant_by_name_strict(
     conn: psycopg.Connection,
-    name_norm: str,
+    full_name: str,
 ) -> str | None:
     """Return participant_id for a unique name match, raise on ambiguity."""
+    lookup_keys = participant_name_lookup_keys(full_name)
+    if not lookup_keys:
+        return None
+    legacy_comma_key = participant_legacy_comma_lookup_key(full_name)
     rows = conn.execute(
-        "SELECT id FROM participant WHERE normalized_full_name = %s",
-        (name_norm,),
+        """
+        SELECT id
+        FROM participant
+        WHERE normalized_full_name = ANY(%s)
+           OR (
+                %s::text IS NOT NULL
+                AND normalized_full_name = %s
+                AND full_name LIKE '%%,%%'
+           )
+        """,
+        (list(lookup_keys), legacy_comma_key, legacy_comma_key),
     ).fetchall()
     if not rows:
         return None
     if len(rows) > 1:
-        raise AmbiguousMatchError(f"ambiguous_name_match: name_norm={name_norm!r}")
+        raise AmbiguousMatchError(
+            f"ambiguous_name_match: full_name={full_name!r}, lookup_keys={list(lookup_keys)!r}"
+        )
     return str(rows[0][0])
 
 
@@ -257,24 +273,31 @@ def _strict_resolve_participant(
         source_first = trim(row.get("First Name"))
         source_last = trim(row.get("Last Name"))
         source_full = _build_full_name(source_first, source_last)
-        source_name_norm = normalize_name(source_full) if source_full else None
+        source_lookup_keys = participant_name_lookup_keys(source_full) if source_full else ()
+        source_legacy_comma_key = (
+            participant_legacy_comma_lookup_key(source_full) if source_full else None
+        )
+        allowed_source_name_keys = set(source_lookup_keys)
+        if source_legacy_comma_key:
+            allowed_source_name_keys.add(source_legacy_comma_key)
 
         used_missing_name_exception = False
-        if source_name_norm is None or target_name is None:
+        if not allowed_source_name_keys or target_name is None:
             if not allow_unique_email_missing_name_link:
                 _quarantine(
                     pid, "missing_name_for_email_match",
-                    f"source_has_name={source_name_norm is not None}, "
+                    f"source_has_name={bool(allowed_source_name_keys)}, "
                     f"target_has_name={target_name is not None}",
                 )
                 return None
             # Policy v2.1 optional exception: continue to C/D checks.
             # Counter incremented only on successful return below.
             used_missing_name_exception = True
-        elif source_name_norm != target_name:
+        elif target_name not in allowed_source_name_keys:
             _quarantine(
                 pid, "email_name_mismatch",
-                f"source={source_name_norm!r}, target={target_name!r}",
+                f"source_lookup_keys={sorted(allowed_source_name_keys)!r}, "
+                f"target={target_name!r}",
             )
             return None
 
@@ -317,22 +340,20 @@ def _strict_resolve_participant(
     full_name = _build_full_name(source_first, source_last)
 
     if full_name:
-        name_norm = normalize_name(full_name)
-        if name_norm:
-            try:
-                name_pid = _resolve_participant_by_name_strict(conn, name_norm)
-            except AmbiguousMatchError:
-                # Name-only ambiguity: row-level reject only (not a review-queue case)
-                rejects.write(
-                    {**row, "_source_file": source_file_name,
-                     "_audience_status": audience_status},
-                    "ambiguous_name_match",
-                )
-                counters.rows_rejected += 1
-                return None
-            if name_pid is not None:
-                counters.participants_matched_existing += 1
-                return name_pid
+        try:
+            name_pid = _resolve_participant_by_name_strict(conn, full_name)
+        except AmbiguousMatchError:
+            # Name-only ambiguity: row-level reject only (not a review-queue case)
+            rejects.write(
+                {**row, "_source_file": source_file_name,
+                 "_audience_status": audience_status},
+                "ambiguous_name_match",
+            )
+            counters.rows_rejected += 1
+            return None
+        if name_pid is not None:
+            counters.participants_matched_existing += 1
+            return name_pid
 
     display_name = full_name or email_norm  # email as fallback for name-absent rows
     new_pid = insert_participant(conn, display_name)

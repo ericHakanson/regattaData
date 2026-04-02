@@ -13,7 +13,6 @@ import psycopg
 
 from regatta_etl.normalize import (
     normalize_email,
-    normalize_name,
     normalize_phone,
     normalize_space,
     parse_date,
@@ -91,7 +90,10 @@ def _process_row(
 
     # Canonical Projection
     # Participant
-    participant_id = resolve_participant_by_name(conn, normalize_name(participant_name))
+    participant_id = resolve_participant_by_name(
+        conn,
+        participant_name,
+    )
     if not participant_id:
         participant_id = insert_participant(conn, participant_name)
         counters.participants_inserted += 1

@@ -32,7 +32,7 @@ Per-row processing:
         as an integer. 0 is a valid PHRF rating and is written.
 
 Name-only participant resolution (no email/phone in source):
-  normalize_name(owner_name) → lookup; insert on miss.
+  normalize_person_name_for_identity(owner_name) → lookup; insert on miss.
 
 Effective start date for ownership rows:
   Provided via --effective-start (YYYY-MM-DD); defaults to the load date
@@ -59,7 +59,9 @@ import click
 import psycopg
 
 from regatta_etl.normalize import (
-    normalize_name,
+    normalize_person_name_for_identity,
+    participant_legacy_comma_lookup_key,
+    participant_name_lookup_keys,
     normalize_space,
     slug_name,
     trim,
@@ -274,15 +276,27 @@ def _resolve_or_insert_participant(
     Name-only resolution — no email/phone in snapshot source.
     Raises AmbiguousMatchError if normalized name matches multiple participants.
     """
-    norm = normalize_name(owner_name)
-    if norm:
+    lookup_keys = participant_name_lookup_keys(owner_name)
+    if lookup_keys:
+        legacy_comma_key = participant_legacy_comma_lookup_key(owner_name)
         rows = conn.execute(
-            "SELECT id FROM participant WHERE normalized_full_name = %s",
-            (norm,),
+            """
+            SELECT id
+            FROM participant
+            WHERE normalized_full_name = ANY(%s)
+               OR (
+                    %s::text IS NOT NULL
+                    AND normalized_full_name = %s
+                    AND full_name LIKE '%%,%%'
+               )
+            """,
+            (list(lookup_keys), legacy_comma_key, legacy_comma_key),
         ).fetchall()
         if len(rows) > 1:
             raise AmbiguousMatchError(
-                f"ambiguous_participant_match: name={norm!r} ({len(rows)} matches)"
+                "ambiguous_participant_match: "
+                f"name={owner_name!r}, lookup_keys={list(lookup_keys)!r} "
+                f"({len(rows)} matches)"
             )
         if len(rows) == 1:
             counters.participants_matched_existing += 1
@@ -465,7 +479,7 @@ def _process_row(
         return
 
     # Validate at least the first owner has a resolvable normalized name
-    first_norm = normalize_name(owner_names[0])
+    first_norm = normalize_person_name_for_identity(owner_names[0])
     if not first_norm:
         rejects.write(row, "missing_required_column:nameLower")
         counters.rows_rejected += 1
@@ -499,7 +513,7 @@ def _process_row(
 
     # ── Resolve / insert each owner and upsert ownership ──
     for owner_idx, owner_name in enumerate(owner_names):
-        owner_norm = normalize_name(owner_name)
+        owner_norm = normalize_person_name_for_identity(owner_name)
         if not owner_norm:
             counters.warnings.append(
                 f"[{run_id}] row {ordinal}: owner[{owner_idx}] "

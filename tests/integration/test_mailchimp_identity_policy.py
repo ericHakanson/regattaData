@@ -213,6 +213,23 @@ def test_email_name_exact_match_accepted(db_conn, tmp_path):
     assert len(_queue_rows(conn)) == 0
 
 
+def test_email_name_match_accepts_legacy_comma_normalization(db_conn, tmp_path):
+    """Email match should accept when target has legacy comma-order normalized name."""
+    conn, dsn = db_conn
+
+    pid = _seed_participant(conn, name="Smith, John", email="john@example.com")
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email="john@example.com", first="John", last="Smith"),
+    ])
+
+    assert ctrs.rows_rejected == 0
+    assert ctrs.mailchimp_identity_rows_quarantined == 0
+    assert ctrs.participants_matched_existing == 1
+    assert ctrs.participants_inserted == 0
+    assert len(_queue_rows(conn)) == 0
+
+
 def test_email_name_mismatch_quarantined(db_conn, tmp_path):
     """Email match but name mismatch → quarantine with email_name_mismatch."""
     conn, dsn = db_conn

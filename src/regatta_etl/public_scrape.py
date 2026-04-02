@@ -26,7 +26,7 @@ from regatta_etl.normalize import (
     build_entry_hash,
     canonical_entries_url,
     extract_sku_from_hist,
-    normalize_name,
+    normalize_person_name_for_identity,
     normalize_space,
     parse_race_url,
     slug_name,
@@ -202,7 +202,7 @@ def parse_entry_row(
         return None
 
     # Name must produce a non-null normalized form (rejects pure-punctuation values)
-    if not normalize_name(full_name):
+    if not normalize_person_name_for_identity(full_name):
         counters.rows_rejected += 1
         rejects.write(row, "missing_required_column:Name")
         return None
@@ -423,10 +423,9 @@ def _process_entry(
     """Upsert participant, yacht, event_entry, event_entry_participant for one entry."""
 
     # Participant — name-only resolution for public scrape
-    name_norm = normalize_name(rec.full_name)
     pid: str | None = None
-    if name_norm:
-        pid = resolve_participant_by_name(conn, name_norm)
+    if rec.full_name:
+        pid = resolve_participant_by_name(conn, rec.full_name)
 
     if pid is not None:
         counters.participants_matched_existing += 1

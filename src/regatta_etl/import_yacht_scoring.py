@@ -35,7 +35,9 @@ import click
 import psycopg
 
 from regatta_etl.normalize import (
-    normalize_name,
+    normalize_person_name_for_identity,
+    participant_legacy_comma_lookup_key,
+    participant_name_lookup_keys,
     normalize_space,
     parse_ys_boatdetail_url,
     parse_ys_emenu_url,
@@ -150,7 +152,7 @@ def _build_participant_source_key(
     Key: "{name_norm}|{affiliation_slug}|{location_slug}"
     Returns None when owner_name normalizes to None.
     """
-    name_norm = normalize_name(owner_name)
+    name_norm = normalize_person_name_for_identity(owner_name)
     if not name_norm:
         return None
     aff_slug = slug_name(affiliation) or ""
@@ -462,15 +464,27 @@ def _resolve_or_insert_participant_ys(
     counters: RunCounters,
 ) -> str:
     """Resolve participant by normalized name only; raise on ambiguity; insert on no match."""
-    name_norm = normalize_name(full_name)
-    if name_norm:
+    lookup_keys = participant_name_lookup_keys(full_name)
+    if lookup_keys:
+        legacy_comma_key = participant_legacy_comma_lookup_key(full_name)
         rows = conn.execute(
-            "SELECT id FROM participant WHERE normalized_full_name = %s",
-            (name_norm,),
+            """
+            SELECT id
+            FROM participant
+            WHERE normalized_full_name = ANY(%s)
+               OR (
+                    %s::text IS NOT NULL
+                    AND normalized_full_name = %s
+                    AND full_name LIKE '%%,%%'
+               )
+            """,
+            (list(lookup_keys), legacy_comma_key, legacy_comma_key),
         ).fetchall()
         if len(rows) > 1:
             raise AmbiguousMatchError(
-                f"ambiguous_participant_match: name={name_norm!r} ({len(rows)} participants)"
+                "ambiguous_participant_match: "
+                f"name={full_name!r}, lookup_keys={list(lookup_keys)!r} "
+                f"({len(rows)} participants)"
             )
         if len(rows) == 1:
             counters.participants_matched_existing += 1
