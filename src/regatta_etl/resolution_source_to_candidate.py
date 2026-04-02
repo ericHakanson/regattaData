@@ -54,6 +54,7 @@ Tables intentionally skipped (logged in pipeline report):
 
 from __future__ import annotations
 
+from collections import defaultdict
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -2518,6 +2519,42 @@ class UnderCombinationRemediationCounters:
         return d
 
 
+def _participant_alias_cluster_key(normalized_name: str | None) -> str | None:
+    """Return a token-order-insensitive key for participant-name remediation.
+
+    This is intentionally narrow: we only normalize token order so
+    "fname lname" and "lname fname" cluster together. Other safety criteria
+    (single clear winner, loser eligibility) are still enforced separately.
+    """
+    norm = normalize_name(normalized_name)
+    if not norm:
+        return None
+    tokens = norm.split()
+    if len(tokens) < 2:
+        return norm
+    return " ".join(sorted(tokens))
+
+
+def _remediation_rank_key(row: tuple[Any, ...]) -> tuple[int, int, float, float, str]:
+    """Deterministic winner ranking key for remediation candidates.
+
+    Row shape:
+      (id, normalized_name, best_email, is_promoted, quality_score,
+       updated_at, resolution_state, display_name)
+    """
+    quality = row[4]
+    quality_num = float(quality) if quality is not None else -1_000_000_000.0
+    updated_at = row[5]
+    updated_ts = float(updated_at.timestamp()) if updated_at is not None else 0.0
+    return (
+        0 if row[2] is not None else 1,  # best_email DESC
+        0 if bool(row[3]) else 1,        # is_promoted DESC
+        -quality_num,                    # quality_score DESC NULLS LAST
+        -updated_ts,                     # updated_at DESC
+        str(row[0]),                     # id ASC
+    )
+
+
 def run_under_combination_remediation(
     conn: psycopg.Connection,
     dry_run: bool = False,
@@ -2541,64 +2578,72 @@ def run_under_combination_remediation(
     """
     ctrs = UnderCombinationRemediationCounters()
 
-    # Find split groups
-    split_names = conn.execute(
+    # Load participant candidates once and cluster by alias-aware key.
+    candidate_rows = conn.execute(
         """
-        SELECT normalized_name
+        SELECT id, normalized_name, best_email, is_promoted, quality_score, updated_at,
+               resolution_state, display_name
         FROM candidate_participant
         WHERE normalized_name IS NOT NULL
-        GROUP BY normalized_name
-        HAVING BOOL_OR(best_email IS NULL) AND BOOL_OR(best_email IS NOT NULL)
-        ORDER BY normalized_name
         """
     ).fetchall()
 
-    for (norm_name,) in split_names:
+    clustered: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
+    for row in candidate_rows:
+        alias_key = _participant_alias_cluster_key(row[1])
+        if alias_key:
+            clustered[alias_key].append(row)
+
+    for alias_key in sorted(clustered):
+        cluster_rows = clustered[alias_key]
+        has_email_bearer = any(row[2] is not None for row in cluster_rows)
+        has_null_email = any(row[2] is None for row in cluster_rows)
+        if not (has_email_bearer and has_null_email):
+            continue
+
         ctrs.groups_examined += 1
 
-        # Fetch all candidates for this name, ranked
-        candidates = conn.execute(
-            """
-            SELECT id, best_email, is_promoted, quality_score, updated_at,
-                   resolution_state, display_name
-            FROM candidate_participant
-            WHERE normalized_name = %s
-            ORDER BY
-                (best_email IS NOT NULL) DESC,
-                is_promoted DESC,
-                quality_score DESC NULLS LAST,
-                updated_at DESC,
-                id ASC
-            """,
-            (norm_name,),
-        ).fetchall()
+        # Rank candidates in this alias-aware cluster deterministically.
+        candidates = sorted(cluster_rows, key=_remediation_rank_key)
+        normalized_names = sorted({str(row[1]) for row in candidates if row[1]})
 
-        # Winner = first candidate (has email per ORDER BY)
-        winner = candidates[0]
-        winner_id = str(winner[0])
-        winner_email = winner[1]
-
-        if winner_email is None:
+        # Safety: only auto-consolidate when there's one clear email-bearing winner.
+        email_bearers = [row for row in candidates if row[2] is not None]
+        if len(email_bearers) != 1:
             ctrs.conflicts_skipped += 1
             ctrs.warnings.append(
-                f"remediation_skip: norm_name={norm_name!r} — winner has no email; "
-                "cannot determine winner deterministically"
+                f"remediation_skip: alias_key={alias_key!r} normalized_names={normalized_names!r} "
+                f"— ambiguous winner ({len(email_bearers)} email-bearing candidates)"
             )
             continue
 
+        winner = email_bearers[0]
+        winner_id = str(winner[0])
+        winner_email = winner[2]
+
         # Eligible losers: null email, reject state, not promoted
         losers = [
-            c for c in candidates[1:]
-            if c[1] is None and c[5] == "reject" and not c[2]
+            c for c in candidates
+            if str(c[0]) != winner_id and c[2] is None and c[6] == "reject" and not c[3]
         ]
+
+        if dry_run and losers:
+            planned_loser_ids = [str(c[0]) for c in losers]
+            ctrs.warnings.append(
+                f"remediation_plan: alias_key={alias_key!r} normalized_names={normalized_names!r} "
+                f"winner_id={winner_id} winner_email={winner_email!r} "
+                f"loser_ids={planned_loser_ids!r}"
+            )
 
         if not losers:
             # All null-email candidates are ineligible (promoted or wrong state)
-            ineligible = [c for c in candidates[1:] if c[1] is None]
+            ineligible = [
+                c for c in candidates if str(c[0]) != winner_id and c[2] is None
+            ]
             if ineligible:
                 ctrs.conflicts_skipped += 1
                 ctrs.warnings.append(
-                    f"remediation_skip: norm_name={norm_name!r} — "
+                    f"remediation_skip: alias_key={alias_key!r} normalized_names={normalized_names!r} — "
                     f"{len(ineligible)} null-email candidate(s) ineligible for merge "
                     "(promoted or not in reject state)"
                 )
@@ -2802,7 +2847,7 @@ def run_under_combination_remediation(
                 group_errors += 1
                 ctrs.db_errors += 1
                 ctrs.warnings.append(
-                    f"remediation_error: norm_name={norm_name!r} loser_id={loser_id}: {exc}"
+                    f"remediation_error: alias_key={alias_key!r} loser_id={loser_id}: {exc}"
                 )
                 if not dry_run:
                     try:

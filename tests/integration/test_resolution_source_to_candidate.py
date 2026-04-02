@@ -908,6 +908,25 @@ class TestUnderCombinationRemediation:
         )
         return winner_id, loser_id
 
+    def _seed_alias_split_pair(self, conn: psycopg.Connection):
+        """Seed a split pair where normalized_name differs only by token order."""
+        from regatta_etl.normalize import normalize_name
+        winner_norm = normalize_name("Alias Person")
+        loser_norm = normalize_name("Person Alias")
+        winner_id = _insert_candidate_participant(
+            conn, "Alias Person", winner_norm, "alias@example.com",
+            resolution_state="auto_promote", quality_score=0.8,
+        )
+        loser_id = _insert_candidate_participant(
+            conn, "Person Alias", loser_norm, None,
+            resolution_state="reject",
+        )
+        _insert_candidate_source_link(
+            conn, "participant", loser_id,
+            "yacht_scoring_raw_row", "fake-ys-pk-alias-001",
+        )
+        return winner_id, loser_id, winner_norm, loser_norm
+
     def test_remediation_merges_existing_split_pair(self, db_conn):
         """Remediation deletes loser, retains winner, transfers source links."""
         conn, _ = db_conn
@@ -981,6 +1000,48 @@ class TestUnderCombinationRemediation:
         ).fetchone()
         assert reg_row is not None
         assert str(reg_row[0]) == winner_id
+
+    def test_remediation_merges_token_order_alias_split_pair(self, db_conn):
+        """Token-order aliases should cluster and merge in one remediation pass."""
+        conn, _ = db_conn
+        winner_id, loser_id, winner_norm, loser_norm = self._seed_alias_split_pair(conn)
+
+        ctrs = run_under_combination_remediation(conn, dry_run=False)
+
+        assert ctrs.groups_examined >= 1
+        assert ctrs.groups_merged >= 1
+        assert ctrs.loser_rows_deleted >= 1
+        assert ctrs.links_transferred >= 1
+        assert ctrs.db_errors == 0
+
+        loser_row = conn.execute(
+            "SELECT 1 FROM candidate_participant WHERE id = %s",
+            (loser_id,),
+        ).fetchone()
+        assert loser_row is None
+
+        winner_row = conn.execute(
+            "SELECT normalized_name FROM candidate_participant WHERE id = %s",
+            (winner_id,),
+        ).fetchone()
+        assert winner_row is not None
+        assert winner_row[0] in (winner_norm, loser_norm)
+
+    def test_remediation_dry_run_reports_alias_cluster_plan(self, db_conn):
+        """Dry-run warnings should include alias cluster and planned winner/losers."""
+        conn, _ = db_conn
+        winner_id, loser_id, winner_norm, loser_norm = self._seed_alias_split_pair(conn)
+
+        ctrs = run_under_combination_remediation(conn, dry_run=True)
+
+        assert ctrs.db_errors == 0
+        planned = [w for w in ctrs.warnings if w.startswith("remediation_plan:")]
+        assert planned
+        plan_text = " ".join(planned)
+        assert winner_norm in plan_text
+        assert loser_norm in plan_text
+        assert winner_id in plan_text
+        assert loser_id in plan_text
 
     def test_remediation_dry_run_no_writes(self, db_conn):
         """Dry-run reports planned merges but leaves DB unchanged."""
