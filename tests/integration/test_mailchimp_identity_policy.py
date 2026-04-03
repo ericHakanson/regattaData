@@ -343,7 +343,8 @@ def test_ambiguous_email_quarantined_with_queue_row(db_conn, tmp_path):
     conn, dsn = db_conn
 
     shared_email = "shared@example.com"
-    for name in ("P One", "P Two"):
+    # Keep identity corroboration intentionally ambiguous: both share same name.
+    for name in ("Pat Lee", "Pat Lee"):
         pid = str(uuid.uuid4())
         conn.execute(
             "INSERT INTO participant (id, full_name, normalized_full_name) "
@@ -362,7 +363,7 @@ def test_ambiguous_email_quarantined_with_queue_row(db_conn, tmp_path):
     conn.commit()
 
     ctrs, rejects_path = _run(conn, dsn, tmp_path, [
-        _make_row(email=shared_email, first="P", last="One"),
+        _make_row(email=shared_email, first="Pat", last="Lee"),
     ])
 
     assert ctrs.rows_rejected == 1
@@ -376,6 +377,66 @@ def test_ambiguous_email_quarantined_with_queue_row(db_conn, tmp_path):
     # Raw capture preserved despite quarantine
     ct = conn.execute("SELECT COUNT(*) FROM mailchimp_audience_row").fetchone()[0]
     assert ct == 1
+
+
+def test_ambiguous_email_uniquely_corroborated_is_accepted(db_conn, tmp_path):
+    """Ambiguous email can resolve when exactly one participant passes corroboration."""
+    conn, dsn = db_conn
+
+    shared_email = "shared-disambiguate@example.com"
+
+    # Both candidates share email and normalized name; phone breaks the tie.
+    _seed_participant(
+        conn,
+        name="Sam Smith",
+        email=shared_email,
+        phone="2075550101",
+        address="1 Main St, Boothbay, ME 04537",
+    )
+    _seed_participant(
+        conn,
+        name="Sam Smith",
+        email=shared_email,
+        phone="6175559999",
+        address="88 Other Rd, Boston, MA 02108",
+    )
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(
+            email=shared_email,
+            first="Sam",
+            last="Smith",
+            phone="207-555-0101",
+            address="1 Main St, Boothbay, ME 04537",
+        ),
+    ])
+
+    assert ctrs.rows_rejected == 0
+    assert ctrs.mailchimp_identity_rows_quarantined == 0
+    assert ctrs.participants_matched_existing == 1
+    assert len(_queue_rows(conn)) == 0
+
+
+def test_ambiguous_email_with_multiple_corroborated_candidates_stays_quarantined(db_conn, tmp_path):
+    """Fail-closed: if more than one candidate still passes corroboration, keep ambiguous."""
+    conn, dsn = db_conn
+
+    shared_email = "shared-still-ambiguous@example.com"
+
+    # Both candidates will pass (same name; no phone/address provided in source row).
+    _seed_participant(conn, name="Casey Jordan", email=shared_email)
+    _seed_participant(conn, name="Casey Jordan", email=shared_email)
+
+    ctrs, _ = _run(conn, dsn, tmp_path, [
+        _make_row(email=shared_email, first="Casey", last="Jordan"),
+    ])
+
+    assert ctrs.rows_rejected == 1
+    assert ctrs.mailchimp_identity_rows_quarantined == 1
+
+    queue = _queue_rows(conn)
+    assert len(queue) == 1
+    assert queue[0]["reason_code"] == "ambiguous_email_match"
 
 
 # ---------------------------------------------------------------------------

@@ -113,6 +113,19 @@ def _resolve_participant_by_email(
     email_norm: str,
 ) -> str | None:
     """Return participant_id for a unique email match, raise on ambiguity."""
+    rows = _resolve_participant_ids_by_email(conn, email_norm)
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise AmbiguousMatchError(f"ambiguous_email_match: email={email_norm!r}")
+    return rows[0]
+
+
+def _resolve_participant_ids_by_email(
+    conn: psycopg.Connection,
+    email_norm: str,
+) -> list[str]:
+    """Return all participant ids that currently bear this normalized email."""
     rows = conn.execute(
         """
         SELECT DISTINCT participant_id
@@ -121,11 +134,7 @@ def _resolve_participant_by_email(
         """,
         (email_norm,),
     ).fetchall()
-    if not rows:
-        return None
-    if len(rows) > 1:
-        raise AmbiguousMatchError(f"ambiguous_email_match: email={email_norm!r}")
-    return str(rows[0][0])
+    return [str(r[0]) for r in rows]
 
 
 def _resolve_participant_by_name_strict(
@@ -215,6 +224,78 @@ def _insert_identity_review_queue(
     )
 
 
+def _evaluate_email_match_corroboration(
+    conn: psycopg.Connection,
+    row: dict[str, str],
+    participant_id: str,
+    allow_unique_email_missing_name_link: bool = False,
+) -> tuple[bool, str | None, str | None, bool]:
+    """Evaluate policy B/C/D checks for a specific participant candidate.
+
+    Returns:
+      (ok, reason_code, reason_detail, used_missing_name_exception)
+    """
+    target_name, target_phone, target_address = _get_participant_corroboration_data(
+        conn, participant_id
+    )
+    source_first = trim(row.get("First Name"))
+    source_last = trim(row.get("Last Name"))
+    source_full = _build_full_name(source_first, source_last)
+    source_lookup_keys = participant_name_lookup_keys(source_full) if source_full else ()
+    source_legacy_comma_key = (
+        participant_legacy_comma_lookup_key(source_full) if source_full else None
+    )
+    allowed_source_name_keys = set(source_lookup_keys)
+    if source_legacy_comma_key:
+        allowed_source_name_keys.add(source_legacy_comma_key)
+
+    used_missing_name_exception = False
+    if not allowed_source_name_keys or target_name is None:
+        if not allow_unique_email_missing_name_link:
+            return (
+                False,
+                "missing_name_for_email_match",
+                f"source_has_name={bool(allowed_source_name_keys)}, "
+                f"target_has_name={target_name is not None}",
+                False,
+            )
+        # Policy v2.1 optional exception: continue to C/D checks.
+        used_missing_name_exception = True
+    elif target_name not in allowed_source_name_keys:
+        return (
+            False,
+            "email_name_mismatch",
+            f"source_lookup_keys={sorted(allowed_source_name_keys)!r}, "
+            f"target={target_name!r}",
+            False,
+        )
+
+    # Optional corroboration: phone
+    source_phone_raw = trim(row.get("Phone Number"))
+    if source_phone_raw and target_phone:
+        source_phone_norm = normalize_phone(source_phone_raw)
+        if source_phone_norm and source_phone_norm != target_phone:
+            return (
+                False,
+                "email_phone_mismatch",
+                f"source={source_phone_norm!r}, target={target_phone!r}",
+                used_missing_name_exception,
+            )
+
+    # Optional corroboration: address
+    source_address = trim(row.get("Address"))
+    if source_address and target_address:
+        if not addresses_match_for_identity(source_address, target_address):
+            return (
+                False,
+                "email_address_mismatch",
+                f"source={source_address!r}, target={target_address!r}",
+                used_missing_name_exception,
+            )
+
+    return True, None, None, used_missing_name_exception
+
+
 def _strict_resolve_participant(
     conn: psycopg.Connection,
     row: dict[str, str],
@@ -256,81 +337,52 @@ def _strict_resolve_participant(
     # ------------------------------------------------------------------ A
     # Email lookup
     # ------------------------------------------------------------------ A
-    try:
-        pid = _resolve_participant_by_email(conn, email_norm)
-    except AmbiguousMatchError:
-        _quarantine(None, "ambiguous_email_match",
-                    f"email {email_norm!r} maps to multiple participants")
-        return None
+    email_match_ids = _resolve_participant_ids_by_email(conn, email_norm)
 
-    if pid is not None:
-        # -------------------------------------------------------------- B
-        # Name corroboration (required when email matched)
-        # -------------------------------------------------------------- B
-        target_name, target_phone, target_address = _get_participant_corroboration_data(
-            conn, pid
-        )
-        source_first = trim(row.get("First Name"))
-        source_last = trim(row.get("Last Name"))
-        source_full = _build_full_name(source_first, source_last)
-        source_lookup_keys = participant_name_lookup_keys(source_full) if source_full else ()
-        source_legacy_comma_key = (
-            participant_legacy_comma_lookup_key(source_full) if source_full else None
-        )
-        allowed_source_name_keys = set(source_lookup_keys)
-        if source_legacy_comma_key:
-            allowed_source_name_keys.add(source_legacy_comma_key)
-
-        used_missing_name_exception = False
-        if not allowed_source_name_keys or target_name is None:
-            if not allow_unique_email_missing_name_link:
-                _quarantine(
-                    pid, "missing_name_for_email_match",
-                    f"source_has_name={bool(allowed_source_name_keys)}, "
-                    f"target_has_name={target_name is not None}",
-                )
-                return None
-            # Policy v2.1 optional exception: continue to C/D checks.
-            # Counter incremented only on successful return below.
-            used_missing_name_exception = True
-        elif target_name not in allowed_source_name_keys:
-            _quarantine(
-                pid, "email_name_mismatch",
-                f"source_lookup_keys={sorted(allowed_source_name_keys)!r}, "
-                f"target={target_name!r}",
+    if len(email_match_ids) == 1:
+        pid = email_match_ids[0]
+        ok, reason_code, reason_detail, used_missing_name_exception = (
+            _evaluate_email_match_corroboration(
+                conn,
+                row,
+                pid,
+                allow_unique_email_missing_name_link=allow_unique_email_missing_name_link,
             )
+        )
+        if not ok:
+            _quarantine(pid, reason_code or "mailchimp_identity_policy_error", reason_detail)
             return None
-
-        # -------------------------------------------------------------- C
-        # Optional corroboration: phone
-        # -------------------------------------------------------------- C
-        source_phone_raw = trim(row.get("Phone Number"))
-        if source_phone_raw and target_phone:
-            source_phone_norm = normalize_phone(source_phone_raw)
-            if source_phone_norm and source_phone_norm != target_phone:
-                _quarantine(
-                    pid, "email_phone_mismatch",
-                    f"source={source_phone_norm!r}, target={target_phone!r}",
-                )
-                return None
-
-        # -------------------------------------------------------------- D
-        # Optional corroboration: address
-        # -------------------------------------------------------------- D
-        source_address = trim(row.get("Address"))
-        if source_address and target_address:
-            if not addresses_match_for_identity(source_address, target_address):
-                _quarantine(
-                    pid, "email_address_mismatch",
-                    f"source={source_address!r}, target={target_address!r}",
-                )
-                return None
-
-        # All checks passed — link to existing participant
         if used_missing_name_exception:
             counters.mailchimp_missing_name_unique_email_accepted += 1
         counters.participants_matched_existing += 1
         return pid
+
+    if len(email_match_ids) > 1:
+        passing: list[tuple[str, bool]] = []
+        for pid in email_match_ids:
+            ok, _, _, used_missing_name_exception = _evaluate_email_match_corroboration(
+                conn,
+                row,
+                pid,
+                allow_unique_email_missing_name_link=allow_unique_email_missing_name_link,
+            )
+            if ok:
+                passing.append((pid, used_missing_name_exception))
+
+        if len(passing) == 1:
+            pid, used_missing_name_exception = passing[0]
+            if used_missing_name_exception:
+                counters.mailchimp_missing_name_unique_email_accepted += 1
+            counters.participants_matched_existing += 1
+            return pid
+
+        _quarantine(
+            None,
+            "ambiguous_email_match",
+            f"email {email_norm!r} maps to multiple participants "
+            f"(total={len(email_match_ids)}, corroborated={len(passing)})",
+        )
+        return None
 
     # ------------------------------------------------------------------ E
     # No email match — fall through to name lookup or create new
