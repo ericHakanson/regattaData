@@ -8,6 +8,7 @@ import os
 import sys
 from collections import defaultdict
 from pathlib import Path
+import re
 
 import psycopg
 
@@ -15,6 +16,7 @@ import psycopg
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REVIEW_CSV = REPO_ROOT / "artifacts/qa/mailchimp_address_review_973afc1ed4.csv"
 TRIAGE_CSV = REPO_ROOT / "artifacts/qa/mailchimp_participant_triage_973afc1ed4.csv"
+FIDELITY_TXT = REPO_ROOT / "artifacts/qa/mailchimp_address_fidelity_973afc1ed4.txt"
 
 
 def norm_name(value: str) -> str:
@@ -26,11 +28,30 @@ def last_name(value: str) -> str:
     return parts[-1] if parts else ""
 
 
+def load_fidelity_outcomes(path: Path) -> dict[str, int]:
+    """Parse outcome_bucket counts from the fidelity report text output."""
+    if not path.exists():
+        return {}
+
+    outcomes: dict[str, int] = {}
+    # Example lines:
+    # canonical_address_present           |  259
+    # review_queue:ambiguous_email_match |    1
+    line_re = re.compile(r"^\s*([a-z_:\-]+)\s+\|\s+(\d+)\s*$")
+    with path.open(encoding="utf-8") as handle:
+        for raw in handle:
+            m = line_re.match(raw.rstrip("\n"))
+            if not m:
+                continue
+            key = m.group(1)
+            if key == "outcome_bucket":
+                continue
+            outcomes[key] = int(m.group(2))
+    return outcomes
+
+
 def main() -> int:
     db_dsn = os.environ.get("DB_DSN")
-    if not db_dsn:
-        print("DB_DSN is not set.", file=sys.stderr)
-        return 1
 
     if not REVIEW_CSV.exists():
         print(f"Missing review CSV: {REVIEW_CSV}", file=sys.stderr)
@@ -46,7 +67,7 @@ def main() -> int:
     )
     canonical_by_participant: dict[str, list[str]] = {}
 
-    if participant_ids:
+    if participant_ids and db_dsn:
         with psycopg.connect(db_dsn) as conn:
             matched = conn.execute(
                 """
@@ -70,6 +91,8 @@ def main() -> int:
             if canonical_id not in grouped[participant_id]:
                 grouped[participant_id].append(canonical_id)
         canonical_by_participant = dict(grouped)
+    elif participant_ids and not db_dsn:
+        print("DB_DSN is not set; skipping canonical ID enrichment.", file=sys.stderr)
 
     fieldnames = [
         "email",
@@ -176,7 +199,22 @@ def main() -> int:
             )
 
     print(TRIAGE_CSV)
-    print(f"emails {len(by_email)}")
+    print(f"triage_emails_from_review_csv {len(by_email)}")
+    if not REVIEW_CSV.samefile(TRIAGE_CSV):
+        print(f"review_snapshot {REVIEW_CSV}")
+
+    fidelity_outcomes = load_fidelity_outcomes(FIDELITY_TXT)
+    if fidelity_outcomes:
+        print(f"fidelity_snapshot {FIDELITY_TXT}")
+        for key in sorted(fidelity_outcomes):
+            if key == "canonical_address_present" or key.startswith("review_queue:"):
+                print(f"{key} {fidelity_outcomes[key]}")
+        review_queue_total = sum(
+            value for key, value in fidelity_outcomes.items() if key.startswith("review_queue:")
+        )
+        print(f"fidelity_review_queue_rows {review_queue_total}")
+    else:
+        print("fidelity_snapshot_missing")
     return 0
 
 
