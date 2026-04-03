@@ -423,7 +423,7 @@ def _process_row(
         "private_export", "public_scrape", "jotform_waiver",
         "mailchimp_audience", "mailchimp_event_activation",
         "airtable_copy", "yacht_scoring",
-        "bhyc_member_directory",
+        "bhyc_member_directory", "bhyc_membership_csv",
         "regattaman_snapshot",
         "resolution_source_to_candidate", "resolution_score", "resolution_promote",
         "resolution_manual_apply", "resolution_lifecycle",
@@ -437,7 +437,7 @@ def _process_row(
 )
 @click.option("--db-dsn", required=True, help="PostgreSQL DSN")
 # private_export flags
-@click.option("--csv-path", default=None, type=click.Path(), help="[private_export|jotform_waiver] Input CSV")
+@click.option("--csv-path", default=None, type=click.Path(), help="[private_export|jotform_waiver|bhyc_membership_csv] Input CSV")
 @click.option("--host-club-name", default=None)
 @click.option("--host-club-normalized", default=None)
 @click.option("--event-series-name", default=None)
@@ -812,7 +812,42 @@ def main(
 
     click.echo(f"[{run_id}] Starting {mode} run (dry_run={dry_run})")
 
-    if mode == "bhyc_member_directory":
+    if mode == "bhyc_membership_csv":
+        _validate_bhyc_membership_csv_flags(csv_path, run_id)
+        from regatta_etl.import_bhyc_member_directory import (
+            BhycRunCounters,
+            build_bhyc_report,
+            run_bhyc_membership_csv,
+        )
+
+        bhyc_counters = BhycRunCounters()
+        click.echo(f"[{run_id}] bhyc_membership_csv csv_path={csv_path} dry_run={dry_run}")
+        run_bhyc_membership_csv(
+            run_id=run_id,
+            db_dsn=db_dsn,
+            csv_path=csv_path,  # type: ignore[arg-type]
+            counters=bhyc_counters,
+            dry_run=dry_run,
+        )
+
+        report = build_bhyc_report(bhyc_counters, dry_run=dry_run)
+        click.echo(report)
+
+        report_path = write_run_report(
+            run_id, started_at, mode, dry_run,
+            {"csv_path": csv_path},
+            bhyc_counters,  # type: ignore[arg-type]
+        )
+        click.echo(f"[{run_id}] Run report: {report_path}")
+
+        if bhyc_counters.db_errors > 0 and not dry_run:
+            click.echo(
+                f"[{run_id}] {bhyc_counters.db_errors} DB errors — exiting non-zero",
+                err=True,
+            )
+            sys.exit(1)
+        return
+    elif mode == "bhyc_member_directory":
         _validate_bhyc_member_directory_flags(start_url, run_id)
         from regatta_etl.import_bhyc_member_directory import (
             BhycRunCounters,
@@ -1723,6 +1758,25 @@ def _validate_resolution_manual_apply_flags(
     if not _Path(decisions_path).exists():
         click.echo(
             f"[{run_id}] FATAL: --decisions-path not found: {decisions_path}",
+            err=True,
+        )
+        sys.exit(1)
+
+
+def _validate_bhyc_membership_csv_flags(
+    csv_path: str | None,
+    run_id: str,
+) -> None:
+    if not csv_path:
+        click.echo(
+            f"[{run_id}] FATAL: bhyc_membership_csv mode requires: --csv-path",
+            err=True,
+        )
+        sys.exit(1)
+    path = Path(csv_path)
+    if not path.exists():
+        click.echo(
+            f"[{run_id}] FATAL: --csv-path not found: {csv_path}",
             err=True,
         )
         sys.exit(1)

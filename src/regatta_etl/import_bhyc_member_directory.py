@@ -28,6 +28,7 @@ Processing order per profile:
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import logging
@@ -77,6 +78,29 @@ SOURCE_SYSTEM = "bhyc_member_directory"
 SOURCE_TABLE = "bhyc_member_raw_row"
 BHYC_CLUB_NAME = "Boothbay Harbor Yacht Club"
 BHYC_CLUB_NORMALIZED = "boothbay-harbor-yacht-club"
+BHYC_MEMBERSHIP_CSV_HEADERS = [
+    "First Name",
+    "Last Name",
+    "Summer (Home) Phone",
+    "Mobile Phone",
+    "Primary Email Address",
+    "Boat 1",
+    "Boat 1 Type",
+    "Boat 2",
+    "Boat 2 Type",
+    "Street 1",
+    "Street 2",
+    "City",
+    "State",
+    "Zip",
+    "Country",
+    "Street 1",
+    "Street 2",
+    "City",
+    "State",
+    "Zip",
+    "Country",
+]
 
 # Sentinel for vCard MIME type
 _VCARD_MIME_TYPES = ("text/vcard", "text/x-vcard", "text/plain")
@@ -1145,6 +1169,168 @@ def _upsert_bhyc_xref_participant(
 
 
 # ---------------------------------------------------------------------------
+# BHYC membership CSV parser
+# ---------------------------------------------------------------------------
+
+def _norm_csv_header(value: str) -> str:
+    return re.sub(r"\s+", " ", trim(value) or "").lower()
+
+
+def _build_bhyc_csv_member_id(
+    first_name: str,
+    last_name: str,
+    email_raw: str,
+    home_phone_raw: str,
+    mobile_phone_raw: str,
+    row_num: int,
+) -> str:
+    """Build a stable member_id for CSV ingestion runs."""
+    email_norm = normalize_email(email_raw)
+    if email_norm:
+        return f"csv_email:{email_norm}"
+
+    stable = "|".join(
+        [
+            normalize_space(first_name) or "",
+            normalize_space(last_name) or "",
+            normalize_phone(home_phone_raw) or "",
+            normalize_phone(mobile_phone_raw) or "",
+        ]
+    )
+    if stable.strip("|"):
+        digest = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
+        return f"csv_identity:{digest}"
+    return f"csv_row:{row_num}"
+
+
+def _build_csv_address(
+    street_1: str,
+    street_2: str,
+    city: str,
+    state: str,
+    postal_code: str,
+    country_code: str,
+    address_type: str,
+) -> dict[str, Any] | None:
+    line_parts = [trim(street_1), trim(street_2)]
+    line1 = " ".join([p for p in line_parts if p]).strip()
+    city = trim(city)
+    state = trim(state)
+    postal_code = trim(postal_code)
+    country_code = trim(country_code)
+    raw = ", ".join([p for p in [line1, city, state, postal_code, country_code] if p]).strip()
+    if not raw:
+        return None
+    return {
+        "address_type": address_type,
+        "raw": raw,
+        "line1": line1 or None,
+        "city": city or None,
+        "state": state or None,
+        "postal_code": postal_code or None,
+        "country_code": country_code or None,
+    }
+
+
+def _parse_bhyc_membership_csv(
+    csv_path: Path,
+    counters: BhycRunCounters,
+) -> list[tuple[str, str, dict[str, Any], list[str]]]:
+    """Parse BHYC membership CSV rows into merged profile payloads.
+
+    Returns:
+      (member_id, source_url, merged_payload, parse_warnings)
+    """
+    rows_out: list[tuple[str, str, dict[str, Any], list[str]]] = []
+
+    with csv_path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if header is None:
+            raise ValueError(f"Empty BHYC membership CSV: {csv_path}")
+
+        expected = [_norm_csv_header(h) for h in BHYC_MEMBERSHIP_CSV_HEADERS]
+        actual = [_norm_csv_header(h) for h in header]
+        if actual != expected:
+            raise ValueError(
+                "BHYC membership CSV header mismatch.\n"
+                f"Expected: {BHYC_MEMBERSHIP_CSV_HEADERS}\n"
+                f"Actual:   {header}"
+            )
+
+        for row_num, raw in enumerate(reader, start=2):
+            if not any(trim(v) for v in raw):
+                continue
+            counters.pages_discovered += 1
+
+            if len(raw) < len(BHYC_MEMBERSHIP_CSV_HEADERS):
+                raw = raw + [""] * (len(BHYC_MEMBERSHIP_CSV_HEADERS) - len(raw))
+            elif len(raw) > len(BHYC_MEMBERSHIP_CSV_HEADERS):
+                raw = raw[: len(BHYC_MEMBERSHIP_CSV_HEADERS)]
+
+            first_name = trim(raw[0]) or ""
+            last_name = trim(raw[1]) or ""
+            home_phone = trim(raw[2]) or ""
+            mobile_phone = trim(raw[3]) or ""
+            email = trim(raw[4]) or ""
+
+            display_name = " ".join([p for p in [first_name, last_name] if p]).strip()
+            if not display_name and not email:
+                counters.pages_rejected += 1
+                counters.warnings.append(
+                    f"csv_row={row_num}: missing both name and email — skipped"
+                )
+                continue
+
+            boats: list[dict[str, str]] = []
+            for name_idx, type_idx in ((5, 6), (7, 8)):
+                boat_name = trim(raw[name_idx]) or ""
+                boat_type = trim(raw[type_idx]) or ""
+                if boat_name:
+                    boats.append({"name": boat_name, "boat_type": boat_type})
+
+            addresses: list[dict[str, Any]] = []
+            addr_one = _build_csv_address(
+                raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], "summer_mailing"
+            )
+            if addr_one:
+                addresses.append(addr_one)
+            addr_two = _build_csv_address(
+                raw[15], raw[16], raw[17], raw[18], raw[19], raw[20], "winter_mailing"
+            )
+            if addr_two:
+                addresses.append(addr_two)
+
+            phones: list[dict[str, str]] = []
+            if home_phone:
+                phones.append({"label": "summer_home", "value": home_phone, "subtype": "home"})
+            if mobile_phone:
+                phones.append({"label": "mobile", "value": mobile_phone, "subtype": "mobile"})
+
+            emails: list[str] = [email] if email else []
+            member_id = _build_bhyc_csv_member_id(
+                first_name, last_name, email, home_phone, mobile_phone, row_num
+            )
+            source_url = f"{csv_path}#row={row_num}"
+            merged = {
+                "display_name": display_name or None,
+                "first_name": first_name or None,
+                "last_name": last_name or None,
+                "all_emails": emails,
+                "phones": phones,
+                "addresses": addresses,
+                "boats": boats,
+                "household": [],
+                "membership_begins": None,
+                "source_type": "bhyc_membership_csv",
+            }
+            rows_out.append((member_id, source_url, merged, []))
+            counters.pages_parsed += 1
+
+    return rows_out
+
+
+# ---------------------------------------------------------------------------
 # DB helpers — participant resolution (BHYC: email → phone → name)
 # ---------------------------------------------------------------------------
 
@@ -1579,6 +1765,98 @@ def _ingest_profile(
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
+
+def run_bhyc_membership_csv(
+    run_id: str,
+    db_dsn: str,
+    csv_path: str,
+    counters: BhycRunCounters,
+    dry_run: bool = False,
+) -> None:
+    """Ingest BHYC membership CSV rows using BHYC identity/linkage logic."""
+    csv_file = Path(csv_path)
+    if not csv_file.exists():
+        raise FileNotFoundError(f"BHYC membership CSV not found: {csv_file}")
+
+    parsed_rows = _parse_bhyc_membership_csv(csv_file, counters)
+    conn = psycopg.connect(db_dsn, autocommit=False)
+    try:
+        for idx, (member_id, source_url, merged, parse_warnings) in enumerate(parsed_rows, start=1):
+            sp = f"bhyc_csv_{idx}"
+            profile_row_id: str | None = None
+            try:
+                conn.execute(f"SAVEPOINT {sp}")
+
+                content_hash = hashlib.sha256(
+                    json.dumps(merged, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()
+                profile_row_id = _insert_bhyc_raw_row(
+                    conn,
+                    member_id=member_id,
+                    page_type="member_profile",
+                    source_url=source_url,
+                    run_id=run_id,
+                    gcs_bucket=None,
+                    gcs_object=None,
+                    http_status=200,
+                    content_hash=content_hash,
+                    fetched_at=datetime.utcnow(),
+                    parsed_json=merged,
+                    parse_warnings=parse_warnings,
+                )
+                if profile_row_id:
+                    counters.raw_rows_inserted += 1
+                else:
+                    row = conn.execute(
+                        """
+                        SELECT id
+                        FROM bhyc_member_raw_row
+                        WHERE source_system = %s
+                          AND member_id = %s
+                          AND page_type = 'member_profile'
+                          AND run_id = %s
+                        """,
+                        (SOURCE_SYSTEM, member_id, run_id),
+                    ).fetchone()
+                    profile_row_id = str(row[0]) if row else None
+
+                if not profile_row_id:
+                    counters.db_errors += 1
+                    counters.pages_rejected += 1
+                    counters.warnings.append(
+                        f"csv member_id={member_id}: unable to resolve raw profile row id"
+                    )
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    conn.execute(f"RELEASE SAVEPOINT {sp}")
+                    continue
+
+                _ingest_profile(conn, member_id, profile_row_id, merged, run_id, counters)
+                counters.pages_fetched += 1
+                conn.execute(f"RELEASE SAVEPOINT {sp}")
+            except AmbiguousMatchError as exc:
+                counters.pages_rejected += 1
+                counters.warnings.append(
+                    f"csv member_id={member_id}: ambiguous_identity ({exc})"
+                )
+                conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                conn.execute(f"RELEASE SAVEPOINT {sp}")
+            except Exception as exc:
+                counters.db_errors += 1
+                counters.pages_rejected += 1
+                counters.warnings.append(f"csv member_id={member_id}: ingest_error ({exc})")
+                conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                conn.execute(f"RELEASE SAVEPOINT {sp}")
+
+        if dry_run or counters.db_errors > 0:
+            conn.rollback()
+        else:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 def run_bhyc_member_directory(
     run_id: str,
