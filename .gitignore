@@ -39,3 +39,6 @@ dist/
 *.p12
 *.key
 *.crt
+
+# Ignore all CSV files
+*.csv
