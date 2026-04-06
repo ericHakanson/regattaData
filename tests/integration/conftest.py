@@ -43,6 +43,14 @@ MIGRATIONS = [
     PROJECT_ROOT / "migrations" / "0022_hold_pool_geo_prepare.sql",
     PROJECT_ROOT / "migrations" / "0023_regattaman_snapshot_tables.sql",
     PROJECT_ROOT / "migrations" / "0024_manual_curation_tables.sql",
+    PROJECT_ROOT / "migrations" / "0025_integrity_constraints.sql",
+    PROJECT_ROOT / "migrations" / "0026_zip_code_repair.sql",
+    PROJECT_ROOT / "migrations" / "0027_sourceless_candidate_repair.sql",
+    PROJECT_ROOT / "migrations" / "0028_email_like_participant_name_repair.sql",
+    PROJECT_ROOT / "migrations" / "0029_missing_identity_repair.sql",
+    PROJECT_ROOT / "migrations" / "0030_organization_candidate_repair.sql",
+    PROJECT_ROOT / "migrations" / "0031_invalid_phone_repair.sql",
+    PROJECT_ROOT / "migrations" / "0032_mobile_contact_subtype_backfill.sql",
 ]
 
 # ---------------------------------------------------------------------------

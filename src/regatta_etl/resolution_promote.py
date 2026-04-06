@@ -27,6 +27,12 @@ from typing import Any
 
 import psycopg
 
+from regatta_etl.normalize import (
+    build_person_display_name,
+    is_likely_org_name,
+    normalize_person_name_for_identity,
+    parse_name_parts,
+)
 from regatta_etl.resolution_lifecycle import _write_provenance
 
 # ---------------------------------------------------------------------------
@@ -143,17 +149,36 @@ def _insert_canonical_yacht(conn: psycopg.Connection, pk: str) -> str:
 
 
 def _insert_canonical_participant(conn: psycopg.Connection, pk: str) -> str:
+    candidate_row = conn.execute(
+        """
+        SELECT display_name, date_of_birth, best_email, best_phone, quality_score
+        FROM candidate_participant
+        WHERE id = %s
+        """,
+        (pk,),
+    ).fetchone()
+    first_name, last_name = parse_name_parts(candidate_row[0] if candidate_row else None)
+    display_name = build_person_display_name(first_name, last_name)
+    normalized_name = normalize_person_name_for_identity(display_name)
     row = conn.execute(
         """
         INSERT INTO canonical_participant
-            (display_name, normalized_name, date_of_birth, best_email, best_phone,
+            (display_name, normalized_name, first_name, last_name,
+             date_of_birth, best_email, best_phone,
              canonical_confidence_score)
-        SELECT display_name, normalized_name, date_of_birth, best_email, best_phone,
-               quality_score
-        FROM candidate_participant WHERE id = %s
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
-        (pk,),
+        (
+            display_name,
+            normalized_name,
+            first_name,
+            last_name,
+            candidate_row[1] if candidate_row else None,
+            candidate_row[2] if candidate_row else None,
+            candidate_row[3] if candidate_row else None,
+            candidate_row[4] if candidate_row else None,
+        ),
     ).fetchone()
     return str(row[0])
 
@@ -168,6 +193,21 @@ def _sync_canonical_participant_children(
     This function is safe to call on first promotion and on subsequent repair
     reruns for already-promoted participants.
     """
+    conn.execute(
+        """
+        UPDATE canonical_participant_contact existing
+        SET contact_subtype = COALESCE(existing.contact_subtype, c.contact_subtype),
+            is_primary      = existing.is_primary OR c.is_primary
+        FROM candidate_participant_contact c
+        WHERE c.candidate_participant_id = %s
+          AND existing.canonical_participant_id = %s
+          AND existing.contact_type = c.contact_type
+          AND existing.raw_value = c.raw_value
+          AND COALESCE(existing.normalized_value, '') = COALESCE(c.normalized_value, '')
+        """,
+        (candidate_participant_id, canonical_participant_id),
+    )
+
     conn.execute(
         """
         INSERT INTO canonical_participant_contact
@@ -187,7 +227,6 @@ def _sync_canonical_participant_children(
               FROM canonical_participant_contact existing
               WHERE existing.canonical_participant_id = %s
                 AND existing.contact_type = c.contact_type
-                AND COALESCE(existing.contact_subtype, '') = COALESCE(c.contact_subtype, '')
                 AND existing.raw_value = c.raw_value
                 AND COALESCE(existing.normalized_value, '') = COALESCE(c.normalized_value, '')
           )
@@ -321,11 +360,17 @@ def _promote_entity_type(
             """
         ).fetchall()
     elif entity_type == "participant":
+        # FOR-224: exclude nameless records from the promotion query entirely.
+        # A candidate with normalized_name IS NULL has zero identity signal and
+        # must not be auto-promoted.  The scoring pipeline sets hard_block:missing_name
+        # on such candidates, but a belt-and-suspenders DB-level guard here ensures
+        # re-scoring races don't slip a nameless record through.
         rows = conn.execute(
             """
-            SELECT id, quality_score, is_promoted, promoted_canonical_id
+            SELECT id, quality_score, is_promoted, promoted_canonical_id, display_name, normalized_name
             FROM candidate_participant
             WHERE resolution_state = 'auto_promote'
+              AND normalized_name IS NOT NULL
             ORDER BY created_at
             """
         ).fetchall()
@@ -341,19 +386,73 @@ def _promote_entity_type(
         score_before = float(raw_row[1]) if raw_row[1] is not None else None
         was_already_promoted = False
         stored_canonical_id = None
+        candidate_display_name = None
+        candidate_normalized_name = None
         if entity_type == "participant":
             was_already_promoted = bool(raw_row[2]) or raw_row[3] is not None
             stored_canonical_id = str(raw_row[3]) if raw_row[3] else None
+            candidate_display_name = raw_row[4]
+            candidate_normalized_name = raw_row[5]
         sp = f"promote_{entity_type}_{idx}"
 
         conn.execute(f"SAVEPOINT {sp}")
         try:
+            if entity_type == "participant" and is_likely_org_name(
+                candidate_display_name or candidate_normalized_name
+            ):
+                conn.execute(
+                    """
+                    UPDATE candidate_participant
+                    SET resolution_state = 'reject'
+                    WHERE id = %s
+                    """,
+                    (pk,),
+                )
+                ctrs.warnings.append(
+                    f"participant pk={pk}: org-like candidate blocked from promotion (FOR-222)"
+                )
+                conn.execute(f"RELEASE SAVEPOINT {sp}")
+                continue
+
             # Check if a canonical_link already exists (partial prior run recovery)
             existing_canonical_id = _lookup_canonical_id(conn, entity_type, pk)
 
             if existing_canonical_id:
                 canonical_id = existing_canonical_id
             elif stored_canonical_id:
+                # FOR-220: guard against reusing a canonical that already belongs to a
+                # different candidate.  This can happen when promoted_canonical_id is set
+                # on a candidate row pointing to a canonical that was claimed by someone
+                # else (e.g. after a botched data migration).  If detected, walk this
+                # candidate back to 'review' and skip rather than create a collision.
+                collision_row = conn.execute(
+                    """
+                    SELECT candidate_entity_id
+                    FROM candidate_canonical_link
+                    WHERE candidate_entity_type = %s
+                      AND canonical_entity_id   = %s
+                      AND candidate_entity_id  != %s
+                    LIMIT 1
+                    """,
+                    (entity_type, stored_canonical_id, pk),
+                ).fetchone()
+                if collision_row is not None:
+                    conn.execute(
+                        f"""
+                        UPDATE {table}
+                        SET is_promoted = false,
+                            resolution_state = 'review',
+                            promoted_canonical_id = NULL
+                        WHERE id = %s
+                        """,
+                        (pk,),
+                    )
+                    ctrs.warnings.append(
+                        f"{entity_type} pk={pk}: stored_canonical_id {stored_canonical_id} "
+                        f"already claimed by {collision_row[0]} — reset to review (FOR-220)"
+                    )
+                    conn.execute(f"RELEASE SAVEPOINT {sp}")
+                    continue
                 canonical_id = stored_canonical_id
             elif entity_type == "registration":
                 # Resolve canonical FKs from already-promoted entities

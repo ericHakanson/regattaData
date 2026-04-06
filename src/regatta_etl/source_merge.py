@@ -551,10 +551,10 @@ def _apply_merge(
         )
         return
 
-    # Look up all candidates for each source row BEFORE re-pointing.
-    # A single source row may link to multiple candidates; we collect them all
-    # so cleanup is applied to every stale drop candidate, not just the first.
-    # Best-quality candidate is first in each list.
+    # Look up candidate ownership for each source row BEFORE re-pointing.
+    # Exclusive source ownership means each row should yield at most one
+    # candidate, but we keep the interface list-shaped so legacy/corrupt states
+    # can still be repaired deterministically. Best-quality candidate is first.
     drop_candidate_ids = _find_all_candidates_for_source(conn, entity_type, source_table, drop_id)
     keep_candidate_ids = _find_all_candidates_for_source(conn, entity_type, source_table, keep_id)
     if keep_candidate_ids:

@@ -21,7 +21,9 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+import yaml
 
+from regatta_etl.normalize import is_likely_org_name
 from regatta_etl.resolution_rules import (
     RuleSet,
     close_score_run,
@@ -29,6 +31,7 @@ from regatta_etl.resolution_rules import (
     load_rule_set,
     open_score_run,
     register_rule_set,
+    resolution_state_from_score,
 )
 
 # ---------------------------------------------------------------------------
@@ -36,10 +39,216 @@ from regatta_etl.resolution_rules import (
 # ---------------------------------------------------------------------------
 
 _DEFAULT_RULES_DIR = Path(__file__).parent.parent.parent / "config" / "resolution_rules"
+_DEFAULT_SOURCE_TRUST_PATH = _DEFAULT_RULES_DIR / "source_trust.yml"
 
 
 def _default_rule_path(entity_type: str) -> Path:
     return _DEFAULT_RULES_DIR / f"{entity_type}.yml"
+
+
+# ---------------------------------------------------------------------------
+# Source trust policy
+# ---------------------------------------------------------------------------
+
+_SOURCE_TRUST_DEFAULT_KEYS = frozenset({
+    "unknown_source_weight",
+    "high_trust_threshold",
+    "min_distinct_sources_for_auto_promote",
+    "require_high_trust_for_auto_promote",
+    "single_source_penalty",
+    "no_high_trust_penalty",
+    "multi_source_bonus",
+    "max_total_adjustment_abs",
+})
+_SOURCE_TRUST_TIER_KEYS = frozenset({"high", "medium", "low"})
+_UNKNOWN_SOURCE_KEY = "__unknown__"
+
+
+class SourceTrustValidationError(ValueError):
+    """Raised when source_trust.yml fails validation."""
+
+
+@dataclass(frozen=True)
+class SourceTrustSource:
+    weight: float
+    tier: str
+    notes: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceTrustPolicy:
+    version: str
+    defaults: dict[str, Any]
+    source_weights: dict[str, SourceTrustSource]
+    entity_overrides: dict[str, dict[str, Any]]
+
+    def settings_for(self, entity_type: str) -> dict[str, Any]:
+        settings = dict(self.defaults)
+        settings.update(self.entity_overrides.get(entity_type, {}))
+        return settings
+
+    def source_rule_for(self, source_system: str) -> SourceTrustSource | None:
+        return self.source_weights.get(source_system)
+
+
+def _coerce_bool(value: Any, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise SourceTrustValidationError(f"'{key}' must be a boolean.")
+
+
+def _coerce_float(
+    value: Any,
+    key: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        raise SourceTrustValidationError(f"'{key}' must be numeric.")
+    if minimum is not None and result < minimum:
+        raise SourceTrustValidationError(f"'{key}' must be >= {minimum}.")
+    if maximum is not None and result > maximum:
+        raise SourceTrustValidationError(f"'{key}' must be <= {maximum}.")
+    return result
+
+
+def _coerce_int(value: Any, key: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool):
+        raise SourceTrustValidationError(f"'{key}' must be an integer.")
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        raise SourceTrustValidationError(f"'{key}' must be an integer.")
+    if result < minimum:
+        raise SourceTrustValidationError(f"'{key}' must be >= {minimum}.")
+    return result
+
+
+def load_source_trust_policy(path: Path) -> SourceTrustPolicy:
+    raw = path.read_text(encoding="utf-8")
+    data = yaml.safe_load(raw)
+    if not isinstance(data, dict):
+        raise SourceTrustValidationError("source_trust.yml root must be a mapping.")
+
+    defaults = data.get("defaults")
+    if not isinstance(defaults, dict):
+        raise SourceTrustValidationError("'defaults' must be a mapping.")
+    missing_defaults = _SOURCE_TRUST_DEFAULT_KEYS - set(defaults.keys())
+    if missing_defaults:
+        raise SourceTrustValidationError(
+            f"Missing source trust default keys: {sorted(missing_defaults)}"
+        )
+
+    normalized_defaults = {
+        "unknown_source_weight": _coerce_float(
+            defaults["unknown_source_weight"], "defaults.unknown_source_weight", minimum=0.0, maximum=1.0
+        ),
+        "high_trust_threshold": _coerce_float(
+            defaults["high_trust_threshold"], "defaults.high_trust_threshold", minimum=0.0, maximum=1.0
+        ),
+        "min_distinct_sources_for_auto_promote": _coerce_int(
+            defaults["min_distinct_sources_for_auto_promote"],
+            "defaults.min_distinct_sources_for_auto_promote",
+            minimum=1,
+        ),
+        "require_high_trust_for_auto_promote": _coerce_bool(
+            defaults["require_high_trust_for_auto_promote"],
+            "defaults.require_high_trust_for_auto_promote",
+        ),
+        "single_source_penalty": _coerce_float(
+            defaults["single_source_penalty"], "defaults.single_source_penalty", minimum=0.0, maximum=1.0
+        ),
+        "no_high_trust_penalty": _coerce_float(
+            defaults["no_high_trust_penalty"], "defaults.no_high_trust_penalty", minimum=0.0, maximum=1.0
+        ),
+        "multi_source_bonus": _coerce_float(
+            defaults["multi_source_bonus"], "defaults.multi_source_bonus", minimum=0.0, maximum=1.0
+        ),
+        "max_total_adjustment_abs": _coerce_float(
+            defaults["max_total_adjustment_abs"], "defaults.max_total_adjustment_abs", minimum=0.0, maximum=1.0
+        ),
+    }
+
+    source_weights = data.get("source_weights")
+    if not isinstance(source_weights, dict) or not source_weights:
+        raise SourceTrustValidationError("'source_weights' must be a non-empty mapping.")
+
+    normalized_source_weights: dict[str, SourceTrustSource] = {}
+    for source_name, source_cfg in source_weights.items():
+        if not isinstance(source_cfg, dict):
+            raise SourceTrustValidationError(f"source_weights.{source_name} must be a mapping.")
+        tier = str(source_cfg.get("tier", "")).strip().lower()
+        if tier not in _SOURCE_TRUST_TIER_KEYS:
+            raise SourceTrustValidationError(
+                f"source_weights.{source_name}.tier must be one of {sorted(_SOURCE_TRUST_TIER_KEYS)}."
+            )
+        normalized_source_weights[str(source_name)] = SourceTrustSource(
+            weight=_coerce_float(
+                source_cfg.get("weight"),
+                f"source_weights.{source_name}.weight",
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            tier=tier,
+            notes=str(source_cfg.get("notes")) if source_cfg.get("notes") is not None else None,
+        )
+
+    entity_overrides_raw = data.get("entity_overrides") or {}
+    if not isinstance(entity_overrides_raw, dict):
+        raise SourceTrustValidationError("'entity_overrides' must be a mapping when present.")
+
+    normalized_entity_overrides: dict[str, dict[str, Any]] = {}
+    for entity_type, override_cfg in entity_overrides_raw.items():
+        if entity_type not in _CANDIDATE_TABLE:
+            raise SourceTrustValidationError(f"Unknown entity override '{entity_type}'.")
+        if not isinstance(override_cfg, dict):
+            raise SourceTrustValidationError(f"entity_overrides.{entity_type} must be a mapping.")
+        unknown_override_keys = set(override_cfg.keys()) - _SOURCE_TRUST_DEFAULT_KEYS
+        if unknown_override_keys:
+            raise SourceTrustValidationError(
+                f"Unknown entity override keys for {entity_type}: {sorted(unknown_override_keys)}"
+            )
+        normalized_override: dict[str, Any] = {}
+        for key, value in override_cfg.items():
+            if key == "require_high_trust_for_auto_promote":
+                normalized_override[key] = _coerce_bool(value, f"entity_overrides.{entity_type}.{key}")
+            elif key == "min_distinct_sources_for_auto_promote":
+                normalized_override[key] = _coerce_int(
+                    value, f"entity_overrides.{entity_type}.{key}", minimum=1
+                )
+            else:
+                normalized_override[key] = _coerce_float(
+                    value, f"entity_overrides.{entity_type}.{key}", minimum=0.0, maximum=1.0
+                )
+        normalized_entity_overrides[entity_type] = normalized_override
+
+    return SourceTrustPolicy(
+        version=str(data.get("version") or ""),
+        defaults=normalized_defaults,
+        source_weights=normalized_source_weights,
+        entity_overrides=normalized_entity_overrides,
+    )
+
+
+@dataclass(frozen=True)
+class CandidateSourceProfile:
+    source_systems: tuple[str, ...]
+
+    @property
+    def distinct_source_count(self) -> int:
+        return len(self.source_systems)
+
+
+@dataclass(frozen=True)
+class TrustAdjustmentResult:
+    adjusted_score: float
+    resolution_state: str
+    reasons: list[str]
+    was_adjusted: bool
+    was_capped: bool
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +275,13 @@ class ScoreCounters:
     participant_child_phone_used: int = 0
     participant_child_address_used: int = 0
     participant_address_only_hold: int = 0
+    trust_adjusted_candidates: int = 0
+    trust_capped_candidates: int = 0
+    participant_score_mean: float | None = None
+    participant_score_stddev: float | None = None
+    participant_score_unique_values: int = 0
+    participant_hold_score_unique_values: int = 0
+    participant_auto_promote_score_unique_values: int = 0
     db_errors: int = 0
     warnings: list[str] = field(default_factory=list)
 
@@ -86,6 +302,13 @@ class ScoreCounters:
             "participant_child_phone_used": self.participant_child_phone_used,
             "participant_child_address_used": self.participant_child_address_used,
             "participant_address_only_hold": self.participant_address_only_hold,
+            "trust_adjusted_candidates": self.trust_adjusted_candidates,
+            "trust_capped_candidates": self.trust_capped_candidates,
+            "participant_score_mean": self.participant_score_mean,
+            "participant_score_stddev": self.participant_score_stddev,
+            "participant_score_unique_values": self.participant_score_unique_values,
+            "participant_hold_score_unique_values": self.participant_hold_score_unique_values,
+            "participant_auto_promote_score_unique_values": self.participant_auto_promote_score_unique_values,
             "db_errors": self.db_errors,
             "warnings": self.warnings[:50],
         }
@@ -95,6 +318,24 @@ class ScoreCounters:
 # Feature extractors
 # Map YAML feature_weight keys → boolean columns on each candidate table.
 # ---------------------------------------------------------------------------
+
+def _fetch_participant_source_counts(
+    conn: psycopg.Connection,
+) -> dict[str, int]:
+    """Return a map of candidate_participant_id → source link count.
+
+    Used to populate the source_count_score continuous feature (FOR-225).
+    """
+    rows = conn.execute(
+        """
+        SELECT candidate_entity_id::text, COUNT(*) AS cnt
+        FROM candidate_source_link
+        WHERE candidate_entity_type = 'participant'
+        GROUP BY candidate_entity_id
+        """
+    ).fetchall()
+    return {cid: int(cnt) for cid, cnt in rows}
+
 
 def _fetch_participant_child_evidence(
     conn: psycopg.Connection,
@@ -136,7 +377,133 @@ def _fetch_participant_child_evidence(
     return result
 
 
-def _features_participant(row: dict[str, Any]) -> dict[str, bool]:
+def _fetch_candidate_source_profiles(
+    conn: psycopg.Connection,
+    entity_type: str,
+) -> dict[str, CandidateSourceProfile]:
+    """Return a map of candidate id -> distinct source systems."""
+    rows = conn.execute(
+        """
+        SELECT candidate_entity_id::text,
+               COALESCE(NULLIF(source_system, ''), %s) AS source_system
+        FROM candidate_source_link
+        WHERE candidate_entity_type = %s
+        """,
+        (_UNKNOWN_SOURCE_KEY, entity_type),
+    ).fetchall()
+    grouped: dict[str, set[str]] = {}
+    for candidate_id, source_system in rows:
+        grouped.setdefault(str(candidate_id), set()).add(str(source_system))
+    return {
+        candidate_id: CandidateSourceProfile(tuple(sorted(source_systems)))
+        for candidate_id, source_systems in grouped.items()
+    }
+
+
+def _update_participant_score_distribution_stats(
+    conn: psycopg.Connection,
+    ctrs: ScoreCounters,
+) -> None:
+    """Populate participant score distribution stats used by FOR-225 reporting."""
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total_rows,
+            COUNT(DISTINCT quality_score) AS unique_scores,
+            COUNT(DISTINCT quality_score) FILTER (WHERE resolution_state = 'hold') AS hold_unique_scores,
+            COUNT(DISTINCT quality_score) FILTER (WHERE resolution_state = 'auto_promote') AS auto_promote_unique_scores,
+            AVG(quality_score)::float8 AS mean_score,
+            COALESCE(STDDEV_POP(quality_score)::float8, 0.0) AS stddev_score
+        FROM candidate_participant
+        """
+    ).fetchone()
+    if row is None or int(row[0]) == 0:
+        return
+
+    ctrs.participant_score_unique_values = int(row[1])
+    ctrs.participant_hold_score_unique_values = int(row[2])
+    ctrs.participant_auto_promote_score_unique_values = int(row[3])
+    ctrs.participant_score_mean = float(row[4]) if row[4] is not None else None
+    ctrs.participant_score_stddev = float(row[5]) if row[5] is not None else None
+
+    if ctrs.participant_score_unique_values < 10:
+        ctrs.warnings.append(
+            "participant score distribution has fewer than 10 distinct values"
+        )
+    if ctrs.participant_hold_score_unique_values < 2:
+        ctrs.warnings.append(
+            "participant hold-band score distribution is collapsed"
+        )
+
+
+def _apply_source_trust(
+    rule_set: RuleSet,
+    entity_type: str,
+    base_score: float,
+    profile: CandidateSourceProfile | None,
+    policy: SourceTrustPolicy,
+) -> TrustAdjustmentResult:
+    """Adjust score/state using source trust policy for one candidate."""
+    settings = policy.settings_for(entity_type)
+    source_systems = list(profile.source_systems) if profile is not None else []
+    if not source_systems:
+        return TrustAdjustmentResult(
+            adjusted_score=base_score,
+            resolution_state=resolution_state_from_score(rule_set, base_score),
+            reasons=[],
+            was_adjusted=False,
+            was_capped=False,
+        )
+    weights: list[float] = []
+    for source_system in source_systems:
+        source_rule = policy.source_rule_for(source_system)
+        if source_rule is None:
+            weights.append(float(settings["unknown_source_weight"]))
+        else:
+            weights.append(source_rule.weight)
+    has_high_trust = any(weight >= float(settings["high_trust_threshold"]) for weight in weights)
+
+    adjustment = 0.0
+    reasons: list[str] = [f"trust:distinct_sources:{len(source_systems)}"]
+    if len(source_systems) == 1:
+        adjustment -= float(settings["single_source_penalty"])
+        reasons.append(f"trust:single_source_penalty:{float(settings['single_source_penalty']):.4f}")
+    elif len(source_systems) >= int(settings["min_distinct_sources_for_auto_promote"]):
+        adjustment += float(settings["multi_source_bonus"])
+        reasons.append(f"trust:multi_source_bonus:{float(settings['multi_source_bonus']):.4f}")
+
+    if has_high_trust:
+        reasons.append("trust:high_trust_source_present")
+    else:
+        adjustment -= float(settings["no_high_trust_penalty"])
+        reasons.append(f"trust:no_high_trust_penalty:{float(settings['no_high_trust_penalty']):.4f}")
+
+    max_abs = float(settings["max_total_adjustment_abs"])
+    clamped_adjustment = max(-max_abs, min(max_abs, adjustment))
+    if clamped_adjustment != adjustment:
+        reasons.append(f"trust:adjustment_clamped:{clamped_adjustment:.4f}")
+    adjusted_score = round(min(1.0, max(0.0, base_score + clamped_adjustment)), 4)
+    adjusted_state = resolution_state_from_score(rule_set, adjusted_score)
+
+    cap_reasons: list[str] = []
+    if adjusted_state == "auto_promote":
+        if len(source_systems) < int(settings["min_distinct_sources_for_auto_promote"]):
+            adjusted_state = "review"
+            cap_reasons.append("trust:auto_promote_cap:insufficient_distinct_sources")
+        if bool(settings["require_high_trust_for_auto_promote"]) and not has_high_trust:
+            adjusted_state = "review"
+            cap_reasons.append("trust:auto_promote_cap:no_high_trust_source")
+
+    return TrustAdjustmentResult(
+        adjusted_score=adjusted_score,
+        resolution_state=adjusted_state,
+        reasons=reasons + cap_reasons,
+        was_adjusted=clamped_adjustment != 0.0,
+        was_capped=bool(cap_reasons),
+    )
+
+
+def _features_participant(row: dict[str, Any]) -> dict[str, bool | float]:
     # email/phone: top-level field OR child contact evidence (precomputed in row)
     has_email = bool(row["best_email"]) or bool(row.get("_child_email"))
     has_phone = bool(row["best_phone"]) or bool(row.get("_child_phone"))
@@ -144,12 +511,17 @@ def _features_participant(row: dict[str, Any]) -> dict[str, bool]:
     # This keeps address as a conservative lift for contact-poor candidates only —
     # it must not amplify the score of candidates already bearing email/phone signals.
     has_address = bool(row.get("_child_address")) and not has_email and not has_phone
+    # source_count_score: continuous [0.0..1.0], normalised at 10 source links.
+    # Provides intra-band differentiation so address-only hold candidates are not
+    # all scored identically at 0.30 (FOR-225).
+    source_count_score: float = min(row.get("_source_count", 0) / 10.0, 1.0)
     return {
         "email_exact":           has_email,
         "phone_exact":           has_phone,
         "dob_exact":             bool(row["date_of_birth"]),
         "normalized_name_exact": bool(row["normalized_name"]),
         "address_present":       has_address,
+        "source_count_score":    source_count_score,
     }
 
 
@@ -226,7 +598,7 @@ _SELECT_COLS: dict[str, str] = {
 # These are child-table-derived signals that operators cannot directly enrich
 # via manual action, so generating "missing_X" enrichment NBAs for them is
 # misleading and creates queue noise.
-_NON_NBA_FEATURES: frozenset[str] = frozenset({"address_present"})
+_NON_NBA_FEATURES: frozenset[str] = frozenset({"address_present", "source_count_score"})
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +685,7 @@ def _score_entity_type(
     conn: psycopg.Connection,
     entity_type: str,
     rule_set: RuleSet,
+    source_trust_policy: SourceTrustPolicy,
     score_run_id: str,
     ctrs: ScoreCounters,
 ) -> None:
@@ -328,8 +701,11 @@ def _score_entity_type(
 
     # Precompute child evidence map once for participant scoring (avoids N+1).
     child_evidence: dict[str, dict[str, bool]] = {}
+    source_counts: dict[str, int] = {}
+    source_profiles = _fetch_candidate_source_profiles(conn, entity_type)
     if entity_type == "participant":
         child_evidence = _fetch_participant_child_evidence(conn)
+        source_counts = _fetch_participant_source_counts(conn)
 
     for idx, raw_row in enumerate(rows):
         row = dict(zip(col_names, raw_row))
@@ -337,18 +713,55 @@ def _score_entity_type(
         is_promoted: bool = bool(row["is_promoted"])
         current_state: str = str(row["resolution_state"])
 
-        # Augment participant rows with child evidence flags.
+        # Augment participant rows with child evidence flags and source count.
         if entity_type == "participant":
             ev = child_evidence.get(pk, {})
             row["_child_email"]   = ev.get("has_email", False)
             row["_child_phone"]   = ev.get("has_phone", False)
             row["_child_address"] = ev.get("has_address", False)
+            # source_count_score: continuous [0.0..1.0], max at 10+ source links
+            row["_source_count"]  = source_counts.get(pk, 0)
 
         sp = f"score_{entity_type}_{idx}"
         conn.execute(f"SAVEPOINT {sp}")
         try:
             features = extractor(row)
             score, state, reasons = compute_score(rule_set, features)
+            trust_result = _apply_source_trust(
+            rule_set,
+            entity_type,
+            score,
+            source_profiles.get(pk),
+            source_trust_policy,
+        )
+            score = trust_result.adjusted_score
+            state = trust_result.resolution_state
+            reasons.extend(trust_result.reasons)
+            if trust_result.was_adjusted:
+                ctrs.trust_adjusted_candidates += 1
+            if trust_result.was_capped and not is_promoted:
+                ctrs.trust_capped_candidates += 1
+                ctrs.state_transitions_capped += 1
+
+            # FOR-224: a participant with zero name signal has no identity anchor.
+            # Cap at 'hold' regardless of score so nameless email-only records
+            # never auto-promote. Always record the hard block so downstream
+            # profiling and migrations can identify the condition reliably.
+            if entity_type == "participant" and not row["normalized_name"]:
+                if "hard_block:missing_name" not in reasons:
+                    reasons.append("hard_block:missing_name")
+                if state in ("auto_promote", "review"):
+                    state = "hold"
+
+            # FOR-222: org-like participant names are not person identities.
+            # Reject them from the participant resolution path so they cannot be
+            # promoted into canonical_participant.
+            if entity_type == "participant" and is_likely_org_name(
+                row.get("display_name") or row.get("normalized_name")
+            ):
+                state = "reject"
+                if "hard_block:organization_entity" not in reasons:
+                    reasons.append("hard_block:organization_entity")
 
             # Append child-evidence origin annotations to confidence_reasons.
             if entity_type == "participant":
@@ -451,6 +864,7 @@ def run_score(
         ScoreCounters with run statistics.
     """
     ctrs = ScoreCounters()
+    source_trust_policy = load_source_trust_policy(_DEFAULT_SOURCE_TRUST_PATH)
     entity_types = (
         ["club", "event", "yacht", "participant", "registration"]
         if entity_type == "all"
@@ -464,7 +878,9 @@ def run_score(
         score_run_id = open_score_run(conn, et, rule_set.source_system, rule_set_id)
         step_failed = False
         try:
-            _score_entity_type(conn, et, rule_set, score_run_id, ctrs)
+            _score_entity_type(conn, et, rule_set, source_trust_policy, score_run_id, ctrs)
+            if et == "participant":
+                _update_participant_score_distribution_stats(conn, ctrs)
         except Exception as exc:
             step_failed = True
             ctrs.db_errors += 1
@@ -505,11 +921,19 @@ def build_score_report(ctrs: ScoreCounters, dry_run: bool = False) -> str:
         f"  NBAs written:              {ctrs.nbas_written}",
         f"  staged transitions:        {ctrs.state_transitions_staged}",
         f"  capped transitions:        {ctrs.state_transitions_capped}",
+        f"  trust-adjusted:            {ctrs.trust_adjusted_candidates}",
+        f"  trust-capped:              {ctrs.trust_capped_candidates}",
         f"Child evidence (participant):",
         f"  child email used:          {ctrs.participant_child_email_used}",
         f"  child phone used:          {ctrs.participant_child_phone_used}",
         f"  child address used:        {ctrs.participant_child_address_used}",
         f"  address-only → hold:       {ctrs.participant_address_only_hold}",
+        f"Participant score distribution:",
+        f"  score mean:                {ctrs.participant_score_mean:.4f}" if ctrs.participant_score_mean is not None else "  score mean:                n/a",
+        f"  score stddev:              {ctrs.participant_score_stddev:.4f}" if ctrs.participant_score_stddev is not None else "  score stddev:              n/a",
+        f"  score unique values:       {ctrs.participant_score_unique_values}",
+        f"  hold-band unique values:   {ctrs.participant_hold_score_unique_values}",
+        f"  auto-promote unique vals:  {ctrs.participant_auto_promote_score_unique_values}",
         f"DB errors:                   {ctrs.db_errors}",
     ]
     if ctrs.warnings:

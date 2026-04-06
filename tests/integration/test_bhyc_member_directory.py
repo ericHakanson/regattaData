@@ -92,6 +92,9 @@ class TestMigration:
     def test_bhyc_member_xref_participant_exists(self, conn):
         conn.execute("SELECT 1 FROM bhyc_member_xref_participant LIMIT 0")
 
+    def test_bhyc_household_candidate_evidence_exists(self, conn):
+        conn.execute("SELECT 1 FROM bhyc_household_candidate_evidence LIMIT 0")
+
     def test_raw_row_unique_constraint(self, conn):
         """Re-inserting same (source_system, member_id, page_type, run_id) does nothing."""
         kwargs = dict(
@@ -334,6 +337,48 @@ class TestIngestProfile:
         labels = {r[0] for r in xrefs}
         assert None in labels   # primary member
         assert "spouse" in labels
+
+        # Exclusive source ownership stays on the primary candidate.
+        source_links = conn.execute(
+            """
+            SELECT candidate_entity_id::text
+            FROM candidate_source_link
+            WHERE candidate_entity_type = 'participant'
+              AND source_table_name = 'bhyc_member_raw_row'
+              AND source_row_pk = %s
+            ORDER BY candidate_entity_id
+            """,
+            (row_id,),
+        ).fetchall()
+        assert len(source_links) == 1
+
+        primary_candidate = conn.execute(
+            """
+            SELECT id::text
+            FROM candidate_participant
+            WHERE normalized_name = 'iris irving'
+            """
+        ).fetchone()
+        household_candidate = conn.execute(
+            """
+            SELECT id::text
+            FROM candidate_participant
+            WHERE normalized_name = 'jack irving'
+            """
+        ).fetchone()
+        assert primary_candidate is not None
+        assert household_candidate is not None
+        assert source_links[0][0] == primary_candidate[0]
+
+        household_evidence = conn.execute(
+            """
+            SELECT relationship_label, candidate_participant_id::text
+            FROM bhyc_household_candidate_evidence
+            WHERE bhyc_member_raw_row_id = %s
+            """,
+            (row_id,),
+        ).fetchall()
+        assert household_evidence == [("spouse", household_candidate[0])]
 
     def test_idempotent_rerun(self, conn):
         """Running _ingest_profile twice for the same member must not duplicate entities."""

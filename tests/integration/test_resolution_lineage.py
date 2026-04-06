@@ -47,7 +47,16 @@ def _insert_auto_promote_participant(conn: psycopg.Connection, suffix: str = "")
         """,
         (fp, name_slug, name_slug, em),
     ).fetchone()
-    return str(row[0])
+    candidate_id = str(row[0])
+    conn.execute(
+        """
+        INSERT INTO candidate_source_link
+            (candidate_entity_type, candidate_entity_id, source_table_name, source_row_pk)
+        VALUES ('participant', %s::uuid, 'participant', %s)
+        """,
+        (candidate_id, f"lineage-auto-{tag}"),
+    )
+    return candidate_id
 
 
 def _insert_review_participant(conn: psycopg.Connection, suffix: str = "") -> str:
@@ -68,7 +77,16 @@ def _insert_review_participant(conn: psycopg.Connection, suffix: str = "") -> st
         """,
         (fp, name_slug, name_slug, em),
     ).fetchone()
-    return str(row[0])
+    candidate_id = str(row[0])
+    conn.execute(
+        """
+        INSERT INTO candidate_source_link
+            (candidate_entity_type, candidate_entity_id, source_table_name, source_row_pk)
+        VALUES ('participant', %s::uuid, 'participant', %s)
+        """,
+        (candidate_id, f"lineage-review-{tag}"),
+    )
+    return candidate_id
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +159,199 @@ class TestLineageReportBasic:
         assert r.pct_candidate_to_canonical == 100.0
         assert r.thresholds_passed is True
 
+    def test_sourceless_candidates_fail_thresholds(self, db_conn):
+        conn, _ = db_conn
+        fp = _fp("lin-sourceless", "sourceless@example.test")
+        conn.execute(
+            """
+            INSERT INTO candidate_participant
+                (stable_fingerprint, display_name, normalized_name, best_email, resolution_state)
+            VALUES (%s, 'Sourceless Person', 'sourceless person', %s, 'review')
+            """,
+            (fp, "sourceless@example.test"),
+        )
+
+        results = run_lineage_report(
+            conn, entity_type="participant", canonical_threshold_pct=0.0, dry_run=True
+        )
+        r = results[0]
+        assert r.candidates_without_source_links == 1
+        assert r.thresholds_passed is False
+        assert any("zero source links" in note for note in r.notes)
+
+    def test_participant_lineage_reports_email_like_name_count(self, db_conn):
+        conn, _ = db_conn
+        fp = _fp("lin-email-name", "lin-email-name@example.test")
+        conn.execute(
+            """
+            INSERT INTO candidate_participant
+                (stable_fingerprint, display_name, normalized_name, best_email, resolution_state)
+            VALUES (%s, 'lin-email-name@example.test', 'lin-email-name@example.test', %s, 'review')
+            """,
+            (fp, "lin-email-name@example.test"),
+        )
+
+        results = run_lineage_report(
+            conn, entity_type="participant", canonical_threshold_pct=0.0, dry_run=True
+        )
+        assert any(
+            note == "participant candidates with email-like names: 1"
+            for note in results[0].notes
+        )
+
+    def test_participant_lineage_reports_identity_gap_counts(self, db_conn):
+        conn, _ = db_conn
+        nameless_fp = _fp("lin-nameless", "lin-nameless@example.test")
+        promoted_fp = _fp("lin-nameless-promoted", "lin-nameless-promoted@example.test")
+        canonical_id = conn.execute(
+            """
+            INSERT INTO canonical_participant (display_name, canonical_confidence_score)
+            VALUES ('Nameless Canonical', 0.9)
+            RETURNING id
+            """
+        ).fetchone()[0]
+
+        conn.execute(
+            """
+            INSERT INTO candidate_participant
+                (stable_fingerprint, display_name, normalized_name, best_email, resolution_state)
+            VALUES (%s, NULL, NULL, %s, 'hold')
+            """,
+            (nameless_fp, "lin-nameless@example.test"),
+        )
+        conn.execute(
+            """
+            INSERT INTO candidate_participant
+                (stable_fingerprint, display_name, normalized_name, best_email,
+                 resolution_state, is_promoted, promoted_canonical_id)
+            VALUES (%s, NULL, NULL, %s, 'auto_promote', true, %s::uuid)
+            """,
+            (promoted_fp, "lin-nameless-promoted@example.test", canonical_id),
+        )
+
+        results = run_lineage_report(
+            conn, entity_type="participant", canonical_threshold_pct=0.0, dry_run=True
+        )
+        assert any(
+            note == "participant candidates with no identity anchor: 2"
+            for note in results[0].notes
+        )
+        assert any(
+            note == "promoted participant candidates with no identity anchor: 1"
+            for note in results[0].notes
+        )
+
+    def test_participant_lineage_reports_org_pattern_counts(self, db_conn):
+        conn, _ = db_conn
+        promoted_canonical_id = conn.execute(
+            """
+            INSERT INTO canonical_participant (display_name, canonical_confidence_score)
+            VALUES ('Org Canonical', 0.9)
+            RETURNING id
+            """
+        ).fetchone()[0]
+
+        conn.execute(
+            """
+            INSERT INTO candidate_participant
+                (stable_fingerprint, display_name, normalized_name, best_email, resolution_state)
+            VALUES (%s, 'Nantucket Yacht Club', 'nantucket yacht club', %s, 'hold')
+            """,
+            (_fp("lin-org-hold", "lin-org-hold@example.test"), "lin-org-hold@example.test"),
+        )
+        conn.execute(
+            """
+            INSERT INTO candidate_participant
+                (stable_fingerprint, display_name, normalized_name, best_email,
+                 resolution_state, is_promoted, promoted_canonical_id)
+            VALUES (%s, 'Tenacious Holdings LLC', 'tenacious holdings llc', %s,
+                    'auto_promote', true, %s::uuid)
+            """,
+            (
+                _fp("lin-org-promoted", "lin-org-promoted@example.test"),
+                "lin-org-promoted@example.test",
+                promoted_canonical_id,
+            ),
+        )
+
+        results = run_lineage_report(
+            conn, entity_type="participant", canonical_threshold_pct=0.0, dry_run=True
+        )
+        assert any(
+            note == "participant org-pattern candidates: 2"
+            for note in results[0].notes
+        )
+        assert any(
+            note == "promoted participant org-pattern candidates: 1"
+            for note in results[0].notes
+        )
+
+    def test_participant_lineage_reports_invalid_phone_counts(self, db_conn):
+        conn, _ = db_conn
+        candidate_id = conn.execute(
+            """
+            INSERT INTO candidate_participant
+                (stable_fingerprint, display_name, normalized_name, best_email, best_phone, resolution_state)
+            VALUES (%s, 'Phone Person', 'phone person', %s, '+8295056', 'review')
+            RETURNING id
+            """,
+            (_fp("lin-invalid-phone", "lin-invalid-phone@example.test"), "lin-invalid-phone@example.test"),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            INSERT INTO candidate_participant_contact
+                (candidate_participant_id, contact_type, raw_value, normalized_value,
+                 is_primary, source_table_name, source_row_pk)
+            VALUES (%s, 'phone', '+8295056', '+8295056', true, 'test', 'row-1')
+            """,
+            (candidate_id,),
+        )
+
+        results = run_lineage_report(
+            conn, entity_type="participant", canonical_threshold_pct=0.0, dry_run=True
+        )
+        assert any(
+            note == "participant invalid phone contact rows: 1"
+            for note in results[0].notes
+        )
+        assert any(
+            note == "participant invalid best_phone values: 1"
+            for note in results[0].notes
+        )
+
+    def test_participant_lineage_warns_when_mobile_phone_coverage_is_zero(self, db_conn):
+        conn, _ = db_conn
+        candidate_id = conn.execute(
+            """
+            INSERT INTO candidate_participant
+                (stable_fingerprint, display_name, normalized_name, best_email, resolution_state)
+            VALUES (%s, 'No Mobile Person', 'no mobile person', %s, 'review')
+            RETURNING id
+            """,
+            (_fp("lin-no-mobile", "lin-no-mobile@example.test"), "lin-no-mobile@example.test"),
+        ).fetchone()[0]
+        conn.execute(
+            """
+            INSERT INTO candidate_participant_contact
+                (candidate_participant_id, contact_type, contact_subtype, raw_value, normalized_value,
+                 is_primary, source_table_name, source_row_pk)
+            VALUES (%s, 'phone', 'home', '(207) 555-3333', '+12075553333', true, 'test', 'row-home')
+            """,
+            (candidate_id,),
+        )
+
+        results = run_lineage_report(
+            conn, entity_type="participant", canonical_threshold_pct=0.0, dry_run=True
+        )
+        assert any(
+            note == "participant mobile phone contact rows: 0"
+            for note in results[0].notes
+        )
+        assert any(
+            note == "warning: participant mobile phone coverage is 0% despite phone contact rows"
+            for note in results[0].notes
+        )
+
 
 # ---------------------------------------------------------------------------
 # lineage_report — snapshot persistence
@@ -171,6 +382,30 @@ class TestLineageReportSnapshot:
             "SELECT COUNT(*) FROM lineage_coverage_snapshot WHERE entity_type = 'participant'"
         ).fetchone()[0]
         assert count == 2
+
+    def test_snapshot_persists_sourceless_count(self, db_conn):
+        conn, _ = db_conn
+        fp = _fp("lin-snap-sourceless", "snap-sourceless@example.test")
+        conn.execute(
+            """
+            INSERT INTO candidate_participant
+                (stable_fingerprint, display_name, normalized_name, best_email, resolution_state)
+            VALUES (%s, 'Snapshot Sourceless', 'snapshot sourceless', %s, 'review')
+            """,
+            (fp, "snap-sourceless@example.test"),
+        )
+
+        run_lineage_report(conn, entity_type="participant", dry_run=False)
+        count = conn.execute(
+            """
+            SELECT candidates_without_source_links
+            FROM lineage_coverage_snapshot
+            WHERE entity_type = 'participant'
+            ORDER BY snapshot_at DESC
+            LIMIT 1
+            """
+        ).fetchone()[0]
+        assert count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +480,27 @@ class TestPurgeCheck:
             "SELECT COUNT(*) FROM lineage_coverage_snapshot WHERE entity_type = 'participant'"
         ).fetchone()[0]
         assert count >= 1
+
+    def test_purge_check_fails_when_candidate_has_no_source_links(self, db_conn):
+        conn, _ = db_conn
+        fp = _fp("pc-nosrc", "pc-nosrc@example.test")
+        conn.execute(
+            """
+            INSERT INTO candidate_participant
+                (stable_fingerprint, display_name, normalized_name, best_email, resolution_state)
+            VALUES (%s, 'No Source', 'no source', %s, 'review')
+            """,
+            (fp, "pc-nosrc@example.test"),
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            run_purge_check(
+                conn,
+                entity_type="participant",
+                canonical_threshold_pct=0.0,
+                source_threshold_pct=0.0,
+            )
+        assert exc_info.value.code == 1
 
 
 # ---------------------------------------------------------------------------

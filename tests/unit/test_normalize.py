@@ -6,6 +6,9 @@ from datetime import date, datetime
 
 from regatta_etl.normalize import (
     addresses_match_for_identity,
+    build_person_display_name,
+    is_likely_org_name,
+    looks_like_email,
     normalize_address_for_identity,
     participant_legacy_comma_lookup_key,
     participant_name_lookup_keys,
@@ -82,6 +85,14 @@ class TestNormalizeEmail:
         assert normalize_email("") is None
 
 
+class TestLooksLikeEmail:
+    def test_matches_basic_email(self):
+        assert looks_like_email("user@example.com") is True
+
+    def test_rejects_human_name(self):
+        assert looks_like_email("Alice Smith") is False
+
+
 # ---------------------------------------------------------------------------
 # normalize_phone
 # ---------------------------------------------------------------------------
@@ -108,9 +119,34 @@ class TestNormalizePhone:
     def test_too_short_returns_none(self):
         assert normalize_phone("123") is None
 
+    def test_seven_digit_local_number_returns_none(self):
+        assert normalize_phone("8295056") is None
+
     def test_same_home_and_cell(self):
         # From CSV: owner_hphone == owner_cphone — both normalize to same value
         assert normalize_phone("2078318338") == normalize_phone("2078318338")
+
+
+class TestBuildPersonDisplayName:
+    def test_joins_first_and_last(self):
+        assert build_person_display_name("Alice", "Smith") == "Alice Smith"
+
+    def test_drops_email_like_first_name(self):
+        assert build_person_display_name("alice@example.com", "Smith") == "Smith"
+
+    def test_returns_none_when_only_email_like_parts(self):
+        assert build_person_display_name("alice@example.com", None) is None
+
+
+class TestIsLikelyOrgName:
+    def test_detects_llc(self):
+        assert is_likely_org_name("Tenacious Holdings LLC") is True
+
+    def test_detects_yacht_club(self):
+        assert is_likely_org_name("Nantucket Yacht Club") is True
+
+    def test_rejects_normal_person_name(self):
+        assert is_likely_org_name("Alice Smith") is False
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +405,14 @@ class TestParseNameParts:
         first, last = parse_name_parts("Carleton , Stott")
         assert first == "Stott"
         assert last == "Carleton"
+
+    def test_email_like_first_token_is_dropped(self):
+        first, last = parse_name_parts("alice@example.com Smith")
+        assert first is None
+        assert last == "Smith"
+
+    def test_email_only_returns_empty_parts(self):
+        assert parse_name_parts("alice@example.com") == (None, None)
 
 
 # ---------------------------------------------------------------------------

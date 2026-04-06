@@ -23,6 +23,7 @@ _TRAILING_POSTAL_RE = re.compile(
     r"(?:\s*(?:united states(?: of america)?|usa|us))?\s*$",
     re.IGNORECASE,
 )
+_EMAIL_LIKE_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +62,14 @@ def normalize_email(value: str | None) -> str | None:
     return v.lower()
 
 
+def looks_like_email(value: str | None) -> bool:
+    """Return True when value has the minimal expected shape of an email."""
+    v = trim(value)
+    if v is None:
+        return False
+    return bool(_EMAIL_LIKE_RE.match(v))
+
+
 # ---------------------------------------------------------------------------
 # Rule 4: normalize_phone
 # ---------------------------------------------------------------------------
@@ -70,8 +79,10 @@ def normalize_phone(value: str | None) -> str | None:
 
     Keeps digits only.  10-digit → +1XXXXXXXXXX.
     11-digit starting with 1 → +1XXXXXXXXXX.
-    Anything else → return as-is with '+' prefix if no prefix present,
-    or None if fewer than 7 digits (likely a data error).
+    Anything else → None (insufficient or non-standard digit count).
+
+    FOR-226: Previously passed 7–9-digit values through as "+NNNNNNN…", producing
+    malformed E.164.  These are almost always truncated or erroneous entries.
     """
     v = trim(value)
     if v is None:
@@ -81,9 +92,47 @@ def normalize_phone(value: str | None) -> str | None:
         return f"+1{digits}"
     if len(digits) == 11 and digits.startswith("1"):
         return f"+{digits}"
-    if len(digits) >= 7:
-        return f"+{digits}"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Org-entity detection  (FOR-222)
+# ---------------------------------------------------------------------------
+
+_ORG_PHRASE_RE = re.compile(
+    r"\b("
+    r"yacht\s+club|sailing\s+club|boat\s+club|cruising\s+club|racing\s+club|"
+    r"coast\s+guard|yacht\s+squad|fleet|squadron|"
+    r"foundation|association|assoc\.?|society|"
+    r"team|committee|regatta|authority|district|"
+    r"university|college|school|academy|"
+    r"department|dept\.?|division|bureau|agency|"
+    r"international|national|state\s+of|town\s+of|city\s+of|"
+    r"charity|nonprofit|non-profit"
+    r")\b",
+    re.IGNORECASE,
+)
+_ORG_SUFFIX_RE = re.compile(
+    r"(?:^|[\s,])("
+    r"l\.?l\.?c\.?|inc\.?|corp\.?|ltd\.?|llp\.?|lp\.?|p\.?c\.?|"
+    r"trust|estate"
+    r")\.?$",
+    re.IGNORECASE,
+)
+
+
+def is_likely_org_name(name: str | None) -> bool:
+    """Return True when name looks like an organization rather than a person.
+
+    Used to flag candidate_participant records that are orgs in disguise (FOR-222).
+    Detection is intentionally conservative: a false positive (real person with a
+    club-like token in their name) is less harmful than silently promoting an org as
+    a canonical person. Downstream scoring/promotion can reject flagged candidates
+    from the participant path.
+    """
+    if not name:
+        return False
+    return bool(_ORG_PHRASE_RE.search(name) or _ORG_SUFFIX_RE.search(name))
 
 
 def normalize_postal_code(value: str | None) -> str | None:
@@ -194,6 +243,8 @@ def normalize_person_name_for_identity(value: str | None) -> str | None:
     first, last = parse_name_parts(v)
     canonical = " ".join(part for part in (first, last) if part)
     if not canonical:
+        if looks_like_email(v):
+            return None
         canonical = v
     return normalize_name(canonical)
 
@@ -330,11 +381,31 @@ def parse_name_parts(full_name: str | None) -> tuple[str | None, str | None]:
         parts = v.split(",", 1)
         last = trim(parts[0])
         first = trim(parts[1])
+        if looks_like_email(first):
+            first = None
+        if looks_like_email(last):
+            last = None
         return (first, last)
     tokens = v.split()
     if len(tokens) == 1:
-        return (tokens[0], None)
-    return (" ".join(tokens[:-1]), tokens[-1])
+        return (None, None) if looks_like_email(tokens[0]) else (tokens[0], None)
+    first = " ".join(tokens[:-1])
+    last = tokens[-1]
+    if looks_like_email(first):
+        first = None
+    if looks_like_email(last):
+        last = None
+    return (first, last)
+
+
+def build_person_display_name(first_name: str | None, last_name: str | None) -> str | None:
+    """Return a display-ready name from non-email first/last parts."""
+    first = trim(first_name)
+    last = trim(last_name)
+    parts = [p for p in (first, last) if p and not looks_like_email(p)]
+    if not parts:
+        return None
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------

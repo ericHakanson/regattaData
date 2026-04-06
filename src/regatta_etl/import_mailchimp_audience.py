@@ -30,6 +30,7 @@ import psycopg
 
 from regatta_etl.normalize import (
     addresses_match_for_identity,
+    looks_like_email,
     normalize_email,
     participant_legacy_comma_lookup_key,
     participant_name_lookup_keys,
@@ -195,8 +196,11 @@ def _get_participant_corroboration_data(
         "SELECT address_raw FROM participant_address WHERE participant_id = %s LIMIT 1",
         (participant_id,),
     ).fetchone()
+    target_name = name_row[0] if name_row else None
+    if looks_like_email(target_name):
+        target_name = None
     return (
-        name_row[0] if name_row else None,
+        target_name,
         phone_row[0] if phone_row else None,
         addr_row[0] if addr_row else None,
     )

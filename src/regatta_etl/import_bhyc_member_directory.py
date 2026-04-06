@@ -20,7 +20,7 @@ Processing order per profile:
       d.  SAVEPOINT curated_{idx}
           i.   Upsert operational participant (email → phone → name)
           ii.  Upsert participant contacts, addresses, boat + ownership, membership
-          iii. Upsert household members (operational + candidate)
+          iii. Upsert household members (operational + candidate + household evidence)
           iv.  Upsert candidate_participant + candidate child rows
           v.   Insert candidate_source_link
           vi.  Upsert bhyc_member_xref_participant
@@ -51,6 +51,7 @@ from regatta_etl.normalize import (
     normalize_email,
     normalize_person_name_for_identity,
     normalize_phone,
+    normalize_postal_code,
     normalize_space,
     slug_name,
     trim,
@@ -779,7 +780,9 @@ def _try_parse_address_raw(raw: str, addr: dict[str, Any]) -> None:
         tail = parts[-1].split()
         if len(tail) >= 2:
             addr["state"] = tail[0]
-            addr["postal_code"] = tail[1]
+            # FOR-218: normalize_postal_code zero-pads 4-digit codes (e.g. ME/MA exports
+            # from Excel drop the leading zero: "4538" → "04538").
+            addr["postal_code"] = normalize_postal_code(tail[1])
             if len(tail) >= 3:
                 addr["country_code"] = tail[2]
     elif len(parts) == 2:
@@ -787,6 +790,16 @@ def _try_parse_address_raw(raw: str, addr: dict[str, Any]) -> None:
         addr["city"] = parts[1]
     elif len(parts) == 1:
         addr["line1"] = parts[0]
+
+    rebuilt_raw = _compose_address_raw(
+        line1=addr.get("line1"),
+        city=addr.get("city"),
+        state=addr.get("state"),
+        postal_code=addr.get("postal_code"),
+        country_code=addr.get("country_code"),
+    )
+    if rebuilt_raw:
+        addr["raw"] = rebuilt_raw
 
 
 def _parse_household_section(
@@ -1168,12 +1181,66 @@ def _upsert_bhyc_xref_participant(
     return bool(row[0]) if row else False
 
 
+def _upsert_bhyc_household_candidate_evidence(
+    conn: psycopg.Connection,
+    profile_row_id: str,
+    member_id: str,
+    relationship_label: str,
+    participant_id: str,
+    candidate_participant_id: str,
+) -> bool:
+    """Persist explicit BHYC household evidence without sharing source ownership."""
+    row = conn.execute(
+        """
+        INSERT INTO bhyc_household_candidate_evidence
+            (source_system, bhyc_member_raw_row_id, member_id, relationship_label,
+             participant_id, candidate_participant_id)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (source_system, bhyc_member_raw_row_id, candidate_participant_id, relationship_label)
+        DO UPDATE SET
+            participant_id = EXCLUDED.participant_id,
+            last_seen_at = now()
+        RETURNING (xmax = 0) AS was_inserted
+        """,
+        (
+            SOURCE_SYSTEM,
+            profile_row_id,
+            member_id,
+            relationship_label,
+            participant_id,
+            candidate_participant_id,
+        ),
+    ).fetchone()
+    return bool(row[0]) if row else False
+
+
 # ---------------------------------------------------------------------------
 # BHYC membership CSV parser
 # ---------------------------------------------------------------------------
 
 def _norm_csv_header(value: str) -> str:
     return re.sub(r"\s+", " ", trim(value) or "").lower()
+
+
+def _compose_address_raw(
+    line1: str | None,
+    city: str | None,
+    state: str | None,
+    postal_code: str | None,
+    country_code: str | None,
+) -> str:
+    return ", ".join(
+        [
+            p for p in [
+                trim(line1),
+                trim(city),
+                trim(state),
+                trim(postal_code),
+                trim(country_code),
+            ]
+            if p
+        ]
+    ).strip()
 
 
 def _build_bhyc_csv_member_id(
@@ -1216,9 +1283,11 @@ def _build_csv_address(
     line1 = " ".join([p for p in line_parts if p]).strip()
     city = trim(city)
     state = trim(state)
-    postal_code = trim(postal_code)
+    # FOR-218: normalize_postal_code zero-pads 4-digit codes exported from Excel without
+    # the leading zero (e.g. ME/MA ZIPs "4538" → "04538").
+    postal_code = normalize_postal_code(trim(postal_code))
     country_code = trim(country_code)
-    raw = ", ".join([p for p in [line1, city, state, postal_code, country_code] if p]).strip()
+    raw = _compose_address_raw(line1, city, state, postal_code, country_code)
     if not raw:
         return None
     return {
@@ -1648,6 +1717,7 @@ def _ingest_profile(
             _upsert_contact(
                 conn, cand_id, "phone", val, norm,
                 False, SOURCE_TABLE, profile_row_id,
+                contact_subtype=ph.get("subtype"),  # FOR-219: preserve 'mobile'/'home'/etc.
             )
 
     # Candidate addresses
@@ -1745,19 +1815,14 @@ def _ingest_profile(
 
         _upsert_role(conn, hh_cand_id, hh_role)
 
-        hh_was_linked = _link_source(
+        _upsert_bhyc_household_candidate_evidence(
             conn,
-            entity_type="participant",
-            candidate_id=hh_cand_id,
-            source_table=SOURCE_TABLE,
-            source_pk=profile_row_id,
-            source_system=SOURCE_SYSTEM,
-            source_row_hash=None,
-            link_score=0.7,
-            link_reason={"member_id": member_id, "relationship": raw_rel},
+            profile_row_id=profile_row_id,
+            member_id=member_id,
+            relationship_label=raw_rel,
+            participant_id=hh_pid,
+            candidate_participant_id=hh_cand_id,
         )
-        if hh_was_linked:
-            counters.candidate_links_inserted += 1
 
     counters.members_processed += 1
 

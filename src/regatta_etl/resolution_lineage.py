@@ -11,12 +11,17 @@ Coverage metrics (per entity_type):
     pct_source_to_candidate:    % of source link rows that have a candidate entry
                                 (opportunistic — reported as NULL if candidate_source_link
                                 is empty for the entity type).
+    candidates_without_source_links:
+                                candidate_* rows that have zero provenance rows
+                                in candidate_source_link. This is a hard-fail
+                                integrity condition.
     unresolved_critical_deps:   (registration only) promoted registrations whose event
                                 is not yet promoted.
     thresholds_passed:          true iff pct_candidate_to_canonical >= threshold_canonical_pct
                                 AND pct_source_to_candidate >= threshold_source_pct
                                 (source threshold only applied when source rows exist)
-                                AND unresolved_critical_deps == 0.
+                                AND unresolved_critical_deps == 0
+                                AND candidates_without_source_links == 0.
 
 Depends on: 0016_lineage_coverage (lineage_coverage_snapshot)
             0011_candidate_canonical_core (candidate_* + candidate_source_link)
@@ -44,6 +49,24 @@ _CANDIDATE_TABLE = {
     "registration": "candidate_registration",
 }
 
+_PARTICIPANT_ORG_SIGNAL_SQL_RE = (
+    r"\m("
+    r"yacht\s+club|sailing\s+club|boat\s+club|cruising\s+club|racing\s+club|"
+    r"coast\s+guard|yacht\s+squad|fleet|squadron|"
+    r"foundation|association|assoc\.?|society|"
+    r"team|committee|regatta|authority|district|"
+    r"university|college|school|academy|"
+    r"department|dept\.?|division|bureau|agency|"
+    r"international|national|state\s+of|town\s+of|city\s+of|"
+    r"charity|nonprofit|non-profit"
+    r")\M"
+)
+_PARTICIPANT_ORG_SUFFIX_SQL_RE = (
+    r"(^|[\s,])("
+    r"l\.?l\.?c\.?|inc\.?|corp\.?|ltd\.?|llp\.?|lp\.?|p\.?c\.?|trust|estate"
+    r")\.?$"
+)
+
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -54,6 +77,7 @@ class LineageCoverageResult:
     entity_type: str
     candidates_total: int
     candidates_promoted: int
+    candidates_without_source_links: int
     pct_candidate_to_canonical: float | None
     source_rows_in_link_table: int | None
     source_rows_with_candidate: int | None
@@ -113,6 +137,21 @@ def _compute_coverage(
     source_rows_with_candidate = source_rows_in_link_table  # same rows; ratio not computable
     pct_source = None  # always None until Phase 4 adds unlinked-source denominator
 
+    sourceless_row = conn.execute(
+        f"""
+        SELECT COUNT(*)
+        FROM {cand_table} c
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM candidate_source_link csl
+            WHERE csl.candidate_entity_type = %s
+              AND csl.candidate_entity_id = c.id
+        )
+        """,
+        (entity_type,),
+    ).fetchone()
+    candidates_without_source_links = int(sourceless_row[0])
+
     # Unresolved critical dependencies (registrations only).
     unresolved_deps = 0
     if entity_type == "registration":
@@ -138,7 +177,11 @@ def _compute_coverage(
         pct_canonical is not None
         and pct_canonical >= canonical_threshold_pct
     )
-    thresholds_passed = canon_ok and (unresolved_deps == 0)
+    thresholds_passed = (
+        canon_ok
+        and (unresolved_deps == 0)
+        and (candidates_without_source_links == 0)
+    )
 
     notes: list[str] = []
     if pct_canonical is None:
@@ -147,6 +190,133 @@ def _compute_coverage(
         "source coverage ratio not measurable (candidate_source_link stores only linked rows; "
         "Phase 4 will add raw-source counts for a true denominator)"
     )
+    if candidates_without_source_links > 0:
+        notes.append(
+            f"{candidates_without_source_links} candidates have zero source links"
+        )
+    if entity_type == "participant":
+        identity_gap_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE COALESCE(NULLIF(BTRIM(normalized_name), ''), NULL) IS NULL
+                ) AS total_missing_name_signal,
+                COUNT(*) FILTER (
+                    WHERE is_promoted = true
+                      AND COALESCE(NULLIF(BTRIM(normalized_name), ''), NULL) IS NULL
+                ) AS promoted_missing_name_signal
+            FROM candidate_participant
+            """
+        ).fetchone()
+        notes.append(
+            "participant candidates with no identity anchor: "
+            f"{int(identity_gap_row[0])}"
+        )
+        notes.append(
+            "promoted participant candidates with no identity anchor: "
+            f"{int(identity_gap_row[1])}"
+        )
+        org_like_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE COALESCE(display_name, '') ~* %s
+                       OR COALESCE(normalized_name, '') ~* %s
+                       OR COALESCE(display_name, '') ~* %s
+                       OR COALESCE(normalized_name, '') ~* %s
+                ) AS total_org_like,
+                COUNT(*) FILTER (
+                    WHERE is_promoted = true
+                      AND (
+                            COALESCE(display_name, '') ~* %s
+                         OR COALESCE(normalized_name, '') ~* %s
+                         OR COALESCE(display_name, '') ~* %s
+                         OR COALESCE(normalized_name, '') ~* %s
+                      )
+                ) AS promoted_org_like
+            FROM candidate_participant
+            """,
+            (
+                _PARTICIPANT_ORG_SIGNAL_SQL_RE,
+                _PARTICIPANT_ORG_SIGNAL_SQL_RE,
+                _PARTICIPANT_ORG_SUFFIX_SQL_RE,
+                _PARTICIPANT_ORG_SUFFIX_SQL_RE,
+                _PARTICIPANT_ORG_SIGNAL_SQL_RE,
+                _PARTICIPANT_ORG_SIGNAL_SQL_RE,
+                _PARTICIPANT_ORG_SUFFIX_SQL_RE,
+                _PARTICIPANT_ORG_SUFFIX_SQL_RE,
+            ),
+        ).fetchone()
+        notes.append(
+            "participant org-pattern candidates: "
+            f"{int(org_like_row[0])}"
+        )
+        notes.append(
+            "promoted participant org-pattern candidates: "
+            f"{int(org_like_row[1])}"
+        )
+        invalid_phone_row = conn.execute(
+            r"""
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM candidate_participant_contact cpc
+                    WHERE cpc.contact_type = 'phone'
+                      AND NOT (
+                            COALESCE(cpc.normalized_value, cpc.raw_value, '') ~ '^\+\d{10,15}$'
+                      )
+                ) AS invalid_contact_rows,
+                (
+                    SELECT COUNT(*)
+                    FROM candidate_participant cp
+                    WHERE COALESCE(cp.best_phone, '') <> ''
+                      AND cp.best_phone !~ '^\+\d{10,15}$'
+                ) AS invalid_best_phone_rows
+            """
+        ).fetchone()
+        notes.append(
+            "participant invalid phone contact rows: "
+            f"{int(invalid_phone_row[0])}"
+        )
+        notes.append(
+            "participant invalid best_phone values: "
+            f"{int(invalid_phone_row[1])}"
+        )
+        mobile_phone_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE contact_type = 'phone'
+                ) AS total_phone_rows,
+                COUNT(*) FILTER (
+                    WHERE contact_type = 'phone'
+                      AND LOWER(COALESCE(contact_subtype, '')) = 'mobile'
+                ) AS mobile_phone_rows
+            FROM candidate_participant_contact
+            """
+        ).fetchone()
+        total_phone_rows = int(mobile_phone_row[0])
+        mobile_phone_rows = int(mobile_phone_row[1])
+        notes.append(
+            "participant mobile phone contact rows: "
+            f"{mobile_phone_rows}"
+        )
+        if total_phone_rows > 0 and mobile_phone_rows == 0:
+            notes.append(
+                "warning: participant mobile phone coverage is 0% despite phone contact rows"
+            )
+        email_like_name_row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM candidate_participant
+            WHERE COALESCE(display_name, '') LIKE '%@%'
+               OR COALESCE(normalized_name, '') LIKE '%@%'
+            """
+        ).fetchone()
+        notes.append(
+            "participant candidates with email-like names: "
+            f"{int(email_like_name_row[0])}"
+        )
     if unresolved_deps > 0:
         notes.append(f"{unresolved_deps} promoted registrations have un-promoted events")
 
@@ -154,6 +324,7 @@ def _compute_coverage(
         entity_type=entity_type,
         candidates_total=candidates_total,
         candidates_promoted=candidates_promoted,
+        candidates_without_source_links=candidates_without_source_links,
         pct_candidate_to_canonical=pct_canonical,
         source_rows_in_link_table=source_rows_in_link_table,
         source_rows_with_candidate=source_rows_with_candidate,
@@ -173,6 +344,7 @@ def _insert_snapshot(conn: psycopg.Connection, result: LineageCoverageResult) ->
             entity_type,
             candidates_total,
             candidates_linked_to_canonical,
+            candidates_without_source_links,
             pct_candidate_to_canonical,
             source_rows_in_link_table,
             source_rows_with_candidate,
@@ -182,12 +354,13 @@ def _insert_snapshot(conn: psycopg.Connection, result: LineageCoverageResult) ->
             unresolved_critical_deps,
             thresholds_passed,
             notes
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             result.entity_type,
             result.candidates_total,
             result.candidates_promoted,
+            result.candidates_without_source_links,
             result.pct_candidate_to_canonical,
             result.source_rows_in_link_table,
             result.source_rows_with_candidate,
@@ -301,6 +474,9 @@ def build_lineage_report(
         lines.append(
             f"    candidates total/promoted: "
             f"{r.candidates_total} / {r.candidates_promoted} ({canon_pct})"
+        )
+        lines.append(
+            f"    candidates without source links: {r.candidates_without_source_links}"
         )
         lines.append(f"    threshold canonical: {r.threshold_canonical_pct:.1f}%")
         lines.append(f"    source coverage:     {src_pct}")

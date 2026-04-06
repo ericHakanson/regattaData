@@ -297,6 +297,118 @@ def _delete_canonical_with_provenance(
     )
 
 
+def _merge_canonical_participant_children(
+    conn: psycopg.Connection,
+    keep_id: str,
+    merge_id: str,
+) -> None:
+    """Union canonical participant child rows from merge_id into keep_id before delete.
+
+    This is the canonical→canonical analogue of _sync_canonical_participant_children()
+    in resolution_promote.py (which copies candidate→canonical at promotion time).
+    The SQL structure is identical but reads from canonical_participant_* tables rather
+    than candidate_participant_* tables, so no candidate_canonical_link translation join
+    is required for role assignments.
+
+    Called by _apply_merge() for entity_type == 'participant' only (other entity types
+    have no canonical child tables to merge).
+    """
+    conn.execute(
+        """
+        UPDATE canonical_participant_contact existing
+        SET contact_subtype = COALESCE(existing.contact_subtype, c.contact_subtype),
+            is_primary      = existing.is_primary OR c.is_primary
+        FROM canonical_participant_contact c
+        WHERE c.canonical_participant_id = %s
+          AND existing.canonical_participant_id = %s
+          AND existing.contact_type = c.contact_type
+          AND existing.raw_value = c.raw_value
+          AND COALESCE(existing.normalized_value, '') = COALESCE(c.normalized_value, '')
+        """,
+        (merge_id, keep_id),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO canonical_participant_contact
+            (canonical_participant_id, contact_type, contact_subtype,
+             raw_value, normalized_value, is_primary)
+        SELECT DISTINCT
+            %s::uuid,
+            c.contact_type,
+            c.contact_subtype,
+            c.raw_value,
+            c.normalized_value,
+            c.is_primary
+        FROM canonical_participant_contact c
+        WHERE c.canonical_participant_id = %s
+          AND NOT EXISTS (
+              SELECT 1
+              FROM canonical_participant_contact existing
+              WHERE existing.canonical_participant_id = %s
+                AND existing.contact_type = c.contact_type
+                AND existing.raw_value = c.raw_value
+                AND COALESCE(existing.normalized_value, '') = COALESCE(c.normalized_value, '')
+          )
+        """,
+        (keep_id, merge_id, keep_id),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO canonical_participant_address
+            (canonical_participant_id, address_raw, line1, city, state,
+             postal_code, country_code, is_primary)
+        SELECT DISTINCT
+            %s::uuid,
+            a.address_raw,
+            a.line1,
+            a.city,
+            a.state,
+            a.postal_code,
+            a.country_code,
+            a.is_primary
+        FROM canonical_participant_address a
+        WHERE a.canonical_participant_id = %s
+          AND NOT EXISTS (
+              SELECT 1
+              FROM canonical_participant_address existing
+              WHERE existing.canonical_participant_id = %s
+                AND existing.address_raw = a.address_raw
+          )
+        """,
+        (keep_id, merge_id, keep_id),
+    )
+
+    conn.execute(
+        """
+        INSERT INTO canonical_participant_role_assignment
+            (canonical_participant_id, role, canonical_event_id,
+             canonical_registration_id, source_context)
+        SELECT DISTINCT
+            %s::uuid,
+            r.role,
+            r.canonical_event_id,
+            r.canonical_registration_id,
+            r.source_context
+        FROM canonical_participant_role_assignment r
+        WHERE r.canonical_participant_id = %s
+          AND NOT EXISTS (
+              SELECT 1
+              FROM canonical_participant_role_assignment existing
+              WHERE existing.canonical_participant_id = %s
+                AND existing.role = r.role
+                AND COALESCE(existing.canonical_event_id::text, '')
+                    = COALESCE(r.canonical_event_id::text, '')
+                AND COALESCE(existing.canonical_registration_id::text, '')
+                    = COALESCE(r.canonical_registration_id::text, '')
+                AND COALESCE(existing.source_context, '') = COALESCE(r.source_context, '')
+          )
+        """,
+        (keep_id, merge_id, keep_id),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Merge
 # ---------------------------------------------------------------------------
@@ -425,7 +537,11 @@ def _apply_merge(
                      entity_type, provenance_candidate_id),
                 )
 
-    # 5b. Reroute canonical_registration FK references from merge_id → keep_id.
+    # 5b. Preserve participant child evidence before deleting the losing canonical.
+    if entity_type == "participant":
+        _merge_canonical_participant_children(conn, keep_id, merge_id)
+
+    # 5c. Reroute canonical_registration FK references from merge_id → keep_id.
     _migrate_canonical_refs(conn, entity_type, merge_id, keep_id)
 
     # 6. Delete the merge canonical (+ its provenance rows).

@@ -20,6 +20,7 @@ class TestLineageCoverageResult:
             "entity_type": "participant",
             "candidates_total": 100,
             "candidates_promoted": 80,
+            "candidates_without_source_links": 0,
             "pct_candidate_to_canonical": 80.0,
             "source_rows_in_link_table": None,
             "source_rows_with_candidate": None,
@@ -68,6 +69,7 @@ class TestBuildLineageReport:
             entity_type=entity_type,
             candidates_total=100,
             candidates_promoted=100,
+            candidates_without_source_links=0,
             pct_candidate_to_canonical=100.0,
             source_rows_in_link_table=None,
             source_rows_with_candidate=None,
@@ -83,6 +85,7 @@ class TestBuildLineageReport:
             entity_type=entity_type,
             candidates_total=100,
             candidates_promoted=50,
+            candidates_without_source_links=0,
             pct_candidate_to_canonical=50.0,
             source_rows_in_link_table=None,
             source_rows_with_candidate=None,
@@ -128,3 +131,9 @@ class TestBuildLineageReport:
         r.notes = ["some important note"]
         report = build_lineage_report([r])
         assert "some important note" in report
+
+    def test_sourceless_count_shown_in_report(self):
+        r = self._fail_result()
+        r.candidates_without_source_links = 3
+        report = build_lineage_report([r])
+        assert "candidates without source links: 3" in report

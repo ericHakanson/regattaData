@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from regatta_etl.resolution_score import (
@@ -11,6 +13,7 @@ from regatta_etl.resolution_score import (
     _features_participant,
     _features_registration,
     _features_yacht,
+    load_source_trust_policy,
 )
 
 
@@ -23,9 +26,9 @@ def _part(
     best_email=None,
     best_phone=None,
     date_of_birth=None,
-    **_,
+    **extra,
 ) -> dict:
-    return {
+    row = {
         "id": "x",
         "normalized_name": normalized_name,
         "best_email": best_email,
@@ -33,6 +36,8 @@ def _part(
         "date_of_birth": date_of_birth,
         "quality_score": 0,
     }
+    row.update(extra)
+    return row
 
 
 def _yacht(
@@ -123,6 +128,7 @@ class TestParticipantFeatures:
             "dob_exact": True,
             "normalized_name_exact": True,
             "address_present": False,  # no child address evidence in this row
+            "source_count_score": 0.0,
         }
 
     def test_none_present(self):
@@ -140,6 +146,10 @@ class TestParticipantFeatures:
         feats = _features_participant(_part(best_email="", normalized_name=""))
         assert feats["email_exact"] is False
         assert feats["normalized_name_exact"] is False
+
+    def test_source_count_score_scales_and_caps(self):
+        feats = _features_participant(_part(normalized_name="john", _source_count=25))
+        assert feats["source_count_score"] == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -267,11 +277,15 @@ class TestScoreCounters:
             candidates_hold=1,
             candidates_rejected=1,
             nbas_written=3,
+            participant_score_mean=0.42,
+            participant_score_stddev=0.11,
+            participant_score_unique_values=12,
         )
         d = ctrs.to_dict()
         assert d["candidates_scored"] == 5
         assert d["candidates_auto_promote"] == 2
         assert d["nbas_written"] == 3
+        assert d["participant_score_unique_values"] == 12
         assert "warnings" in d
 
     def test_warnings_truncated_to_50(self):
@@ -310,6 +324,8 @@ class TestScoreCounters:
         assert d["new_auto_promote_club"] == 2
         assert d["new_auto_promote_participant"] == 5
         assert d["new_auto_promote_yacht"] == 4
+        assert d["trust_adjusted_candidates"] == 0
+        assert d["trust_capped_candidates"] == 0
 
     def test_to_dict_includes_all_expected_keys(self):
         expected_keys = {
@@ -324,8 +340,37 @@ class TestScoreCounters:
             "new_auto_promote_club",
             "new_auto_promote_participant",
             "new_auto_promote_yacht",
+            "trust_adjusted_candidates",
+            "trust_capped_candidates",
+            "participant_score_mean",
+            "participant_score_stddev",
+            "participant_score_unique_values",
+            "participant_hold_score_unique_values",
+            "participant_auto_promote_score_unique_values",
             "db_errors",
             "warnings",
         }
         d = ScoreCounters().to_dict()
         assert expected_keys <= set(d.keys())
+
+
+class TestSourceTrustPolicy:
+    def test_load_default_source_trust_policy(self):
+        policy = load_source_trust_policy(Path("config/resolution_rules/source_trust.yml"))
+        assert policy.defaults["unknown_source_weight"] == pytest.approx(0.40)
+        assert policy.source_weights["operational_db"].tier == "high"
+        assert policy.settings_for("participant")["no_high_trust_penalty"] == pytest.approx(0.15)
+
+    def test_invalid_source_trust_policy_fails_fast(self, tmp_path):
+        bad_path = tmp_path / "source_trust.yml"
+        bad_path.write_text(
+            """
+version: "v1"
+defaults:
+  unknown_source_weight: 0.4
+source_weights: {}
+""".strip(),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError):
+            load_source_trust_policy(bad_path)

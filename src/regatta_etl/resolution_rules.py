@@ -200,18 +200,23 @@ def validate_rule_set(data: dict[str, Any]) -> None:
 
 def compute_score(
     rule_set: RuleSet,
-    features: dict[str, bool],
+    features: dict[str, bool | float],
     hard_block_flags: list[str] | None = None,
 ) -> tuple[float, str, list[str]]:
     """Compute quality score and resolution_state for a candidate.
 
-    The score is the sum of feature weights for all present features, then
-    penalties for missing high-value attributes are subtracted, clamped to
-    [0.0, 1.0].  Hard blocks short-circuit to score=0.0, state='reject'.
+    The score is the weighted sum of feature values, then penalties for missing
+    high-value attributes are subtracted, clamped to [0.0, 1.0].
+    Hard blocks short-circuit to score=0.0, state='reject'.
+
+    Feature values may be:
+      - bool  : True contributes full weight; False contributes nothing.
+      - float : value in [0.0, 1.0] contributes ``weight * value`` (continuous
+                feature, e.g. source_count_score).  Values are clamped to [0,1].
 
     Args:
         rule_set: Active RuleSet with weights, thresholds, and penalties.
-        features: Mapping from feature name to boolean (True = feature present).
+        features: Mapping from feature name to bool or float value.
         hard_block_flags: List of hard-block condition names detected for this
             candidate.  If any match a rule in rule_set.hard_blocks, the
             candidate is immediately rejected.
@@ -231,12 +236,16 @@ def compute_score(
                 reasons.append(f"hard_block:{flag}")
                 return 0.0, "reject", reasons
 
-    # Weighted feature sum
+    # Weighted feature sum — supports bool and continuous float values
     score = 0.0
     for feat, weight in rule_set.feature_weights.items():
-        if features.get(feat):
-            score += weight
-            reasons.append(f"feature:{feat}:{weight:.4f}")
+        raw_val = features.get(feat, False)
+        # Clamp continuous values to [0.0, 1.0]; booleans map naturally (1.0/0.0)
+        feat_val = min(1.0, max(0.0, float(raw_val)))
+        if feat_val > 0.0:
+            contribution = weight * feat_val
+            score += contribution
+            reasons.append(f"feature:{feat}:{contribution:.4f}")
 
     # Missing-attribute penalties
     for penalty_key, penalty_val in rule_set.missing_attribute_penalties.items():

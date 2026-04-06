@@ -64,6 +64,9 @@ import psycopg
 from psycopg import pq
 
 from regatta_etl.normalize import (
+    build_person_display_name,
+    is_likely_org_name,
+    looks_like_email,
     normalize_email,
     normalize_name,
     normalize_person_name_for_identity,
@@ -104,6 +107,7 @@ _SKIPPED_TABLES: list[tuple[str, str]] = [
     ("mailchimp_contact_tag",      "supplemental_to_mailchimp_audience_row"),
     ("bhyc_member_raw_row",        "inline_candidate_linking_in_bhyc_pipeline"),
     ("bhyc_member_xref_participant", "lookup_xref_table"),
+    ("bhyc_household_candidate_evidence", "bhyc_household_evidence_not_entity"),
     ("candidate_participant",      "is_candidate_layer_not_source"),
     ("candidate_yacht",            "is_candidate_layer_not_source"),
     ("candidate_club",             "is_candidate_layer_not_source"),
@@ -232,9 +236,21 @@ def _upsert_candidate(
     On conflict (fingerprint already exists), COALESCE is used so only null
     columns in the existing row are filled from the incoming data.
 
+    FOR-222: when table is 'candidate_participant', display_name is checked via
+    is_likely_org_name(). If the name looks like an organization (yacht club, LLC,
+    Coast Guard, etc.), resolution_state is forced to 'reject' on INSERT so the
+    record never auto-promotes into a canonical person. Existing rows are not
+    downgraded here (fill-nulls-only semantics); the backfill migration handles
+    pre-existing rows.
+
     Returns:
         (uuid_str, was_inserted: bool)
     """
+    if table == "candidate_participant" and is_likely_org_name(
+        fields.get("display_name") or fields.get("normalized_name")
+    ):
+        fields = {**fields, "resolution_state": "reject"}
+
     cols = ["stable_fingerprint"] + list(fields.keys())
     vals = [fingerprint] + list(fields.values())
     placeholders = ", ".join(["%s"] * len(vals))
@@ -278,7 +294,7 @@ def _link_source(
             (candidate_entity_type, candidate_entity_id, source_table_name,
              source_row_pk, source_row_hash, source_system, link_score, link_reason)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (candidate_entity_type, candidate_entity_id, source_table_name, source_row_pk)
+        ON CONFLICT (candidate_entity_type, source_table_name, source_row_pk)
         DO NOTHING
         RETURNING id
         """,
@@ -305,23 +321,40 @@ def _upsert_contact(
     is_primary: bool,
     source_table: str,
     source_pk: str,
+    contact_subtype: str | None = None,
 ) -> None:
-    """Upsert a candidate_participant_contact row (idempotent via partial unique indexes)."""
+    """Upsert a candidate_participant_contact row (idempotent via partial unique indexes).
+
+    contact_subtype (e.g. 'mobile', 'home', 'work') is stored but is NOT part of the
+    deduplication key — two phone numbers with identical normalized values but different
+    subtypes are still the same contact point.  FOR-219: subtype was previously silently
+    dropped; callers must now pass it for phone contacts.
+    """
+    # FOR-226: candidate-layer phone contacts must always be valid normalized
+    # E.164-style values. Keep malformed/truncated raw numbers only in the
+    # source-layer participant_contact_point table for provenance.
+    if contact_type == "phone" and normalized_value is None:
+        return
+
     if normalized_value is not None:
         # Conflict on (candidate_participant_id, contact_type, normalized_value)
         conn.execute(
             """
             INSERT INTO candidate_participant_contact
-                (candidate_participant_id, contact_type, raw_value, normalized_value,
-                 is_primary, source_table_name, source_row_pk)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                (candidate_participant_id, contact_type, contact_subtype, raw_value,
+                 normalized_value, is_primary, source_table_name, source_row_pk)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (candidate_participant_id, contact_type, normalized_value)
                 WHERE normalized_value IS NOT NULL
-            DO NOTHING
+            DO UPDATE SET
+                contact_subtype = COALESCE(candidate_participant_contact.contact_subtype,
+                                           EXCLUDED.contact_subtype),
+                is_primary      = candidate_participant_contact.is_primary OR EXCLUDED.is_primary
             """,
             (
                 candidate_participant_id,
                 contact_type,
+                contact_subtype,
                 raw_value,
                 normalized_value,
                 is_primary,
@@ -334,16 +367,20 @@ def _upsert_contact(
         conn.execute(
             """
             INSERT INTO candidate_participant_contact
-                (candidate_participant_id, contact_type, raw_value, normalized_value,
-                 is_primary, source_table_name, source_row_pk)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                (candidate_participant_id, contact_type, contact_subtype, raw_value,
+                 normalized_value, is_primary, source_table_name, source_row_pk)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (candidate_participant_id, contact_type, raw_value)
                 WHERE normalized_value IS NULL
-            DO NOTHING
+            DO UPDATE SET
+                contact_subtype = COALESCE(candidate_participant_contact.contact_subtype,
+                                           EXCLUDED.contact_subtype),
+                is_primary      = candidate_participant_contact.is_primary OR EXCLUDED.is_primary
             """,
             (
                 candidate_participant_id,
                 contact_type,
+                contact_subtype,
                 raw_value,
                 None,
                 is_primary,
@@ -636,32 +673,61 @@ def _ingest_participants_from_participant_table(
     conn: psycopg.Connection,
     ctrs: SourceToCandidateCounters,
 ) -> None:
-    """Ingest every participant row (+ best email from participant_contact_point)."""
+    """Ingest every participant row (+ best contact/address evidence).
+
+    Live Cloud SQL runs pay a noticeable round-trip cost for each query. Loading
+    child contact/address rows once and grouping them in memory avoids tens of
+    thousands of per-participant lookups during a full participant rerun.
+    """
     rows = conn.execute(
         """
         SELECT p.id, p.full_name, p.normalized_full_name, p.date_of_birth,
-               (SELECT contact_value_normalized
-                FROM participant_contact_point
-                WHERE participant_id = p.id AND contact_type = 'email'
-                ORDER BY is_primary DESC, created_at ASC
-                LIMIT 1) AS best_email,
-               (SELECT contact_value_normalized
-                FROM participant_contact_point
-                WHERE participant_id = p.id AND contact_type = 'phone'
-                ORDER BY is_primary DESC, created_at ASC
-                LIMIT 1) AS best_phone
+               p.first_name, p.last_name
         FROM participant p
         ORDER BY p.created_at
         """
     ).fetchall()
 
+    contact_rows = conn.execute(
+        """
+        SELECT participant_id::text, id, contact_type, contact_subtype,
+               contact_value_raw, contact_value_normalized, is_primary
+        FROM participant_contact_point
+        ORDER BY participant_id, is_primary DESC, created_at ASC, id ASC
+        """
+    ).fetchall()
+    contacts_by_participant: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
+    best_contact_by_participant: dict[str, dict[str, str | None]] = defaultdict(dict)
+    for contact_row in contact_rows:
+        participant_id = str(contact_row[0])
+        contacts_by_participant[participant_id].append(contact_row)
+        contact_type = contact_row[2]
+        if contact_type not in best_contact_by_participant[participant_id]:
+            best_contact_by_participant[participant_id][contact_type] = contact_row[5]
+
+    address_rows = conn.execute(
+        """
+        SELECT participant_id::text, id, address_raw, line1, city, state,
+               postal_code, country_code, is_primary
+        FROM participant_address
+        ORDER BY participant_id, created_at ASC, id ASC
+        """
+    ).fetchall()
+    addresses_by_participant: dict[str, list[tuple[Any, ...]]] = defaultdict(list)
+    for address_row in address_rows:
+        addresses_by_participant[str(address_row[0])].append(address_row)
+
     for row in rows:
         pk = str(row[0])
-        display_name = row[1]
-        norm_name = row[2]
+        display_name = build_person_display_name(row[4], row[5])
+        if display_name is None:
+            raw_full_name = trim(row[1])
+            if raw_full_name and "@" not in raw_full_name and not looks_like_email(raw_full_name):
+                display_name = raw_full_name
+        norm_name = normalize_person_name_for_identity(display_name)
         dob = row[3]
-        best_email = row[4]
-        best_phone = row[5]
+        best_email = best_contact_by_participant.get(pk, {}).get("email")
+        best_phone = best_contact_by_participant.get(pk, {}).get("phone")
 
         fields = {
             "display_name": display_name,
@@ -704,48 +770,32 @@ def _ingest_participants_from_participant_table(
                 ctrs.source_links_skipped_duplicate += 1
 
             # Upsert contact child rows from participant_contact_point
-            contacts = conn.execute(
-                """
-                SELECT id, contact_type, contact_subtype, contact_value_raw,
-                       contact_value_normalized, is_primary
-                FROM participant_contact_point
-                WHERE participant_id = %s
-                ORDER BY created_at
-                """,
-                (pk,),
-            ).fetchall()
+            contacts = contacts_by_participant.get(pk, [])
             for c in contacts:
                 _upsert_contact(
                     conn, cid,
-                    contact_type=c[1],
-                    raw_value=c[3],
-                    normalized_value=c[4],
-                    is_primary=bool(c[5]),
+                    contact_type=c[2],
+                    raw_value=c[4],
+                    normalized_value=c[5],
+                    is_primary=bool(c[6]),
                     source_table="participant_contact_point",
-                    source_pk=str(c[0]),
+                    source_pk=str(c[1]),
+                    contact_subtype=c[3],  # FOR-219: was silently dropped
                 )
                 ctrs.participant_contacts_linked += 1
 
             # Upsert address child rows from participant_address
-            addresses = conn.execute(
-                """
-                SELECT id, address_raw, line1, city, state, postal_code, country_code, is_primary
-                FROM participant_address
-                WHERE participant_id = %s
-                ORDER BY created_at
-                """,
-                (pk,),
-            ).fetchall()
+            addresses = addresses_by_participant.get(pk, [])
             for a in addresses:
-                if a[1]:
+                if a[2]:
                     _upsert_address(
                         conn, cid,
-                        address_raw=a[1],
+                        address_raw=a[2],
                         source_table="participant_address",
-                        source_pk=str(a[0]),
-                        line1=a[2], city=a[3], state=a[4],
-                        postal_code=a[5], country_code=a[6],
-                        is_primary=bool(a[7]),
+                        source_pk=str(a[1]),
+                        line1=a[3], city=a[4], state=a[5],
+                        postal_code=a[6], country_code=a[7],
+                        is_primary=bool(a[8]),
                     )
                     ctrs.participant_addresses_linked += 1
 
@@ -908,7 +958,10 @@ def _ingest_participants_from_mailchimp(
                 # Derive candidate from the participant record itself.
                 p_rec = conn.execute(
                     """
-                    SELECT p.normalized_full_name,
+                    SELECT p.full_name,
+                           p.first_name,
+                           p.last_name,
+                           p.normalized_full_name,
                            (SELECT contact_value_normalized
                             FROM participant_contact_point
                             WHERE participant_id = p.id
@@ -926,15 +979,20 @@ def _ingest_participants_from_mailchimp(
                         "participant row not found — skipped"
                     )
                     continue
-                norm_name = p_rec[0]
-                best_email = p_rec[1]
+                display_name = build_person_display_name(p_rec[1], p_rec[2])
+                if display_name is None:
+                    raw_full_name = trim(p_rec[0])
+                    if raw_full_name and "@" not in raw_full_name and not looks_like_email(raw_full_name):
+                        display_name = raw_full_name
+                norm_name = normalize_person_name_for_identity(display_name)
+                best_email = p_rec[4]
                 fp = participant_fingerprint(norm_name, best_email or first_email_normalized)
                 cid, created = _upsert_candidate(
                     conn,
                     "candidate_participant",
                     fp,
                     {
-                        "display_name": norm_name,
+                        "display_name": display_name,
                         "normalized_name": norm_name,
                         "best_email": best_email or first_email_normalized,
                     },
@@ -965,7 +1023,8 @@ def _ingest_participants_from_mailchimp(
             # ── Step 3: Phone child evidence from participant_contact_point ───
             phone_rows = conn.execute(
                 """
-                SELECT id, contact_value_raw, contact_value_normalized, is_primary
+                SELECT id, contact_value_raw, contact_value_normalized, is_primary,
+                       contact_subtype
                 FROM participant_contact_point
                 WHERE participant_id = %s AND contact_type = 'phone'
                 ORDER BY is_primary DESC, created_at ASC
@@ -981,6 +1040,7 @@ def _ingest_participants_from_mailchimp(
                         is_primary=bool(pr[3]),
                         source_table="participant_contact_point",
                         source_pk=str(pr[0]),
+                        contact_subtype=pr[4],  # FOR-219
                     )
                     ctrs.participant_contacts_linked += 1
 
@@ -2672,18 +2732,28 @@ def run_under_combination_remediation(
                     if not dry_run:
                         conn.execute(
                             """
-                            INSERT INTO candidate_source_link
-                                (candidate_entity_type, candidate_entity_id, source_table_name,
-                                 source_row_pk, source_row_hash, source_system,
-                                 link_score, link_reason)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (candidate_entity_type, candidate_entity_id,
-                                         source_table_name, source_row_pk)
-                            DO NOTHING
+                            UPDATE candidate_source_link loser_link
+                            SET candidate_entity_id = %s
+                            WHERE loser_link.candidate_entity_type = %s
+                              AND loser_link.candidate_entity_id = %s
+                              AND loser_link.source_table_name = %s
+                              AND loser_link.source_row_pk = %s
+                              AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM candidate_source_link winner_link
+                                    WHERE winner_link.candidate_entity_type = loser_link.candidate_entity_type
+                                      AND winner_link.candidate_entity_id = %s
+                                      AND winner_link.source_table_name = loser_link.source_table_name
+                                      AND winner_link.source_row_pk = loser_link.source_row_pk
+                              )
                             """,
                             (
-                                lnk[0], winner_id, lnk[1], lnk[2], lnk[3], lnk[4], lnk[5],
-                                json.dumps(lnk[6]) if lnk[6] is not None else "{}",
+                                winner_id,
+                                lnk[0],
+                                loser_id,
+                                lnk[1],
+                                lnk[2],
+                                winner_id,
                             ),
                         )
                     ctrs.links_transferred += 1

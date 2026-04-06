@@ -151,6 +151,33 @@ def _insert_candidate_registration(
     return str(row[0])
 
 
+def _insert_source_link(
+    conn: psycopg.Connection,
+    *,
+    entity_type: str,
+    candidate_id: str,
+    source_table_name: str,
+    source_pk: str | None = None,
+    source_system: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO candidate_source_link
+            (candidate_entity_type, candidate_entity_id, source_table_name,
+             source_row_pk, source_system)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+        """,
+        (
+            entity_type,
+            candidate_id,
+            source_table_name,
+            source_pk or str(uuid.uuid4()),
+            source_system,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Scoring tests
 # ---------------------------------------------------------------------------
@@ -454,6 +481,180 @@ class TestCandidatePromotion:
         ).fetchone()
         assert link is not None
         assert link[1] == "auto"
+
+    def test_participant_promotion_sanitizes_email_like_name_parts(self, db_conn):
+        conn, _ = db_conn
+        cid = _insert_candidate_participant(
+            conn,
+            normalized_name="baker",
+            best_email="jen@example.com",
+            best_phone="+12075551234",
+        )
+        conn.execute(
+            """
+            UPDATE candidate_participant
+            SET display_name = 'jen@example.com Baker',
+                resolution_state = 'auto_promote'
+            WHERE id = %s
+            """,
+            (cid,),
+        )
+
+        run_promote(conn, entity_type="participant")
+
+        canonical_id = conn.execute(
+            """
+            SELECT canonical_entity_id
+            FROM candidate_canonical_link
+            WHERE candidate_entity_type = 'participant' AND candidate_entity_id = %s
+            """,
+            (cid,),
+        ).fetchone()[0]
+        row = conn.execute(
+            """
+            SELECT display_name, first_name, last_name
+            FROM canonical_participant
+            WHERE id = %s
+            """,
+            (canonical_id,),
+        ).fetchone()
+        assert row[0] == "Baker"
+        assert row[1] is None
+        assert row[2] == "Baker"
+
+    def test_nameless_participant_is_held_with_missing_name_reason(self, db_conn):
+        conn, _ = db_conn
+        cid = _insert_candidate_participant(
+            conn,
+            normalized_name=None,
+            best_email="nameless@example.com",
+            best_phone="+12075550000",
+        )
+        run_score(conn, entity_type="participant")
+
+        row = conn.execute(
+            """
+            SELECT resolution_state, confidence_reasons
+            FROM candidate_participant
+            WHERE id = %s
+            """,
+            (cid,),
+        ).fetchone()
+        assert row[0] == "hold"
+        assert "hard_block:missing_name" in row[1]
+
+    def test_nameless_auto_promote_candidate_is_not_promoted(self, db_conn):
+        conn, _ = db_conn
+        cid = _insert_candidate_participant(
+            conn,
+            normalized_name=None,
+            best_email="blocked@example.com",
+            best_phone="+12075550001",
+        )
+        conn.execute(
+            """
+            UPDATE candidate_participant
+            SET display_name = NULL,
+                normalized_name = NULL,
+                resolution_state = 'auto_promote'
+            WHERE id = %s
+            """,
+            (cid,),
+        )
+
+        ctrs = run_promote(conn, entity_type="participant")
+        row = conn.execute(
+            """
+            SELECT is_promoted, promoted_canonical_id
+            FROM candidate_participant
+            WHERE id = %s
+            """,
+            (cid,),
+        ).fetchone()
+
+        assert row[0] is False
+        assert row[1] is None
+        assert ctrs.candidates_promoted == 0
+        assert conn.execute(
+            """
+            SELECT 1
+            FROM candidate_canonical_link
+            WHERE candidate_entity_type = 'participant'
+              AND candidate_entity_id = %s
+            """,
+            (cid,),
+        ).fetchone() is None
+
+    def test_org_like_participant_is_rejected_with_org_reason(self, db_conn):
+        conn, _ = db_conn
+        cid = _insert_candidate_participant(
+            conn,
+            normalized_name="tenacious holdings llc",
+            best_email="ops@tenacious.test",
+            best_phone="+12075550002",
+        )
+        conn.execute(
+            """
+            UPDATE candidate_participant
+            SET display_name = 'Tenacious Holdings LLC'
+            WHERE id = %s
+            """,
+            (cid,),
+        )
+
+        run_score(conn, entity_type="participant")
+
+        row = conn.execute(
+            """
+            SELECT resolution_state, confidence_reasons
+            FROM candidate_participant
+            WHERE id = %s
+            """,
+            (cid,),
+        ).fetchone()
+        assert row[0] == "reject"
+        assert "hard_block:organization_entity" in row[1]
+
+    def test_org_like_auto_promote_candidate_is_blocked_from_promotion(self, db_conn):
+        conn, _ = db_conn
+        cid = _insert_candidate_participant(
+            conn,
+            normalized_name="tenacious holdings llc",
+            best_email="ops@tenacious.test",
+            best_phone="+12075550003",
+        )
+        conn.execute(
+            """
+            UPDATE candidate_participant
+            SET display_name = 'Tenacious Holdings LLC',
+                resolution_state = 'auto_promote'
+            WHERE id = %s
+            """,
+            (cid,),
+        )
+
+        ctrs = run_promote(conn, entity_type="participant")
+        row = conn.execute(
+            """
+            SELECT is_promoted, promoted_canonical_id, resolution_state
+            FROM candidate_participant
+            WHERE id = %s
+            """,
+            (cid,),
+        ).fetchone()
+        assert row[0] is False
+        assert row[1] is None
+        assert row[2] == "reject"
+        assert ctrs.candidates_promoted == 0
+        assert conn.execute(
+            """
+            SELECT 1
+            FROM candidate_canonical_link
+            WHERE candidate_entity_type = 'participant'
+              AND candidate_entity_id = %s
+            """,
+            (cid,),
+        ).fetchone() is None
 
     def test_audit_log_entry_created(self, db_conn):
         conn, dsn = db_conn
@@ -1183,7 +1384,120 @@ class TestChildEvidenceScoring:
 
         report = build_score_report(ctrs)
         assert "child email used:" in report
-        assert "child address used:" in report
+
+
+class TestSourceTrustScoring:
+    def test_low_trust_single_source_caps_auto_promote_to_review(self, db_conn):
+        conn, dsn = db_conn
+        cid = _insert_candidate_participant(
+            conn,
+            normalized_name="trust-capped",
+            best_email="trust-capped@example.com",
+            best_phone="+12075559999",
+            date_of_birth=None,
+        )
+        _insert_source_link(
+            conn,
+            entity_type="participant",
+            candidate_id=cid,
+            source_table_name="mailchimp_audience_row",
+            source_system="mailchimp_audience_csv",
+        )
+
+        ctrs = run_score(conn, entity_type="participant")
+        row = conn.execute(
+            "SELECT quality_score, resolution_state, confidence_reasons FROM candidate_participant WHERE id = %s",
+            (cid,),
+        ).fetchone()
+
+        assert float(row[0]) == pytest.approx(0.66, abs=0.001)
+        assert row[1] == "review"
+        assert "trust:single_source_penalty:0.0800" in row[2]
+        assert "trust:no_high_trust_penalty:0.1500" in row[2]
+        assert "trust:auto_promote_cap:no_high_trust_source" in row[2]
+        assert ctrs.trust_adjusted_candidates >= 1
+        assert ctrs.trust_capped_candidates >= 1
+
+    def test_high_trust_multi_source_candidate_remains_auto_promote(self, db_conn):
+        conn, dsn = db_conn
+        cid = _insert_candidate_participant(
+            conn,
+            normalized_name="trust-uncapped",
+            best_email="trust-uncapped@example.com",
+            best_phone="+12075558888",
+            date_of_birth=None,
+        )
+        _insert_source_link(
+            conn,
+            entity_type="participant",
+            candidate_id=cid,
+            source_table_name="participant",
+            source_system="operational_db",
+        )
+        _insert_source_link(
+            conn,
+            entity_type="participant",
+            candidate_id=cid,
+            source_table_name="mailchimp_audience_row",
+            source_system="mailchimp_audience_csv",
+        )
+
+        ctrs = run_score(conn, entity_type="participant")
+        row = conn.execute(
+            "SELECT quality_score, resolution_state, confidence_reasons FROM candidate_participant WHERE id = %s",
+            (cid,),
+        ).fetchone()
+
+        assert float(row[0]) == pytest.approx(0.92, abs=0.001)
+        assert row[1] == "auto_promote"
+        assert "trust:multi_source_bonus:0.0500" in row[2]
+        assert "trust:high_trust_source_present" in row[2]
+        assert not any(str(reason).startswith("trust:auto_promote_cap:") for reason in row[2])
+        assert ctrs.trust_adjusted_candidates >= 1
+        report = build_score_report(ctrs)
+        assert "trust-adjusted:" in report
+
+
+class TestParticipantScoreDistribution:
+    def test_hold_band_has_multiple_distinct_scores_and_report_stats(self, db_conn):
+        conn, _ = db_conn
+
+        for source_count in range(11):
+            cid = _insert_candidate_participant(
+                conn,
+                normalized_name=f"hold-dist-{source_count}",
+                best_email=None,
+                best_phone=None,
+                date_of_birth=None,
+            )
+            _insert_child_address(conn, cid)
+            for idx in range(source_count):
+                _insert_source_link(
+                    conn,
+                    entity_type="participant",
+                    candidate_id=cid,
+                    source_table_name="participant",
+                    source_pk=f"{cid}-src-{idx}",
+                    source_system="operational_db",
+                )
+
+        ctrs = run_score(conn, entity_type="participant")
+        unique_hold_scores = conn.execute(
+            """
+            SELECT COUNT(DISTINCT quality_score)
+            FROM candidate_participant
+            WHERE resolution_state = 'hold'
+            """
+        ).fetchone()[0]
+
+        assert unique_hold_scores >= 8
+        assert ctrs.participant_score_unique_values >= 10
+        assert ctrs.participant_hold_score_unique_values >= 8
+
+        report = build_score_report(ctrs)
+        assert "Participant score distribution:" in report
+        assert "score unique values:" in report
+        assert "hold-band unique values:" in report
 
 
 # ---------------------------------------------------------------------------

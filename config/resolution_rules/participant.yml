@@ -1,7 +1,20 @@
 entity_type: participant
 source_system: "regattaman_csv_export|regattaman_public_scrape_csv|mailchimp_audience_csv|jotform_waiver_csv|airtable_copy_csv|yacht_scoring_csv"
-version: "v1.2.0"
+version: "v1.3.0"
 
+# v1.3.0 changes (FOR-225 — intra-band score differentiation):
+#   Added source_count_score as a continuous feature (weight 0.10, max at 10+ sources).
+#   The scoring engine now supports float feature values: contribution = weight * value.
+#   This produces ~10 distinct scores within the hold band (0.25–0.50) instead of
+#   one flat value of 0.30 for all address-only candidates.
+#
+#   Score arithmetic for name + address, varying source count:
+#     base:                  name(0.10) + address(0.35) - missing_email(0.10) - missing_phone(0.05) = 0.30
+#     + 1 source (0.01):     0.31
+#     + 5 sources (0.05):    0.35
+#     + 10+ sources (0.10):  0.40
+#   All values remain in hold (0.25–0.50) — no threshold crossings.
+#
 # v1.2.0 changes (child-evidence scoring):
 #   Added address_present feature (weight 0.35) for candidate_participant_address evidence.
 #   email_exact / phone_exact now also satisfied by child candidate_participant_contact rows.
@@ -58,7 +71,8 @@ thresholds:
   review: 0.50
   hold: 0.25
 
-# Feature weights: each feature is a boolean detected by the scoring pipeline.
+# Feature weights: boolean features contribute their full weight when present.
+# Continuous features (marked [0.0..1.0]) scale: contribution = weight * value.
 # email_exact / phone_exact are satisfied by top-level fields OR child contact rows.
 # address_present is satisfied by any candidate_participant_address child row.
 feature_weights:
@@ -67,6 +81,7 @@ feature_weights:
   dob_exact: 0.15          # date_of_birth present
   normalized_name_exact: 0.10  # well-formed normalized_name present
   address_present: 0.35    # candidate_participant_address child row present (only when no email/phone)
+  source_count_score: 0.10 # [0.0..1.0] continuous: min(source_link_count / 10, 1.0)
 
 # Hard blocks: any detected condition in this list forces score=0, state=reject.
 hard_blocks:

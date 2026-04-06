@@ -378,6 +378,36 @@ class TestParticipantIngestionFromParticipantTable:
         ).fetchone()[0]
         assert count >= 1
 
+    def test_email_like_participant_first_name_does_not_reach_candidate_display_name(self, db_conn):
+        conn, _ = db_conn
+        pid = _seed_participant(conn, "jen@example.com Baker", "jen@example.com")
+        conn.execute(
+            """
+            UPDATE participant
+            SET first_name = 'jen@example.com',
+                last_name = 'Baker'
+            WHERE id = %s::uuid
+            """,
+            (pid,),
+        )
+
+        run_source_to_candidate(conn, entity_type="participant")
+
+        row = conn.execute(
+            """
+            SELECT cp.display_name, cp.normalized_name
+            FROM candidate_participant cp
+            JOIN candidate_source_link csl
+              ON csl.candidate_entity_type = 'participant'
+             AND csl.candidate_entity_id = cp.id
+            WHERE csl.source_table_name = 'participant'
+              AND csl.source_row_pk = %s
+            """,
+            (pid,),
+        ).fetchone()
+        assert row[0] == "Baker"
+        assert row[1] == "baker"
+
 
 # ---------------------------------------------------------------------------
 # Participant ingestion from jotform
@@ -1552,6 +1582,100 @@ class TestMailchimpCandidateEvidence:
             (cid,),
         ).fetchone()
         assert contact is not None, "Mailchimp phone child row must exist on candidate"
+        assert contact[1] == "+12075551234"
+
+    def test_rerun_backfills_missing_phone_subtype_on_existing_candidate_contact(self, db_conn):
+        conn, _ = db_conn
+        participant_id = conn.execute(
+            """
+            INSERT INTO participant (full_name, normalized_full_name, first_name, last_name)
+            VALUES ('Subtype Person', 'subtype person', 'Subtype', 'Person')
+            RETURNING id
+            """
+        ).fetchone()[0]
+        contact_point_id = conn.execute(
+            """
+            INSERT INTO participant_contact_point
+                (participant_id, contact_type, contact_subtype,
+                 contact_value_raw, contact_value_normalized, is_primary, source_system)
+            VALUES (%s, 'phone', 'mobile', '(207) 555-2323', '+12075552323', true, 'test')
+            RETURNING id
+            """,
+            (participant_id,),
+        ).fetchone()[0]
+
+        run_source_to_candidate(conn, entity_type="participant")
+
+        candidate_id = conn.execute(
+            """
+            SELECT id
+            FROM candidate_participant
+            WHERE normalized_name = 'subtype person'
+            """
+        ).fetchone()[0]
+        conn.execute(
+            """
+            UPDATE candidate_participant_contact
+            SET contact_subtype = NULL
+            WHERE candidate_participant_id = %s
+              AND source_table_name = 'participant_contact_point'
+              AND source_row_pk = %s::text
+            """,
+            (candidate_id, contact_point_id),
+        )
+
+        run_source_to_candidate(conn, entity_type="participant")
+
+        assert conn.execute(
+            """
+            SELECT contact_subtype
+            FROM candidate_participant_contact
+            WHERE candidate_participant_id = %s
+              AND source_table_name = 'participant_contact_point'
+              AND source_row_pk = %s::text
+            """,
+            (candidate_id, contact_point_id),
+        ).fetchone()[0] == "mobile"
+
+    def test_invalid_participant_phone_does_not_create_candidate_phone_contact(self, db_conn):
+        conn, _ = db_conn
+        participant_id = conn.execute(
+            """
+            INSERT INTO participant (full_name, normalized_full_name, first_name, last_name)
+            VALUES ('Invalid Phone Person', 'invalid phone person', 'Invalid', 'Phone')
+            RETURNING id
+            """
+        ).fetchone()[0]
+        conn.execute(
+            """
+            INSERT INTO participant_contact_point
+                (participant_id, contact_type, contact_subtype,
+                 contact_value_raw, contact_value_normalized, is_primary, source_system)
+            VALUES (%s, 'phone', 'home', '8295056', NULL, true, 'test')
+            """,
+            (participant_id,),
+        )
+
+        run_source_to_candidate(conn, entity_type="participant")
+
+        candidate = conn.execute(
+            """
+            SELECT id, best_phone
+            FROM candidate_participant
+            WHERE normalized_name = 'invalid phone'
+            """
+        ).fetchone()
+        assert candidate is not None
+        assert candidate[1] is None
+        assert conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM candidate_participant_contact
+            WHERE candidate_participant_id = %s
+              AND contact_type = 'phone'
+            """,
+            (candidate[0],),
+        ).fetchone()[0] == 0
 
     # ------------------------------------------------------------------
     # T4: Mailchimp address produces candidate address child row on target candidate

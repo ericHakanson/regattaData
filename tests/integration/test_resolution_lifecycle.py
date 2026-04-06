@@ -185,6 +185,17 @@ class TestMerge:
         assert new_link is not None
         assert str(new_link[0]) == keep_id
 
+        keep_link_count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM candidate_canonical_link
+            WHERE candidate_entity_type = 'participant'
+              AND canonical_entity_id = %s
+            """,
+            (keep_id,),
+        ).fetchone()[0]
+        assert keep_link_count == 2
+
         # candidate B promoted_canonical_id updated
         state_b = _candidate_state(conn, cid_b)
         assert state_b["promoted_canonical_id"] == keep_id
@@ -231,6 +242,63 @@ class TestMerge:
             "SELECT best_phone FROM canonical_participant WHERE id = %s", (keep_id,)
         ).fetchone()
         assert row[0] == "+19995551234"
+
+    def test_merge_preserves_distinct_participant_phone_contacts(self, db_conn, tmp_path):
+        conn, _ = db_conn
+        # Intentionally the same email on both candidates: simulates undercombination
+        # (same real person promoted as two separate candidates, e.g. Jeff vs Jeffrey).
+        cid_a = _insert_auto_promote_participant(
+            conn,
+            suffix="merge-phone-a",
+            email="john.abbott@example.test",
+            best_phone="+12032490300",
+        )
+        cid_b = _insert_auto_promote_participant(
+            conn,
+            suffix="merge-phone-b",
+            email="john.abbott@example.test",
+            best_phone="+12039186427",
+        )
+
+        conn.execute(
+            """
+            INSERT INTO candidate_participant_contact
+                (candidate_participant_id, contact_type, contact_subtype,
+                 raw_value, normalized_value, is_primary)
+            VALUES
+                (%s, 'phone', 'home', %s, %s, true),
+                (%s, 'phone', 'home', %s, %s, true)
+            """,
+            (cid_a, "+12032490300", "+12032490300", cid_b, "+12039186427", "+12039186427"),
+        )
+
+        run_promote(conn, entity_type="participant")
+
+        keep_id = _get_promoted_canonical_id(conn, cid_a, "participant")
+        merge_id = _get_promoted_canonical_id(conn, cid_b, "participant")
+        assert keep_id and merge_id and keep_id != merge_id
+
+        csv_path = _write_lifecycle_csv(tmp_path, "merge", [{
+            "canonical_entity_type": "participant",
+            "keep_canonical_id": keep_id,
+            "merge_canonical_id": merge_id,
+            "reason_code": "under_combination",
+            "actor": "test",
+        }])
+        ctrs = run_lifecycle(conn, csv_path, "merge")
+
+        assert ctrs.rows_applied == 1
+        phones = conn.execute(
+            """
+            SELECT normalized_value
+            FROM canonical_participant_contact
+            WHERE canonical_participant_id = %s
+              AND contact_type = 'phone'
+            ORDER BY normalized_value
+            """,
+            (keep_id,),
+        ).fetchall()
+        assert [row[0] for row in phones] == ["+12032490300", "+12039186427"]
 
     def test_merge_same_id_invalid(self, db_conn, tmp_path):
         conn, _ = db_conn

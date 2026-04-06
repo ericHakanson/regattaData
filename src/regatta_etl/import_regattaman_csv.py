@@ -431,6 +431,8 @@ def _process_row(
         "participant_enrichment_rocketreach",
         "participant_under_combination_remediation",
         "participant_hold_geo_prepare",
+        "undercombination_suspect_report",
+        "overcombination_suspect_report",
     ]),
     show_default=True,
     help="Ingestion mode",
@@ -1497,6 +1499,63 @@ def main(
             geo_ctrs,  # type: ignore[arg-type]
         )
         click.echo(f"[{run_id}] Run report: {report_path}")
+        return
+    elif mode == "undercombination_suspect_report":
+        from regatta_etl.resolution_undercombination import (
+            UndercombinationCounters,
+            run_undercombination_report,
+        )
+        if not output_path:
+            click.echo(f"[{run_id}] FATAL: --output-path is required for undercombination_suspect_report", err=True)
+            sys.exit(1)
+        click.echo(f"[{run_id}] undercombination_suspect_report output_path={output_path}")
+        conn = psycopg.connect(db_dsn, autocommit=False)
+        try:
+            uc_ctrs = run_undercombination_report(
+                conn,
+                output_path=Path(output_path),
+                dry_run=dry_run,
+            )
+            conn.rollback()  # report-only; no DB writes
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        click.echo(
+            f"[{run_id}] undercombination: scanned={uc_ctrs.candidates_scanned} "
+            f"pairs_evaluated={uc_ctrs.pairs_evaluated} suspects={uc_ctrs.suspects_found}"
+        )
+        click.echo(f"[{run_id}] Report written to {output_path}")
+        return
+    elif mode == "overcombination_suspect_report":
+        from regatta_etl.resolution_overcombination import (
+            OvercombinationCounters,
+            run_overcombination_report,
+        )
+        if not output_path:
+            click.echo(f"[{run_id}] FATAL: --output-path is required for overcombination_suspect_report", err=True)
+            sys.exit(1)
+        click.echo(f"[{run_id}] overcombination_suspect_report output_path={output_path}")
+        conn = psycopg.connect(db_dsn, autocommit=False)
+        try:
+            oc_ctrs = run_overcombination_report(
+                conn,
+                output_path=Path(output_path),
+                dry_run=dry_run,
+            )
+            conn.rollback()  # report-only; no DB writes
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        click.echo(
+            f"[{run_id}] overcombination: scanned={oc_ctrs.candidates_scanned} "
+            f"household_carve_outs={oc_ctrs.household_carve_outs} "
+            f"suspects={oc_ctrs.suspects_found}"
+        )
+        click.echo(f"[{run_id}] Report written to {output_path}")
         return
     elif mode == "purge_check":
         from regatta_etl.resolution_lineage import build_lineage_report, run_lineage_report

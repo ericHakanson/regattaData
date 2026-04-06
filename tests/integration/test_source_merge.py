@@ -524,7 +524,7 @@ class TestSourceMerge:
         ).fetchone()
         assert unlink_log is not None
 
-    def test_merge_with_multi_candidate_drop_row_keeps_best_candidate_when_keep_row_has_none(
+    def test_merge_rehomes_drop_candidate_when_keep_row_has_none(
         self, db_conn, tmp_path
     ):
         conn, _ = db_conn
@@ -539,14 +539,8 @@ class TestSourceMerge:
         survivor_candidate_id = _insert_candidate_yacht(
             conn, name="Ghost", normalized_name="ghost-best", quality_score=0.8
         )
-        stale_candidate_id = _insert_candidate_yacht(
-            conn, name="Ghost", normalized_name="ghost-other", quality_score=0.1
-        )
         _insert_candidate_source_link(
             conn, candidate_id=survivor_candidate_id, source_row_pk=drop_source_id
-        )
-        _insert_candidate_source_link(
-            conn, candidate_id=stale_candidate_id, source_row_pk=drop_source_id
         )
 
         csv_path = _write_merge_csv(tmp_path, [{
@@ -572,24 +566,3 @@ class TestSourceMerge:
         ).fetchone()
         assert survivor_link is not None
         assert survivor_link["source_row_pk"] == keep_source_id
-
-        stale_link = conn.execute(
-            """
-            SELECT 1
-            FROM candidate_source_link
-            WHERE candidate_entity_type = 'yacht' AND candidate_entity_id = %s::uuid
-            """,
-            (stale_candidate_id,),
-        ).fetchone()
-        assert stale_link is None
-
-        stale_candidate = conn.execute(
-            """
-            SELECT resolution_state
-            FROM candidate_yacht
-            WHERE id = %s::uuid
-            """,
-            (stale_candidate_id,),
-        ).fetchone()
-        assert stale_candidate["resolution_state"] == "reject"
-

@@ -201,6 +201,50 @@ def test_mailchimp_e2e(db_conn, tmp_path):
         assert "2025 waiver" in tags
 
 
+def test_mailchimp_email_in_first_name_does_not_persist_as_participant_first_name(db_conn, tmp_path):
+    conn, dsn = db_conn
+
+    sub_path = tmp_path / "subscribed_bad_name.csv"
+    unsub_path = tmp_path / "unsubscribed_empty.csv"
+    clean_path = tmp_path / "cleaned_empty.csv"
+    rejects_path = tmp_path / "rejects.csv"
+
+    _write_csv(
+        sub_path,
+        SUBSCRIBED_HEADERS,
+        [_make_subscribed_row(email="jen@example.com", first="jen@example.com", last="Baker")],
+    )
+    _write_csv(unsub_path, UNSUBSCRIBED_HEADERS, [])
+    _write_csv(clean_path, CLEANED_HEADERS, [])
+
+    _run_mailchimp_audience(
+        run_id=str(uuid.uuid4()),
+        started_at="2026-01-01T00:00:00",
+        db_dsn=dsn,
+        counters=RunCounters(),
+        rejects=RejectWriter(rejects_path),
+        subscribed_path=str(sub_path),
+        unsubscribed_path=str(unsub_path),
+        cleaned_path=str(clean_path),
+        max_reject_rate=0.05,
+        dry_run=False,
+    )
+
+    row = conn.execute(
+        """
+        SELECT full_name, first_name, last_name
+        FROM participant
+        WHERE full_name IN ('Baker', 'jen@example.com Baker')
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "Baker"
+    assert row[1] is None
+    assert row[2] == "Baker"
+
+
 # ---------------------------------------------------------------------------
 # Test: idempotency — rerun produces zero new logical inserts
 # ---------------------------------------------------------------------------

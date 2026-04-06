@@ -32,6 +32,7 @@ from typing import Optional
 
 import psycopg
 
+from regatta_etl.normalize import build_person_display_name, looks_like_email, parse_name_parts
 from regatta_etl.shared import RunCounters
 
 # ---------------------------------------------------------------------------
@@ -162,6 +163,21 @@ def _load_suppression_map(conn: psycopg.Connection) -> dict[str, str]:
         }
 
 
+def _sanitize_candidate_names(
+    first_name: str | None,
+    last_name: str | None,
+    display_name: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    first = None if looks_like_email(first_name) else first_name
+    last = None if looks_like_email(last_name) else last_name
+    if first is None and last is None:
+        first, last = parse_name_parts(display_name)
+    clean_display = build_person_display_name(first, last)
+    if clean_display is None and display_name and "@" not in display_name and not looks_like_email(display_name):
+        clean_display = display_name
+    return first, last, clean_display
+
+
 # ---------------------------------------------------------------------------
 # Segment queries
 # ---------------------------------------------------------------------------
@@ -225,9 +241,9 @@ def _query_upcoming_registrants(
             _CandidateRow(
                 participant_id=r[0],
                 email_normalized=r[1],
-                first_name=r[2],
-                last_name=r[3],
-                display_name=r[4],
+                first_name=first_name,
+                last_name=last_name,
+                display_name=display_name,
                 confidence_score=float(r[5]) if r[5] is not None else 0.0,
                 updated_at=r[6],
                 upcoming_event_count=int(r[7]),
@@ -237,6 +253,7 @@ def _query_upcoming_registrants(
                 last_registered_event_name=r[10],
             )
             for r in cur.fetchall()
+            for first_name, last_name, display_name in [_sanitize_candidate_names(r[2], r[3], r[4])]
         ]
 
 
@@ -299,9 +316,9 @@ def _query_likely_registrants(
             _CandidateRow(
                 participant_id=r[0],
                 email_normalized=r[1],
-                first_name=r[2],
-                last_name=r[3],
-                display_name=r[4],
+                first_name=first_name,
+                last_name=last_name,
+                display_name=display_name,
                 confidence_score=float(r[5]) if r[5] is not None else 0.0,
                 updated_at=r[6],
                 upcoming_event_count=int(r[7]),
@@ -311,6 +328,7 @@ def _query_likely_registrants(
                 last_registered_event_name=r[10],
             )
             for r in cur.fetchall()
+            for first_name, last_name, display_name in [_sanitize_candidate_names(r[2], r[3], r[4])]
         ]
 
 

@@ -19,6 +19,7 @@ from regatta_etl.import_mailchimp_event_activation import (
     _apply_suppression,
     _dedupe_by_email,
     _merge_segment_rows,
+    _sanitize_candidate_names,
     _write_csv,
 )
 from regatta_etl.shared import RunCounters
@@ -96,6 +97,16 @@ class TestMergeSegmentRows:
         result = _merge_segment_rows(a, [])
         assert len(result) == 1
         assert result[0].segment_types == ["upcoming_registrants"]
+
+
+class TestSanitizeCandidateNames:
+    def test_drops_email_like_first_name(self):
+        first, last, display = _sanitize_candidate_names(
+            "jen@example.com", "Baker", "jen@example.com Baker"
+        )
+        assert first is None
+        assert last == "Baker"
+        assert display == "Baker"
 
 
 # ---------------------------------------------------------------------------
