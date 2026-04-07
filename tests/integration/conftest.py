@@ -51,6 +51,7 @@ MIGRATIONS = [
     PROJECT_ROOT / "migrations" / "0030_organization_candidate_repair.sql",
     PROJECT_ROOT / "migrations" / "0031_invalid_phone_repair.sql",
     PROJECT_ROOT / "migrations" / "0032_mobile_contact_subtype_backfill.sql",
+    PROJECT_ROOT / "migrations" / "0033_email_like_participant_display_name_repair.sql",
 ]
 
 # ---------------------------------------------------------------------------

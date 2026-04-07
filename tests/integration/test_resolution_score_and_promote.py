@@ -522,6 +522,62 @@ class TestCandidatePromotion:
         assert row[1] is None
         assert row[2] == "Baker"
 
+    def test_rerun_promotion_repairs_existing_canonical_email_like_display_name(self, db_conn):
+        conn, _ = db_conn
+        cid = _insert_candidate_participant(
+            conn,
+            normalized_name="baker",
+            best_email="jen@example.com",
+            best_phone="+12075551234",
+        )
+        canonical_id = str(
+            conn.execute(
+                """
+                INSERT INTO canonical_participant
+                    (display_name, normalized_name, first_name, last_name,
+                     canonical_confidence_score)
+                VALUES
+                    ('jen@example.com Baker', 'jenexamplecom baker',
+                     'jen@example.com', 'Baker', 0.9)
+                RETURNING id
+                """
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """
+            UPDATE candidate_participant
+            SET display_name = 'Baker',
+                resolution_state = 'auto_promote',
+                is_promoted = true,
+                promoted_canonical_id = %s::uuid
+            WHERE id = %s
+            """,
+            (canonical_id, cid),
+        )
+        
+        conn.execute(
+            """
+            INSERT INTO candidate_canonical_link
+                (candidate_entity_type, candidate_entity_id, canonical_entity_id,
+                 promotion_score, promotion_mode, promoted_by)
+            VALUES
+                ('participant', %s::uuid, %s::uuid, 0.9, 'auto', 'pipeline')
+            """,
+            (cid, canonical_id),
+        )
+
+        run_promote(conn, entity_type="participant")
+
+        row = conn.execute(
+            """
+            SELECT display_name, first_name, last_name
+            FROM canonical_participant
+            WHERE id = %s::uuid
+            """,
+            (canonical_id,),
+        ).fetchone()
+        assert row == ("Baker", "Baker", None)
+
     def test_nameless_participant_is_held_with_missing_name_reason(self, db_conn):
         conn, _ = db_conn
         cid = _insert_candidate_participant(

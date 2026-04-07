@@ -71,6 +71,7 @@ from regatta_etl.normalize import (
     normalize_name,
     normalize_person_name_for_identity,
     normalize_phone,
+    parse_name_parts,
     parse_race_url,
     slug_name,
     trim,
@@ -246,6 +247,9 @@ def _upsert_candidate(
     Returns:
         (uuid_str, was_inserted: bool)
     """
+    if table == "candidate_participant":
+        fields = _sanitize_participant_candidate_fields(fields)
+
     if table == "candidate_participant" and is_likely_org_name(
         fields.get("display_name") or fields.get("normalized_name")
     ):
@@ -257,11 +261,29 @@ def _upsert_candidate(
     col_list = ", ".join(cols)
 
     # Build fill-nulls-only UPDATE SET clause using COALESCE
-    update_parts = [
-        f"{col} = COALESCE({table}.{col}, EXCLUDED.{col})"
-        for col in fields.keys()
-        if col not in ("created_at",)
-    ]
+    update_parts: list[str] = []
+    for col in fields.keys():
+        if col == "created_at":
+            continue
+        if table == "candidate_participant" and col == "display_name":
+            update_parts.append(
+                "display_name = CASE "
+                "WHEN candidate_participant.display_name IS NULL THEN EXCLUDED.display_name "
+                "WHEN candidate_participant.display_name LIKE '%%@%%' THEN EXCLUDED.display_name "
+                "ELSE candidate_participant.display_name "
+                "END"
+            )
+            continue
+        if table == "candidate_participant" and col == "normalized_name":
+            update_parts.append(
+                "normalized_name = CASE "
+                "WHEN candidate_participant.normalized_name IS NULL THEN EXCLUDED.normalized_name "
+                "WHEN candidate_participant.display_name LIKE '%%@%%' THEN EXCLUDED.normalized_name "
+                "ELSE candidate_participant.normalized_name "
+                "END"
+            )
+            continue
+        update_parts.append(f"{col} = COALESCE({table}.{col}, EXCLUDED.{col})")
     update_parts.append("updated_at = now()")
     update_clause = ", ".join(update_parts)
 
@@ -491,6 +513,72 @@ def _find_email_bearing_candidate_by_name(
     return None
 
 
+def _find_candidate_by_source(
+    conn: psycopg.Connection,
+    entity_type: str,
+    source_table: str,
+    source_pk: str,
+) -> str | None:
+    row = conn.execute(
+        """
+        SELECT candidate_entity_id::text
+        FROM candidate_source_link
+        WHERE candidate_entity_type = %s
+          AND source_table_name = %s
+          AND source_row_pk = %s
+        LIMIT 1
+        """,
+        (entity_type, source_table, source_pk),
+    ).fetchone()
+    return str(row[0]) if row else None
+
+
+def _load_candidate_by_source_map(
+    conn: psycopg.Connection,
+    entity_type: str,
+    source_table: str,
+) -> dict[str, str]:
+    """Return source_row_pk -> candidate id for an exclusive source table."""
+    rows = conn.execute(
+        """
+        SELECT source_row_pk, candidate_entity_id::text
+        FROM candidate_source_link
+        WHERE candidate_entity_type = %s
+          AND source_table_name = %s
+        """,
+        (entity_type, source_table),
+    ).fetchall()
+    return {str(source_pk): str(candidate_id) for source_pk, candidate_id in rows}
+
+
+def _load_email_bearing_candidate_by_name_map(
+    conn: psycopg.Connection,
+) -> dict[str, str]:
+    """Return normalized_name -> candidate id or _AMBIGUOUS for email-bearing candidates."""
+    rows = conn.execute(
+        """
+        SELECT normalized_name, id::text
+        FROM candidate_participant
+        WHERE normalized_name IS NOT NULL
+          AND best_email IS NOT NULL
+        ORDER BY normalized_name,
+                 is_promoted DESC,
+                 quality_score DESC NULLS LAST,
+                 updated_at DESC,
+                 id ASC
+        """
+    ).fetchall()
+
+    by_name: dict[str, list[str]] = defaultdict(list)
+    for normalized_name, candidate_id in rows:
+        by_name[str(normalized_name)].append(str(candidate_id))
+
+    return {
+        normalized_name: candidate_ids[0] if len(candidate_ids) == 1 else _AMBIGUOUS
+        for normalized_name, candidate_ids in by_name.items()
+    }
+
+
 def _enrich_candidate_by_id(
     conn: psycopg.Connection,
     table: str,
@@ -498,15 +586,53 @@ def _enrich_candidate_by_id(
     fields: dict[str, Any],
 ) -> None:
     """Fill-nulls-only UPDATE for a candidate row we already hold the id for."""
-    set_parts = [
-        f"{col} = COALESCE({table}.{col}, %s)"
-        for col in fields
-        if col != "created_at"
-    ]
+    if table == "candidate_participant":
+        fields = _sanitize_participant_candidate_fields(fields)
+
+    set_parts: list[str] = []
+    vals: list[Any] = []
+    for col, value in fields.items():
+        if col == "created_at":
+            continue
+        if table == "candidate_participant" and col == "display_name":
+            set_parts.append(
+                "display_name = CASE "
+                "WHEN candidate_participant.display_name IS NULL THEN %s "
+                "WHEN candidate_participant.display_name LIKE '%%@%%' THEN %s "
+                "ELSE candidate_participant.display_name "
+                "END"
+            )
+            vals.extend([value, value])
+            continue
+        if table == "candidate_participant" and col == "normalized_name":
+            set_parts.append(
+                "normalized_name = CASE "
+                "WHEN candidate_participant.normalized_name IS NULL THEN %s "
+                "WHEN candidate_participant.display_name LIKE '%%@%%' THEN %s "
+                "ELSE candidate_participant.normalized_name "
+                "END"
+            )
+            vals.extend([value, value])
+            continue
+        set_parts.append(f"{col} = COALESCE({table}.{col}, %s)")
+        vals.append(value)
     set_parts.append("updated_at = now()")
     sql = f"UPDATE {table} SET {', '.join(set_parts)} WHERE id = %s"
-    vals = [v for col, v in fields.items() if col != "created_at"] + [candidate_id]
+    vals.append(candidate_id)
     conn.execute(sql, vals)
+
+
+def _sanitize_participant_candidate_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Remove email-like participant names before candidate upsert/enrichment."""
+    clean_fields = dict(fields)
+    raw_display_name = trim(clean_fields.get("display_name"))
+    first_name, last_name = parse_name_parts(raw_display_name)
+    clean_display_name = build_person_display_name(first_name, last_name)
+    if clean_display_name is None and raw_display_name and "@" not in raw_display_name:
+        clean_display_name = raw_display_name
+    clean_fields["display_name"] = clean_display_name
+    clean_fields["normalized_name"] = normalize_person_name_for_identity(clean_display_name)
+    return clean_fields
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +843,9 @@ def _ingest_participants_from_participant_table(
     for address_row in address_rows:
         addresses_by_participant[str(address_row[0])].append(address_row)
 
+    candidate_by_source = _load_candidate_by_source_map(conn, "participant", "participant")
+    email_bearing_candidate_by_name = _load_email_bearing_candidate_by_name_map(conn)
+
     for row in rows:
         pk = str(row[0])
         display_name = build_person_display_name(row[4], row[5])
@@ -737,8 +866,9 @@ def _ingest_participants_from_participant_table(
             "best_phone": best_phone,
         }
         reuse_cid: str | None = None
+        source_linked_cid = candidate_by_source.get(pk)
         if best_email is None and norm_name:
-            lookup = _find_email_bearing_candidate_by_name(conn, norm_name)
+            lookup = email_bearing_candidate_by_name.get(norm_name)
             if lookup == _AMBIGUOUS:
                 ctrs.participants_under_combination_ambiguous += 1
                 ctrs.warnings.append(
@@ -749,7 +879,12 @@ def _ingest_participants_from_participant_table(
                 ctrs.participants_under_combination_reused += 1
 
         try:
-            if reuse_cid is not None:
+            if source_linked_cid is not None:
+                cid = source_linked_cid
+                created = False
+                _enrich_candidate_by_id(conn, "candidate_participant", cid, fields)
+                ctrs.participants_candidate_enriched += 1
+            elif reuse_cid is not None:
                 cid = reuse_cid
                 created = False
                 _enrich_candidate_by_id(conn, "candidate_participant", cid, fields)

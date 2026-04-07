@@ -408,6 +408,57 @@ class TestParticipantIngestionFromParticipantTable:
         assert row[0] == "Baker"
         assert row[1] == "baker"
 
+    def test_email_like_candidate_display_name_is_replaced_on_rerun(self, db_conn):
+        conn, _ = db_conn
+        pid = _seed_participant(conn, "Baker", "jen@example.com")
+        conn.execute(
+            """
+            UPDATE participant
+            SET first_name = NULL,
+                last_name = 'Baker',
+                full_name = 'Baker',
+                normalized_full_name = 'baker'
+            WHERE id = %s::uuid
+            """,
+            (pid,),
+        )
+
+        candidate_id = str(
+            conn.execute(
+                """
+                INSERT INTO candidate_participant
+                    (stable_fingerprint, display_name, normalized_name, best_email, resolution_state)
+                VALUES
+                    ('for230-stale-candidate', 'jen@example.com Baker',
+                     'jenexamplecom baker', 'jen@example.com', 'review')
+                RETURNING id
+                """
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """
+            INSERT INTO candidate_source_link
+                (candidate_entity_type, candidate_entity_id, source_table_name,
+                 source_row_pk, source_system, link_score, link_reason)
+            VALUES
+                ('participant', %s::uuid, 'participant', %s::text,
+                 'operational_db', 1.0, '{}'::jsonb)
+            """,
+            (candidate_id, pid),
+        )
+
+        run_source_to_candidate(conn, entity_type="participant")
+
+        row = conn.execute(
+            """
+            SELECT display_name, normalized_name
+            FROM candidate_participant
+            WHERE id = %s::uuid
+            """,
+            (candidate_id,),
+        ).fetchone()
+        assert row == ("Baker", "baker")
+
 
 # ---------------------------------------------------------------------------
 # Participant ingestion from jotform

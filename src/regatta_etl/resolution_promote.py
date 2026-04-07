@@ -183,6 +183,71 @@ def _insert_canonical_participant(conn: psycopg.Connection, pk: str) -> str:
     return str(row[0])
 
 
+def _sync_canonical_participant_fields(
+    conn: psycopg.Connection,
+    candidate_participant_id: str,
+    canonical_participant_id: str,
+) -> None:
+    candidate_row = conn.execute(
+        """
+        SELECT display_name, date_of_birth, best_email, best_phone, quality_score
+        FROM candidate_participant
+        WHERE id = %s
+        """,
+        (candidate_participant_id,),
+    ).fetchone()
+    first_name, last_name = parse_name_parts(candidate_row[0] if candidate_row else None)
+    display_name = build_person_display_name(first_name, last_name)
+    normalized_name = normalize_person_name_for_identity(display_name)
+    conn.execute(
+        """
+        UPDATE canonical_participant
+        SET display_name = CASE
+                WHEN canonical_participant.display_name IS NULL
+                  OR canonical_participant.display_name LIKE '%%@%%'
+                THEN %s
+                ELSE canonical_participant.display_name
+            END,
+            normalized_name = CASE
+                WHEN canonical_participant.normalized_name IS NULL
+                  OR canonical_participant.display_name LIKE '%%@%%'
+                THEN %s
+                ELSE canonical_participant.normalized_name
+            END,
+            first_name = CASE
+                WHEN canonical_participant.first_name IS NULL
+                  OR canonical_participant.first_name ~* '^[^[:space:]@]+@[^[:space:]@]+\\.[^[:space:]@]+$'
+                  OR canonical_participant.display_name LIKE '%%@%%'
+                THEN %s
+                ELSE canonical_participant.first_name
+            END,
+            last_name = CASE
+                WHEN canonical_participant.last_name IS NULL
+                  OR canonical_participant.last_name ~* '^[^[:space:]@]+@[^[:space:]@]+\\.[^[:space:]@]+$'
+                  OR canonical_participant.display_name LIKE '%%@%%'
+                THEN %s
+                ELSE canonical_participant.last_name
+            END,
+            date_of_birth = COALESCE(canonical_participant.date_of_birth, %s),
+            best_email = COALESCE(canonical_participant.best_email, %s),
+            best_phone = COALESCE(canonical_participant.best_phone, %s),
+            canonical_confidence_score = COALESCE(canonical_participant.canonical_confidence_score, %s)
+        WHERE id = %s
+        """,
+        (
+            display_name,
+            normalized_name,
+            first_name,
+            last_name,
+            candidate_row[1] if candidate_row else None,
+            candidate_row[2] if candidate_row else None,
+            candidate_row[3] if candidate_row else None,
+            candidate_row[4] if candidate_row else None,
+            canonical_participant_id,
+        ),
+    )
+
+
 def _sync_canonical_participant_children(
     conn: psycopg.Connection,
     candidate_participant_id: str,
@@ -486,6 +551,7 @@ def _promote_entity_type(
                 canonical_id = inserter(conn, pk)
 
             if entity_type == "participant":
+                _sync_canonical_participant_fields(conn, pk, canonical_id)
                 _sync_canonical_participant_children(conn, pk, canonical_id)
 
             # Record the promotion link (idempotent via UNIQUE constraint)
