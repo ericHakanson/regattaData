@@ -50,6 +50,7 @@ from bs4 import BeautifulSoup
 from regatta_etl.normalize import (
     normalize_country_code,
     normalize_email,
+    parse_mailing_address_components,
     normalize_person_name_for_identity,
     normalize_phone,
     normalize_postal_code_for_storage,
@@ -773,28 +774,20 @@ def _parse_address_sections(
 
 def _try_parse_address_raw(raw: str, addr: dict[str, Any]) -> None:
     """Best-effort split of 'Line1, City, ST  ZIP' into components."""
-    parts = [p.strip() for p in re.split(r",|\|", raw) if p.strip()]
-    if len(parts) >= 3:
-        addr["line1"] = parts[0]
-        addr["city"] = parts[1]
-        # Last part may be "ME 04538" or "ME 04538 USA"
-        tail = parts[-1].split()
-        if len(tail) >= 2:
-            addr["state"] = tail[0]
-            if len(tail) >= 3:
-                addr["country_code"] = normalize_country_code(tail[2])
-            addr["postal_code"] = normalize_postal_code_for_storage(
-                tail[1],
-                addr.get("country_code"),
-            )
-    elif len(parts) == 2:
-        addr["line1"] = parts[0]
-        addr["city"] = parts[1]
-    elif len(parts) == 1:
-        addr["line1"] = parts[0]
+    parsed = parse_mailing_address_components(raw, fallback_country_code="US")
+    addr["line1"] = parsed.line1
+    addr["line2"] = parsed.line2
+    addr["city"] = parsed.city
+    addr["state"] = parsed.state
+    addr["postal_code"] = normalize_postal_code_for_storage(
+        parsed.postal_code,
+        parsed.country_code,
+    )
+    addr["country_code"] = normalize_country_code(parsed.country_code)
 
     rebuilt_raw = _compose_address_raw(
         line1=addr.get("line1"),
+        line2=addr.get("line2"),
         city=addr.get("city"),
         state=addr.get("state"),
         postal_code=addr.get("postal_code"),
@@ -1230,11 +1223,13 @@ def _compose_address_raw(
     state: str | None,
     postal_code: str | None,
     country_code: str | None,
+    line2: str | None = None,
 ) -> str:
     return ", ".join(
         [
             p for p in [
                 trim(line1),
+                trim(line2),
                 trim(city),
                 trim(state),
                 trim(postal_code),
@@ -1281,19 +1276,20 @@ def _build_csv_address(
     country_code: str,
     address_type: str,
 ) -> dict[str, Any] | None:
-    line_parts = [trim(street_1), trim(street_2)]
-    line1 = " ".join([p for p in line_parts if p]).strip()
+    line1 = trim(street_1)
+    line2 = trim(street_2)
     city = trim(city)
     state = trim(state)
     country_code = normalize_country_code(trim(country_code))
     postal_code = normalize_postal_code_for_storage(trim(postal_code), country_code)
-    raw = _compose_address_raw(line1, city, state, postal_code, country_code)
+    raw = _compose_address_raw(line1, city, state, postal_code, country_code, line2=line2)
     if not raw:
         return None
     return {
         "address_type": address_type,
         "raw": raw,
         "line1": line1 or None,
+        "line2": line2 or None,
         "city": city or None,
         "state": state or None,
         "postal_code": postal_code or None,
@@ -1536,25 +1532,66 @@ def _upsert_address_op(
     raw = trim(addr.get("raw"))
     if not raw:
         return
+    raw_type = (addr.get("address_type") or "mailing").lower()
+    db_type = _ADDR_TYPE_MAP.get(raw_type, "other")
     existing = conn.execute(
-        "SELECT id FROM participant_address WHERE participant_id = %s AND address_raw = %s",
+        """
+        SELECT id, line1, line2, city, state, postal_code, country_code
+        FROM participant_address
+        WHERE participant_id = %s AND address_raw = %s
+        """,
         (participant_id, raw),
     ).fetchone()
     if existing:
+        addr_id = existing[0]
+        conn.execute(
+            """
+            UPDATE participant_address
+            SET
+                line1 = CASE
+                    WHEN (city IS NULL OR state IS NULL)
+                     AND (%s)::text IS NOT NULL
+                     AND (%s)::text IS NOT NULL
+                     AND (%s)::text IS NOT NULL
+                    THEN %s
+                    ELSE COALESCE(line1, %s)
+                END,
+                line2 = COALESCE(line2, %s),
+                city = COALESCE(city, %s),
+                state = COALESCE(state, %s),
+                postal_code = COALESCE(postal_code, %s),
+                country_code = COALESCE(country_code, %s),
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                trim(addr.get("city")),
+                trim(addr.get("state")),
+                trim(addr.get("line1")),
+                trim(addr.get("line1")),
+                trim(addr.get("line1")),
+                trim(addr.get("line2")),
+                trim(addr.get("city")),
+                trim(addr.get("state")),
+                trim(addr.get("postal_code")),
+                trim(addr.get("country_code")),
+                addr_id,
+            ),
+        )
         return
-    raw_type = (addr.get("address_type") or "mailing").lower()
-    db_type = _ADDR_TYPE_MAP.get(raw_type, "other")
+
     conn.execute(
         """
         INSERT INTO participant_address
-            (participant_id, address_type, line1, city, state,
+            (participant_id, address_type, line1, line2, city, state,
              postal_code, country_code, address_raw, is_primary, source_system)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, false, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, false, %s)
         """,
         (
             participant_id,
             db_type,
             trim(addr.get("line1")),
+            trim(addr.get("line2")),
             trim(addr.get("city")),
             trim(addr.get("state")),
             trim(addr.get("postal_code")),

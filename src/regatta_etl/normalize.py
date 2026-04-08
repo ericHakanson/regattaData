@@ -34,6 +34,47 @@ _ADDRESS_UNIT_RE = re.compile(
     r"))$",
     re.IGNORECASE,
 )
+_UNIT_HEAD_TOKENS = {
+    "apt",
+    "apartment",
+    "unit",
+    "suite",
+    "ste",
+    "floor",
+    "fl",
+}
+_STREET_MARKER_TOKENS = {
+    "aly",
+    "ave",
+    "avenue",
+    "blvd",
+    "boulevard",
+    "box",
+    "cir",
+    "circle",
+    "court",
+    "ct",
+    "dr",
+    "drive",
+    "hwy",
+    "highway",
+    "ln",
+    "lane",
+    "pkwy",
+    "parkway",
+    "pl",
+    "place",
+    "point",
+    "rd",
+    "road",
+    "st",
+    "street",
+    "ter",
+    "terrace",
+    "trail",
+    "trl",
+    "way",
+}
 
 _NAME_PREFIX_MAP: dict[str, str] = {
     "mr": "Mr",
@@ -414,6 +455,167 @@ def _looks_like_postal(value: str | None) -> bool:
     return bool(_CA_POSTAL_RE.match(compact))
 
 
+def _normalize_token_alnum_lower(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _normalize_token_alpha_upper(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^A-Za-z]", "", value).upper()
+
+
+def _explicit_country_code(value: str | None) -> str | None:
+    """Return country code only for explicit country tokens.
+
+    Important: unlike normalize_country_code, this function intentionally does
+    not treat arbitrary 2-letter codes as countries (to avoid misreading US
+    state tokens like MA/NH as country codes while parsing addresses).
+    """
+    token = _normalize_token_alpha_upper(value)
+    if token in {"US", "USA", "UNITEDSTATES", "UNITEDSTATESOFAMERICA"}:
+        return "US"
+    if token in {"CA", "CAN", "CANADA"}:
+        return "CA"
+    return None
+
+
+def _looks_like_unit_prefix(value: str | None) -> bool:
+    v = normalize_space(value)
+    if not v:
+        return False
+    first = v.split()[0]
+    normalized = _normalize_token_alnum_lower(first)
+    return first.startswith("#") or normalized in _UNIT_HEAD_TOKENS
+
+
+def _split_line1_and_city_from_overloaded_prefix(value: str | None) -> tuple[str | None, str | None]:
+    """Split '<street [unit] city>' into line1/city when city was overloaded."""
+    text = normalize_space(value)
+    if not text:
+        return (None, None)
+
+    tokens = text.split()
+    if len(tokens) < 2:
+        return (None, None)
+
+    cut: int | None = None
+
+    # PO Box pattern: "PO Box <num> <city...>"
+    if len(tokens) >= 4:
+        t0 = _normalize_token_alnum_lower(tokens[0])
+        t1 = _normalize_token_alnum_lower(tokens[1])
+        if (t0, t1) == ("po", "box") or t0 == "pobox":
+            cut = 3
+
+    for idx, token in enumerate(tokens):
+        normalized = _normalize_token_alnum_lower(token)
+        if normalized in _STREET_MARKER_TOKENS:
+            cut = max(cut or 0, idx + 1)
+        if token.startswith("#"):
+            cut = max(cut or 0, idx + 1)
+            continue
+        if normalized in _UNIT_HEAD_TOKENS and idx + 1 < len(tokens):
+            cut = max(cut or 0, idx + 2)
+
+    if cut is not None and 0 < cut < len(tokens):
+        line1 = normalize_space(" ".join(tokens[:cut]).strip(", "))
+        city = normalize_space(" ".join(tokens[cut:]).strip(", "))
+        if line1 and city:
+            return (line1, city)
+
+    # Conservative fallback when no marker found.
+    if len(tokens) >= 4:
+        line1 = normalize_space(" ".join(tokens[:-2]).strip(", "))
+        city = normalize_space(" ".join(tokens[-2:]).strip(", "))
+        if line1 and city:
+            return (line1, city)
+    if len(tokens) >= 3:
+        line1 = normalize_space(" ".join(tokens[:-1]).strip(", "))
+        city = normalize_space(tokens[-1].strip(", "))
+        if line1 and city:
+            return (line1, city)
+
+    return (None, None)
+
+
+def _parse_overloaded_address_line(
+    value: str | None,
+    fallback_country_code: str | None = None,
+) -> AddressParts | None:
+    """Parse addresses like '43 Webb Road Edgecomb, Maine' (no ZIP)."""
+    text = normalize_space(value)
+    if not text:
+        return None
+
+    country = normalize_country_code(fallback_country_code)
+    compact = re.sub(r"\s*,\s*", " ", text).strip()
+    tokens = [tok for tok in compact.split() if tok]
+    if len(tokens) < 3:
+        return None
+
+    # Remove explicit country suffix if present.
+    for span in (4, 3, 2, 1):
+        if len(tokens) >= span:
+            maybe_country = " ".join(tokens[-span:])
+            explicit_country = _explicit_country_code(maybe_country)
+            if explicit_country:
+                country = explicit_country
+                tokens = tokens[:-span]
+                break
+
+    postal = None
+    if len(tokens) >= 2:
+        maybe_ca = f"{tokens[-2]} {tokens[-1]}"
+        maybe_ca_norm = normalize_postal_code_for_storage(maybe_ca, "CA")
+        if maybe_ca_norm and _CA_POSTAL_RE.match(maybe_ca_norm.replace(" ", "")):
+            postal = maybe_ca_norm
+            country = country or "CA"
+            tokens = tokens[:-2]
+
+    if postal is None and tokens:
+        cc_hint = country
+        if cc_hint is None:
+            cc_hint = "CA" if re.search(r"[A-Za-z]", tokens[-1]) else "US"
+        maybe_postal = normalize_postal_code_for_storage(tokens[-1], cc_hint)
+        if maybe_postal and _looks_like_postal(maybe_postal):
+            postal = maybe_postal
+            if _CA_POSTAL_RE.match(maybe_postal.replace(" ", "")):
+                country = country or "CA"
+            elif re.fullmatch(r"\d{5}", maybe_postal):
+                country = country or "US"
+            tokens = tokens[:-1]
+
+    state = None
+    for span in (3, 2, 1):
+        if len(tokens) >= span:
+            maybe_state = " ".join(tokens[-span:])
+            parsed_state = _normalize_state_or_province(maybe_state, country)
+            if parsed_state:
+                state = parsed_state
+                tokens = tokens[:-span]
+                break
+    if not state:
+        return None
+
+    pre = normalize_space(" ".join(tokens))
+    line1, city = _split_line1_and_city_from_overloaded_prefix(pre)
+    if not line1 or not city:
+        return None
+
+    line1_split, line2 = split_address_line1_line2(line1)
+    return AddressParts(
+        line1=line1_split or line1,
+        line2=line2,
+        city=city,
+        state=state,
+        postal_code=normalize_postal_code_for_storage(postal, country),
+        country_code=normalize_country_code(country),
+    )
+
+
 def _parse_city_state_postal_country(
     value: str | None,
     fallback_country_code: str | None = None,
@@ -426,7 +628,7 @@ def _parse_city_state_postal_country(
     tokens = text.split()
     country = normalize_country_code(fallback_country_code)
     if tokens:
-        inferred = normalize_country_code(tokens[-1])
+        inferred = _explicit_country_code(tokens[-1])
         if inferred:
             country = inferred
             tokens = tokens[:-1]
@@ -490,6 +692,18 @@ def parse_mailing_address_components(
             " ".join(segments[2:]),
             country,
         )
+        if _looks_like_unit_prefix(city):
+            city_tokens = city.split()
+            first_token = city_tokens[0] if city_tokens else ""
+            first_norm = _normalize_token_alnum_lower(first_token)
+            if first_token.startswith("#") and len(city_tokens) >= 2:
+                merged_line1 = normalize_space(f"{line1} {first_token}")
+                line1, line2 = split_address_line1_line2(merged_line1)
+                city = normalize_space(" ".join(city_tokens[1:]))
+            elif first_norm in _UNIT_HEAD_TOKENS and len(city_tokens) >= 3:
+                merged_line1 = normalize_space(f"{line1} {' '.join(city_tokens[:2])}")
+                line1, line2 = split_address_line1_line2(merged_line1)
+                city = normalize_space(" ".join(city_tokens[2:]))
     elif len(segments) == 2:
         city, state, postal, country = _parse_city_state_postal_country(
             segments[1],
@@ -498,6 +712,26 @@ def parse_mailing_address_components(
 
     if not line1:
         line1 = line1_raw
+
+    needs_fallback = (
+        not city
+        or not state
+        or _looks_like_unit_prefix(city)
+    )
+    if needs_fallback:
+        overloaded = _parse_overloaded_address_line(text, fallback_country_code=country)
+        if overloaded:
+            line1 = overloaded.line1 or line1
+            if not city or _looks_like_unit_prefix(city):
+                city = overloaded.city or city
+            if overloaded.line2:
+                if not line2:
+                    line2 = overloaded.line2
+                elif city and normalize_space(line2).lower().endswith(normalize_space(city).lower()):
+                    line2 = overloaded.line2
+            state = overloaded.state or state
+            postal = overloaded.postal_code or postal
+            country = overloaded.country_code or country
 
     postal = normalize_postal_code_for_storage(postal, country)
     return AddressParts(

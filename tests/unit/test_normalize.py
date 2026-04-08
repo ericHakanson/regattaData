@@ -237,6 +237,38 @@ class TestParseMailingAddressComponents:
         assert parsed.postal_code == "M5V 3L9"
         assert parsed.country_code == "CA"
 
+    @pytest.mark.parametrize(
+        ("raw", "line1", "city", "state"),
+        [
+            ("PO Box 89 Plymouth, NH", "PO Box 89", "Plymouth", "NH"),
+            ("43 Webb Road Edgecomb, Maine", "43 Webb Road", "Edgecomb", "ME"),
+            ("57 Meetinghouse Lane Little Compton, RI", "57 Meetinghouse Lane", "Little Compton", "RI"),
+            ("4512 35th Road North Arlington, Va", "4512 35th Road", "North Arlington", "VA"),
+            ("117 Cameron’s point road Southport, Maine", "117 Cameron’s point road", "Southport", "ME"),
+            ("909 Beacon St, #5 Boston, MA", "909 Beacon St", "Boston", "MA"),
+        ],
+    )
+    def test_parses_overloaded_line1_without_postal(
+        self,
+        raw: str,
+        line1: str,
+        city: str,
+        state: str,
+    ):
+        parsed = parse_mailing_address_components(raw, fallback_country_code="US")
+        assert parsed.line1 == line1
+        assert parsed.city == city
+        assert parsed.state == state
+        assert parsed.country_code == "US"
+
+    def test_does_not_misread_state_code_as_country(self):
+        parsed = parse_mailing_address_components(
+            "47 Cogswell Avenue Cambridge, MA",
+            fallback_country_code="US",
+        )
+        assert parsed.state == "MA"
+        assert parsed.country_code == "US"
+
 # ---------------------------------------------------------------------------
 # normalize_address_for_identity / addresses_match_for_identity
 # ---------------------------------------------------------------------------
