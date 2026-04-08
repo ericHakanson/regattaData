@@ -65,10 +65,31 @@ address_options AS (
         a.candidate_participant_id AS candidate_id,
         a.address_raw,
         a.line1,
+        a.line2,
         a.city,
         a.state,
-        a.postal_code,
-        a.country_code,
+        CASE
+            WHEN regexp_replace(COALESCE(a.postal_code, ''), '\D', '', 'g') ~ '^\d{9}$'
+                THEN SUBSTR(regexp_replace(a.postal_code, '\D', '', 'g'), 1, 5)
+            WHEN regexp_replace(COALESCE(a.postal_code, ''), '\D', '', 'g') ~ '^\d{5}$'
+                THEN regexp_replace(a.postal_code, '\D', '', 'g')
+            WHEN regexp_replace(COALESCE(a.postal_code, ''), '\D', '', 'g') ~ '^\d{4}$'
+                THEN '0' || regexp_replace(a.postal_code, '\D', '', 'g')
+            ELSE NULLIF(BTRIM(a.postal_code), '')
+        END AS postal_code,
+        COALESCE(
+            CASE
+                WHEN NULLIF(BTRIM(a.country_code), '') IS NULL THEN NULL
+                WHEN UPPER(regexp_replace(a.country_code, '[^A-Za-z]', '', 'g')) IN ('US', 'USA', 'UNITEDSTATES', 'UNITEDSTATESOFAMERICA')
+                    THEN 'US'
+                WHEN UPPER(regexp_replace(a.country_code, '[^A-Za-z]', '', 'g')) IN ('CA', 'CAN', 'CANADA')
+                    THEN 'CA'
+                WHEN LENGTH(regexp_replace(a.country_code, '[^A-Za-z]', '', 'g')) = 2
+                    THEN UPPER(regexp_replace(a.country_code, '[^A-Za-z]', '', 'g'))
+                ELSE NULL
+            END,
+            'US'
+        ) AS country_code,
         a.is_primary,
         a.source_table_name,
         a.source_row_pk,
@@ -82,6 +103,14 @@ address_options AS (
             WHEN pa.source_system = 'mailchimp_audience_csv' THEN 50
             ELSE 90
         END AS source_priority,
+        CASE
+            WHEN NULLIF(BTRIM(a.line1), '') IS NOT NULL
+             AND NULLIF(BTRIM(a.city), '') IS NOT NULL
+             AND NULLIF(BTRIM(a.state), '') IS NOT NULL
+             AND NULLIF(BTRIM(a.postal_code), '') IS NOT NULL
+                THEN 1
+            ELSE 0
+        END AS structured_address_score,
         COUNT(*) OVER (PARTITION BY a.candidate_participant_id) AS address_count
     FROM candidate_participant_address a
     LEFT JOIN participant_address pa
@@ -96,6 +125,7 @@ ranked_address AS (
         ROW_NUMBER() OVER (
             PARTITION BY ao.candidate_id
             ORDER BY
+                ao.structured_address_score DESC,
                 ao.is_primary DESC,
                 ao.source_priority ASC,
                 ao.updated_at DESC NULLS LAST,
@@ -282,10 +312,11 @@ SELECT
     cl.club_affiliation,
     cl.club_sources,
     ra.line1,
+    ra.line2 AS address2,
     ra.city,
     ra.state,
     ra.postal_code,
-    COALESCE(ra.country_code, 'US') AS country_code,
+    ra.country_code AS country_code,
     ra.address_raw,
     ra.source_table_name AS address_source_table,
     ra.participant_address_source_system AS address_source_system,

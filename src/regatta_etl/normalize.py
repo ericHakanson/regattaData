@@ -9,6 +9,7 @@ import hashlib
 import re
 import unicodedata
 import urllib.parse
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -24,6 +25,163 @@ _TRAILING_POSTAL_RE = re.compile(
     re.IGNORECASE,
 )
 _EMAIL_LIKE_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_CA_POSTAL_RE = re.compile(r"^[A-Z]\d[A-Z]\d[A-Z]\d$")
+_NAME_TOKEN_CLEAN_RE = re.compile(r"^[\s,]+|[\s,]+$")
+_NAME_INITIAL_RE = re.compile(r"^[A-Za-z]\.?$")
+_ADDRESS_UNIT_RE = re.compile(
+    r"^(?P<line1>.*?)(?:\s+(?P<line2>"
+    r"(?:apt|apartment|unit|suite|ste|floor|fl|#)\s*[A-Za-z0-9\-\/]+.*"
+    r"))$",
+    re.IGNORECASE,
+)
+
+_NAME_PREFIX_MAP: dict[str, str] = {
+    "mr": "Mr",
+    "mrs": "Mrs",
+    "ms": "Ms",
+    "miss": "Miss",
+    "dr": "Dr",
+    "prof": "Prof",
+    "rev": "Rev",
+    "fr": "Fr",
+    "capt": "Capt",
+    "captain": "Capt",
+    "cmdr": "Cmdr",
+    "lt": "Lt",
+    "col": "Col",
+    "gen": "Gen",
+    "hon": "Hon",
+    "sir": "Sir",
+    "lady": "Lady",
+}
+
+_NAME_SUFFIX_MAP: dict[str, str] = {
+    "jr": "Jr",
+    "sr": "Sr",
+    "ii": "II",
+    "iii": "III",
+    "iv": "IV",
+    "v": "V",
+    "esq": "Esq",
+    "phd": "PhD",
+    "md": "MD",
+    "dds": "DDS",
+    "dmd": "DMD",
+    "jd": "JD",
+}
+
+_SURNAME_PARTICLES = {
+    "al",
+    "ap",
+    "ben",
+    "bin",
+    "da",
+    "dal",
+    "de",
+    "del",
+    "della",
+    "der",
+    "di",
+    "dos",
+    "du",
+    "ibn",
+    "la",
+    "le",
+    "mac",
+    "mc",
+    "st",
+    "van",
+    "von",
+}
+
+_US_STATE_NAME_TO_CODE: dict[str, str] = {
+    "alabama": "AL",
+    "alaska": "AK",
+    "arizona": "AZ",
+    "arkansas": "AR",
+    "california": "CA",
+    "colorado": "CO",
+    "connecticut": "CT",
+    "delaware": "DE",
+    "districtofcolumbia": "DC",
+    "florida": "FL",
+    "georgia": "GA",
+    "hawaii": "HI",
+    "idaho": "ID",
+    "illinois": "IL",
+    "indiana": "IN",
+    "iowa": "IA",
+    "kansas": "KS",
+    "kentucky": "KY",
+    "louisiana": "LA",
+    "maine": "ME",
+    "maryland": "MD",
+    "massachusetts": "MA",
+    "michigan": "MI",
+    "minnesota": "MN",
+    "mississippi": "MS",
+    "missouri": "MO",
+    "montana": "MT",
+    "nebraska": "NE",
+    "nevada": "NV",
+    "newhampshire": "NH",
+    "newjersey": "NJ",
+    "newmexico": "NM",
+    "newyork": "NY",
+    "northcarolina": "NC",
+    "northdakota": "ND",
+    "ohio": "OH",
+    "oklahoma": "OK",
+    "oregon": "OR",
+    "pennsylvania": "PA",
+    "rhodeisland": "RI",
+    "southcarolina": "SC",
+    "southdakota": "SD",
+    "tennessee": "TN",
+    "texas": "TX",
+    "utah": "UT",
+    "vermont": "VT",
+    "virginia": "VA",
+    "washington": "WA",
+    "westvirginia": "WV",
+    "wisconsin": "WI",
+    "wyoming": "WY",
+}
+
+_CA_PROVINCE_NAME_TO_CODE: dict[str, str] = {
+    "alberta": "AB",
+    "britishcolumbia": "BC",
+    "manitoba": "MB",
+    "newbrunswick": "NB",
+    "newfoundlandandlabrador": "NL",
+    "northwestterritories": "NT",
+    "novascotia": "NS",
+    "nunavut": "NU",
+    "ontario": "ON",
+    "princeedwardisland": "PE",
+    "quebec": "QC",
+    "saskatchewan": "SK",
+    "yukon": "YT",
+}
+
+
+@dataclass(frozen=True)
+class NameParts:
+    first_name: str | None
+    middle_name: str | None
+    last_name: str | None
+    name_prefix: str | None
+    name_suffix: str | None
+
+
+@dataclass(frozen=True)
+class AddressParts:
+    line1: str | None
+    line2: str | None
+    city: str | None
+    state: str | None
+    postal_code: str | None
+    country_code: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +293,30 @@ def is_likely_org_name(name: str | None) -> bool:
     return bool(_ORG_PHRASE_RE.search(name) or _ORG_SUFFIX_RE.search(name))
 
 
+def normalize_country_code(value: str | None) -> str | None:
+    """Normalize a country value to ISO-3166 alpha-2 when possible.
+
+    Core requirement (direct-mail): emit/store two-letter codes, especially:
+      - United States variants -> US
+      - Canada variants        -> CA
+    """
+    v = trim(value)
+    if v is None:
+        return None
+
+    token = re.sub(r"[^A-Za-z]", "", v).upper()
+    if not token:
+        return None
+
+    if token in {"US", "USA", "UNITEDSTATES", "UNITEDSTATESOFAMERICA"}:
+        return "US"
+    if token in {"CA", "CAN", "CANADA"}:
+        return "CA"
+    if len(token) == 2:
+        return token
+    return None
+
+
 def normalize_postal_code(value: str | None) -> str | None:
     """Normalize a postal code for identity comparisons.
 
@@ -155,6 +337,177 @@ def normalize_postal_code(value: str | None) -> str | None:
     if len(digits) == 4:
         return f"0{digits}"
     return None
+
+
+def normalize_postal_code_for_storage(
+    value: str | None,
+    country_code: str | None = None,
+) -> str | None:
+    """Normalize postal code for durable storage.
+
+    US/default:
+      - 4-digit -> zero-padded 5-digit
+      - 5-digit -> keep
+      - ZIP+4   -> base 5-digit
+    CA:
+      - canonical A1A 1A1 spacing/casing when parseable
+      - otherwise uppercase/trimmed raw value (no data loss)
+    """
+    v = trim(value)
+    if v is None:
+        return None
+
+    cc = normalize_country_code(country_code)
+    if cc == "CA":
+        token = re.sub(r"\s+", "", v).upper()
+        if _CA_POSTAL_RE.match(token):
+            return f"{token[:3]} {token[3:]}"
+        return token
+
+    normalized_us = normalize_postal_code(v)
+    if normalized_us is not None:
+        return normalized_us
+    return v
+
+
+def split_address_line1_line2(value: str | None) -> tuple[str | None, str | None]:
+    """Split a line1 string into (line1, line2) when a unit marker is present."""
+    line = normalize_space(value)
+    if not line:
+        return (None, None)
+    match = _ADDRESS_UNIT_RE.match(line)
+    if not match:
+        return (line, None)
+    primary = normalize_space(match.group("line1"))
+    secondary = normalize_space(match.group("line2"))
+    if not primary or not secondary:
+        return (line, None)
+    return (primary, secondary)
+
+
+def _normalize_state_or_province(
+    value: str | None,
+    country_code: str | None = None,
+) -> str | None:
+    token = normalize_space(value)
+    if not token:
+        return None
+    compact = re.sub(r"[^A-Za-z]", "", token)
+    if not compact:
+        return None
+    if len(compact) == 2:
+        return compact.upper()
+    key = compact.lower()
+    cc = normalize_country_code(country_code)
+    if cc == "CA":
+        return _CA_PROVINCE_NAME_TO_CODE.get(key) or _US_STATE_NAME_TO_CODE.get(key)
+    return _US_STATE_NAME_TO_CODE.get(key) or _CA_PROVINCE_NAME_TO_CODE.get(key)
+
+
+def _looks_like_postal(value: str | None) -> bool:
+    v = normalize_space(value)
+    if not v:
+        return False
+    if normalize_postal_code(v) is not None:
+        return True
+    compact = re.sub(r"\s+", "", v).upper()
+    return bool(_CA_POSTAL_RE.match(compact))
+
+
+def _parse_city_state_postal_country(
+    value: str | None,
+    fallback_country_code: str | None = None,
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Parse '<city> <state/province> <postal> [country]' tail strings."""
+    text = normalize_space(value)
+    if not text:
+        return (None, None, None, normalize_country_code(fallback_country_code))
+
+    tokens = text.split()
+    country = normalize_country_code(fallback_country_code)
+    if tokens:
+        inferred = normalize_country_code(tokens[-1])
+        if inferred:
+            country = inferred
+            tokens = tokens[:-1]
+
+    postal = None
+    if len(tokens) >= 2:
+        maybe_ca = f"{tokens[-2]} {tokens[-1]}"
+        maybe_ca_norm = normalize_postal_code_for_storage(maybe_ca, "CA")
+        if maybe_ca_norm and _CA_POSTAL_RE.match(maybe_ca_norm.replace(" ", "")):
+            postal = maybe_ca_norm
+            country = country or "CA"
+            tokens = tokens[:-2]
+
+    if postal is None and tokens:
+        cc_hint = country
+        if cc_hint is None:
+            cc_hint = "CA" if re.search(r"[A-Za-z]", tokens[-1]) else "US"
+        maybe_norm = normalize_postal_code_for_storage(tokens[-1], cc_hint)
+        if maybe_norm and _looks_like_postal(maybe_norm):
+            postal = maybe_norm
+            if _CA_POSTAL_RE.match(maybe_norm.replace(" ", "")):
+                country = country or "CA"
+            elif re.fullmatch(r"\d{5}", maybe_norm):
+                country = country or "US"
+            tokens = tokens[:-1]
+
+    state = None
+    if tokens:
+        state = _normalize_state_or_province(tokens[-1], country)
+        if state:
+            tokens = tokens[:-1]
+
+    city = normalize_space(" ".join(tokens))
+    return (city, state, postal, normalize_country_code(country))
+
+
+def parse_mailing_address_components(
+    value: str | None,
+    *,
+    fallback_country_code: str | None = None,
+) -> AddressParts:
+    """Best-effort parser for common US/CA freeform mailing addresses."""
+    text = normalize_space(value)
+    if not text:
+        return AddressParts(None, None, None, None, None, normalize_country_code(fallback_country_code))
+
+    segments = [normalize_space(part) for part in re.split(r"[|,]", text) if normalize_space(part)]
+    if not segments:
+        return AddressParts(None, None, None, None, None, normalize_country_code(fallback_country_code))
+
+    line1_raw = segments[0]
+    line1, line2 = split_address_line1_line2(line1_raw)
+    country = normalize_country_code(fallback_country_code)
+    city = None
+    state = None
+    postal = None
+
+    if len(segments) >= 3:
+        city = segments[1]
+        _, state, postal, country = _parse_city_state_postal_country(
+            " ".join(segments[2:]),
+            country,
+        )
+    elif len(segments) == 2:
+        city, state, postal, country = _parse_city_state_postal_country(
+            segments[1],
+            country,
+        )
+
+    if not line1:
+        line1 = line1_raw
+
+    postal = normalize_postal_code_for_storage(postal, country)
+    return AddressParts(
+        line1=line1,
+        line2=line2,
+        city=normalize_space(city),
+        state=state,
+        postal_code=postal,
+        country_code=normalize_country_code(country),
+    )
 
 
 def normalize_address_for_identity(value: str | None) -> tuple[str | None, str | None]:
@@ -366,36 +719,154 @@ def split_signed_document_urls(value: str | None) -> list[str]:
 # Helper: parse_name_parts
 # ---------------------------------------------------------------------------
 
-def parse_name_parts(full_name: str | None) -> tuple[str | None, str | None]:
-    """Split a full name into (first_name, last_name).
+def _clean_name_token(value: str | None) -> str | None:
+    token = _NAME_TOKEN_CLEAN_RE.sub("", value or "")
+    token = normalize_space(token)
+    return token
 
-    Supports:
-    - "Last, First Middle" → ("First Middle", "Last")
-    - "First Last"         → ("First", "Last")
-    - Single token         → (token, None)
+
+def _name_token_key(value: str | None) -> str:
+    token = _clean_name_token(value)
+    if not token:
+        return ""
+    return token.lower().replace(".", "")
+
+
+def _normalize_middle_tokens(tokens: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for token in tokens:
+        clean = _clean_name_token(token)
+        if not clean:
+            continue
+        key = _name_token_key(clean)
+        if len(key) == 1 and key.isalpha():
+            normalized.append(key.upper())
+        else:
+            normalized.append(clean)
+    return normalized
+
+
+def _pop_name_prefix(tokens: list[str]) -> tuple[str | None, list[str]]:
+    prefix_tokens: list[str] = []
+    remaining = list(tokens)
+    while remaining:
+        key = _name_token_key(remaining[0])
+        canonical = _NAME_PREFIX_MAP.get(key)
+        if canonical is None:
+            break
+        prefix_tokens.append(canonical)
+        remaining.pop(0)
+    prefix = " ".join(prefix_tokens) if prefix_tokens else None
+    return prefix, remaining
+
+
+def _pop_name_suffix(tokens: list[str]) -> tuple[str | None, list[str]]:
+    suffix_tokens: list[str] = []
+    remaining = list(tokens)
+    while remaining:
+        key = _name_token_key(remaining[-1])
+        canonical = _NAME_SUFFIX_MAP.get(key)
+        if canonical is None:
+            break
+        suffix_tokens.insert(0, canonical)
+        remaining.pop()
+    suffix = " ".join(suffix_tokens) if suffix_tokens else None
+    return suffix, remaining
+
+
+def _split_given_and_last(tokens: list[str]) -> tuple[list[str], list[str]]:
+    if not tokens:
+        return [], []
+    if len(tokens) == 1:
+        return [tokens[0]], []
+
+    # Start with the right-most token as the surname, then absorb recognized
+    # surname particles from right-to-left (e.g., "de la Cruz", "van der Meer").
+    last_start = len(tokens) - 1
+    idx = last_start - 1
+    while idx >= 1:
+        key = _name_token_key(tokens[idx])
+        if key in _SURNAME_PARTICLES:
+            last_start = idx
+            idx -= 1
+            continue
+        break
+
+    return tokens[:last_start], tokens[last_start:]
+
+
+def parse_person_name_parts(full_name: str | None) -> NameParts:
+    """Parse a person name into structured components.
+
+    Business rules:
+    - Handles honorific prefixes (Mr/Dr/etc.) and suffixes (Jr/III/etc.).
+    - Preserves hyphenated surnames.
+    - Preserves multi-token surnames with particles (de, van, von, etc.).
+    - Preserves multiple middle initials/tokens in middle_name.
     """
     v = normalize_space(full_name)
-    if not v:
-        return (None, None)
+    if not v or looks_like_email(v):
+        return NameParts(None, None, None, None, None)
+
     if "," in v:
-        parts = v.split(",", 1)
-        last = trim(parts[0])
-        first = trim(parts[1])
-        if looks_like_email(first):
-            first = None
-        if looks_like_email(last):
-            last = None
-        return (first, last)
-    tokens = v.split()
+        left, right = v.split(",", 1)
+        last_tokens = [_clean_name_token(t) for t in left.split()]
+        last_tokens = [t for t in last_tokens if t]
+
+        given_tokens = [_clean_name_token(t) for t in right.split()]
+        given_tokens = [t for t in given_tokens if t]
+        prefix, given_tokens = _pop_name_prefix(given_tokens)
+        suffix, given_tokens = _pop_name_suffix(given_tokens)
+
+        first_name = given_tokens[0] if given_tokens else None
+        middle_tokens = _normalize_middle_tokens(given_tokens[1:]) if len(given_tokens) > 1 else []
+        middle_name = " ".join(middle_tokens) if middle_tokens else None
+        last_name = " ".join(last_tokens) if last_tokens else None
+
+        if first_name and looks_like_email(first_name):
+            first_name = None
+        if last_name and looks_like_email(last_name):
+            last_name = None
+        return NameParts(first_name, middle_name, last_name, prefix, suffix)
+
+    tokens = [_clean_name_token(t) for t in v.split()]
+    tokens = [t for t in tokens if t]
+    prefix, tokens = _pop_name_prefix(tokens)
+    suffix, tokens = _pop_name_suffix(tokens)
+
+    if not tokens:
+        return NameParts(None, None, None, prefix, suffix)
     if len(tokens) == 1:
-        return (None, None) if looks_like_email(tokens[0]) else (tokens[0], None)
-    first = " ".join(tokens[:-1])
-    last = tokens[-1]
-    if looks_like_email(first):
-        first = None
-    if looks_like_email(last):
-        last = None
-    return (first, last)
+        first_name = None if looks_like_email(tokens[0]) else tokens[0]
+        return NameParts(first_name, None, None, prefix, suffix)
+
+    given_tokens, last_tokens = _split_given_and_last(tokens)
+    if not given_tokens:
+        given_tokens = [last_tokens[0]]
+        last_tokens = last_tokens[1:]
+
+    first_name = given_tokens[0] if given_tokens else None
+    middle_tokens = _normalize_middle_tokens(given_tokens[1:]) if len(given_tokens) > 1 else []
+    middle_name = " ".join(middle_tokens) if middle_tokens else None
+    last_name = " ".join(last_tokens) if last_tokens else None
+
+    if first_name and looks_like_email(first_name):
+        first_name = None
+    if last_name and looks_like_email(last_name):
+        last_name = None
+    return NameParts(first_name, middle_name, last_name, prefix, suffix)
+
+
+def parse_name_parts(full_name: str | None) -> tuple[str | None, str | None]:
+    """Split a full name into (given_name, last_name).
+
+    given_name preserves middle tokens (for backward compatibility), while
+    parse_person_name_parts() exposes first/middle/prefix/suffix separately.
+    """
+    parts = parse_person_name_parts(full_name)
+    given_tokens = [p for p in (parts.first_name, parts.middle_name) if p]
+    given_name = " ".join(given_tokens) if given_tokens else None
+    return given_name, parts.last_name
 
 
 def build_person_display_name(first_name: str | None, last_name: str | None) -> str | None:

@@ -31,6 +31,9 @@ import psycopg
 
 from regatta_etl.normalize import (
     normalize_email,
+    normalize_country_code,
+    parse_mailing_address_components,
+    normalize_postal_code_for_storage,
     participant_legacy_comma_lookup_key,
     participant_name_lookup_keys,
     normalize_phone,
@@ -635,23 +638,70 @@ def _upsert_address_raw(
     address_raw: str,
     counters: RunCounters,
 ) -> None:
-    """Upsert a raw address string (no structured parsing)."""
+    """Upsert a raw address string with best-effort structured parsing."""
+    parsed = parse_mailing_address_components(address_raw)
     existing = conn.execute(
         """
-        SELECT id FROM participant_address
+        SELECT id, line1, line2, city, state, postal_code, country_code
+        FROM participant_address
         WHERE participant_id = %s AND address_raw = %s
         """,
         (participant_id, address_raw),
     ).fetchone()
     if existing:
+        updates_needed = any(
+            [
+                parsed.line1 and not existing[1],
+                parsed.line2 and not existing[2],
+                parsed.city and not existing[3],
+                parsed.state and not existing[4],
+                parsed.postal_code and not existing[5],
+                parsed.country_code and not existing[6],
+            ]
+        )
+        if updates_needed:
+            conn.execute(
+                """
+                UPDATE participant_address
+                SET
+                    line1 = COALESCE(line1, %s),
+                    line2 = COALESCE(line2, %s),
+                    city = COALESCE(city, %s),
+                    state = COALESCE(state, %s),
+                    postal_code = COALESCE(postal_code, %s),
+                    country_code = COALESCE(country_code, %s),
+                    updated_at = now()
+                WHERE id = %s
+                """,
+                (
+                    parsed.line1,
+                    parsed.line2,
+                    parsed.city,
+                    parsed.state,
+                    parsed.postal_code,
+                    normalize_country_code(parsed.country_code),
+                    existing[0],
+                ),
+            )
         return
     conn.execute(
         """
         INSERT INTO participant_address
-          (participant_id, address_type, address_raw, is_primary, source_system)
-        VALUES (%s, 'mailing', %s, true, %s)
+          (participant_id, address_type, line1, line2, city, state,
+           postal_code, country_code, address_raw, is_primary, source_system)
+        VALUES (%s, 'mailing', %s, %s, %s, %s, %s, %s, %s, true, %s)
         """,
-        (participant_id, address_raw, SOURCE_SYSTEM),
+        (
+            participant_id,
+            parsed.line1,
+            parsed.line2,
+            parsed.city,
+            parsed.state,
+            parsed.postal_code,
+            normalize_country_code(parsed.country_code),
+            address_raw,
+            SOURCE_SYSTEM,
+        ),
     )
     counters.addresses_inserted += 1
 
@@ -667,27 +717,54 @@ def _upsert_address_structured(
     counters: RunCounters,
 ) -> None:
     """Upsert a structured address into participant_address."""
+    postal = normalize_postal_code_for_storage(postal, "US")
     parts = [p for p in [line1, line2, city, state, postal] if p]
     if not parts:
         return
     address_raw = " | ".join(parts)
     existing = conn.execute(
         """
-        SELECT id FROM participant_address
+        SELECT id, line1, line2, city, state, postal_code, country_code
+        FROM participant_address
         WHERE participant_id = %s AND address_raw = %s
         """,
         (participant_id, address_raw),
     ).fetchone()
     if existing:
+        conn.execute(
+            """
+            UPDATE participant_address
+            SET
+                line1 = COALESCE(line1, %s),
+                line2 = COALESCE(line2, %s),
+                city = COALESCE(city, %s),
+                state = COALESCE(state, %s),
+                postal_code = COALESCE(postal_code, %s),
+                country_code = COALESCE(country_code, %s),
+                updated_at = now()
+            WHERE id = %s
+            """,
+            (line1, line2, city, state, postal, "US", existing[0]),
+        )
         return
     conn.execute(
         """
         INSERT INTO participant_address
-          (participant_id, address_type, line1, city, state,
-           postal_code, address_raw, is_primary, source_system)
-        VALUES (%s, 'mailing', %s, %s, %s, %s, %s, true, %s)
+          (participant_id, address_type, line1, line2, city, state,
+           postal_code, country_code, address_raw, is_primary, source_system)
+        VALUES (%s, 'mailing', %s, %s, %s, %s, %s, %s, %s, true, %s)
         """,
-        (participant_id, line1, city, state, postal, address_raw, SOURCE_SYSTEM),
+        (
+            participant_id,
+            line1,
+            line2,
+            city,
+            state,
+            postal,
+            "US",
+            address_raw,
+            SOURCE_SYSTEM,
+        ),
     )
     counters.addresses_inserted += 1
 

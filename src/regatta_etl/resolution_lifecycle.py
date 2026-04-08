@@ -42,7 +42,18 @@ import psycopg
 # ---------------------------------------------------------------------------
 
 _PROVENANCE_ATTRS: dict[str, list[str]] = {
-    "participant":  ["display_name", "normalized_name", "date_of_birth", "best_email", "best_phone"],
+    "participant":  [
+        "display_name",
+        "normalized_name",
+        "first_name",
+        "middle_name",
+        "last_name",
+        "name_prefix",
+        "name_suffix",
+        "date_of_birth",
+        "best_email",
+        "best_phone",
+    ],
     "yacht":        ["name", "normalized_name", "sail_number", "normalized_sail_number",
                      "length_feet", "yacht_type"],
     "club":         ["name", "normalized_name", "website", "phone", "address_raw", "state_usa"],
@@ -54,7 +65,8 @@ _PROVENANCE_ATTRS: dict[str, list[str]] = {
 # Column lists for cloning a canonical row (excludes id, timestamps)
 _CLONE_COLS: dict[str, str] = {
     "participant":  (
-        "display_name, normalized_name, first_name, last_name, date_of_birth, "
+        "display_name, normalized_name, first_name, middle_name, last_name, "
+        "name_prefix, name_suffix, date_of_birth, "
         "best_email, best_phone, canonical_confidence_score"
     ),
     "yacht":        (
@@ -357,12 +369,13 @@ def _merge_canonical_participant_children(
     conn.execute(
         """
         INSERT INTO canonical_participant_address
-            (canonical_participant_id, address_raw, line1, city, state,
+            (canonical_participant_id, address_raw, line1, line2, city, state,
              postal_code, country_code, is_primary)
         SELECT DISTINCT
             %s::uuid,
             a.address_raw,
             a.line1,
+            a.line2,
             a.city,
             a.state,
             a.postal_code,
@@ -378,6 +391,35 @@ def _merge_canonical_participant_children(
           )
         """,
         (keep_id, merge_id, keep_id),
+    )
+
+    conn.execute(
+        """
+        UPDATE canonical_participant_address existing
+        SET
+            line1 = COALESCE(existing.line1, src.line1),
+            line2 = COALESCE(existing.line2, src.line2),
+            city = COALESCE(existing.city, src.city),
+            state = COALESCE(existing.state, src.state),
+            postal_code = COALESCE(existing.postal_code, src.postal_code),
+            country_code = COALESCE(existing.country_code, src.country_code),
+            is_primary = existing.is_primary OR src.is_primary,
+            updated_at = now()
+        FROM canonical_participant_address src
+        WHERE src.canonical_participant_id = %s
+          AND existing.canonical_participant_id = %s
+          AND existing.address_raw = src.address_raw
+          AND (
+              (existing.line1 IS NULL AND src.line1 IS NOT NULL)
+              OR (existing.line2 IS NULL AND src.line2 IS NOT NULL)
+              OR (existing.city IS NULL AND src.city IS NOT NULL)
+              OR (existing.state IS NULL AND src.state IS NOT NULL)
+              OR (existing.postal_code IS NULL AND src.postal_code IS NOT NULL)
+              OR (existing.country_code IS NULL AND src.country_code IS NOT NULL)
+              OR (existing.is_primary = false AND src.is_primary = true)
+          )
+        """,
+        (merge_id, keep_id),
     )
 
     conn.execute(

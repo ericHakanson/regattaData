@@ -9,6 +9,7 @@ from regatta_etl.normalize import (
     build_person_display_name,
     is_likely_org_name,
     looks_like_email,
+    normalize_country_code,
     normalize_address_for_identity,
     participant_legacy_comma_lookup_key,
     participant_name_lookup_keys,
@@ -17,12 +18,16 @@ from regatta_etl.normalize import (
     normalize_email,
     normalize_phone,
     normalize_postal_code,
+    normalize_postal_code_for_storage,
     normalize_name,
     normalize_person_name_for_identity,
+    parse_mailing_address_components,
     slug_name,
+    split_address_line1_line2,
     parse_ts,
     parse_date_from_ts,
     parse_numeric,
+    parse_person_name_parts,
     parse_name_parts,
     parse_co_owners,
 )
@@ -164,6 +169,74 @@ class TestNormalizePostalCode:
         assert normalize_postal_code("0402q") is None
 
 
+class TestNormalizeCountryCode:
+    def test_united_states_variants_map_to_us(self):
+        assert normalize_country_code("US") == "US"
+        assert normalize_country_code("usa") == "US"
+        assert normalize_country_code("United States") == "US"
+
+    def test_canada_variants_map_to_ca(self):
+        assert normalize_country_code("CA") == "CA"
+        assert normalize_country_code("can") == "CA"
+        assert normalize_country_code("Canada") == "CA"
+
+
+class TestNormalizePostalCodeForStorage:
+    def test_us_four_digit_zip_is_zero_padded(self):
+        assert normalize_postal_code_for_storage("2748", "US") == "02748"
+
+    def test_us_zip_plus_four_reduces_to_base_zip(self):
+        assert normalize_postal_code_for_storage("04102-2537", "US") == "04102"
+
+    def test_ca_postal_canonical_spacing(self):
+        assert normalize_postal_code_for_storage("m5v3l9", "CA") == "M5V 3L9"
+
+
+class TestSplitAddressLine1Line2:
+    def test_extracts_apartment_suffix(self):
+        line1, line2 = split_address_line1_line2("10 Rogers Rd Apt 308")
+        assert line1 == "10 Rogers Rd"
+        assert line2 == "Apt 308"
+
+    def test_returns_original_when_no_secondary_unit(self):
+        line1, line2 = split_address_line1_line2("185 Craigie Street")
+        assert line1 == "185 Craigie Street"
+        assert line2 is None
+
+
+class TestParseMailingAddressComponents:
+    def test_parses_comma_delimited_us_address(self):
+        parsed = parse_mailing_address_components(
+            "1 Main St, Bar Harbor, ME 04609 US"
+        )
+        assert parsed.line1 == "1 Main St"
+        assert parsed.line2 is None
+        assert parsed.city == "Bar Harbor"
+        assert parsed.state == "ME"
+        assert parsed.postal_code == "04609"
+        assert parsed.country_code == "US"
+
+    def test_parses_line2_and_zero_pads_zip(self):
+        parsed = parse_mailing_address_components(
+            "15 Palmer St Apt 4, Dartmouth, MA 2748 US"
+        )
+        assert parsed.line1 == "15 Palmer St"
+        assert parsed.line2 == "Apt 4"
+        assert parsed.city == "Dartmouth"
+        assert parsed.state == "MA"
+        assert parsed.postal_code == "02748"
+        assert parsed.country_code == "US"
+
+    def test_parses_pipe_delimited_ca_address(self):
+        parsed = parse_mailing_address_components(
+            "123 King St W|Toronto|ON M5V3L9|Canada"
+        )
+        assert parsed.line1 == "123 King St W"
+        assert parsed.city == "Toronto"
+        assert parsed.state == "ON"
+        assert parsed.postal_code == "M5V 3L9"
+        assert parsed.country_code == "CA"
+
 # ---------------------------------------------------------------------------
 # normalize_address_for_identity / addresses_match_for_identity
 # ---------------------------------------------------------------------------
@@ -256,10 +329,9 @@ class TestNormalizePersonNameForIdentity:
         assert result is None
 
     def test_two_commas_suffix(self):
-        # "Last, First, Jr." — split on first comma only:
-        # last="Last", first="First, Jr." → normalize_name strips comma → "first jr last"
+        # Suffix is parsed separately and omitted from the identity key.
         result = normalize_person_name_for_identity("Last, First, Jr.")
-        assert result == "first jr last"
+        assert result == "first last"
 
     def test_non_ascii_normalized(self):
         # Accented chars decomposed and combining marks dropped
@@ -413,6 +485,37 @@ class TestParseNameParts:
 
     def test_email_only_returns_empty_parts(self):
         assert parse_name_parts("alice@example.com") == (None, None)
+
+    def test_hyphenated_last_name(self):
+        first, last = parse_name_parts("Anne-Marie Smith-Jones")
+        assert first == "Anne-Marie"
+        assert last == "Smith-Jones"
+
+    def test_compound_last_name_with_particles(self):
+        first, last = parse_name_parts("Juan de la Cruz")
+        assert first == "Juan"
+        assert last == "de la Cruz"
+
+    def test_prefix_suffix_and_multiple_middle_initials(self):
+        first, last = parse_name_parts("Dr. John A. B. Smith Jr.")
+        assert first == "John A B"
+        assert last == "Smith"
+
+
+class TestParsePersonNameParts:
+    def test_extracts_prefix_middle_and_suffix(self):
+        parsed = parse_person_name_parts("Dr. John A. B. Smith Jr.")
+        assert parsed.first_name == "John"
+        assert parsed.middle_name == "A B"
+        assert parsed.last_name == "Smith"
+        assert parsed.name_prefix == "Dr"
+        assert parsed.name_suffix == "Jr"
+
+    def test_comma_format_with_compound_last_name(self):
+        parsed = parse_person_name_parts("de la Cruz, Juan A.")
+        assert parsed.first_name == "Juan"
+        assert parsed.middle_name == "A"
+        assert parsed.last_name == "de la Cruz"
 
 
 # ---------------------------------------------------------------------------

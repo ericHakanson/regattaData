@@ -245,6 +245,57 @@ def test_mailchimp_email_in_first_name_does_not_persist_as_participant_first_nam
     assert row[2] == "Baker"
 
 
+def test_mailchimp_address_is_structured_when_parseable(db_conn, tmp_path):
+    conn, dsn = db_conn
+
+    sub_path = tmp_path / "subscribed_structured_addr.csv"
+    unsub_path = tmp_path / "unsubscribed_empty.csv"
+    clean_path = tmp_path / "cleaned_empty.csv"
+    rejects_path = tmp_path / "rejects.csv"
+
+    _write_csv(
+        sub_path,
+        SUBSCRIBED_HEADERS,
+        [
+            _make_subscribed_row(
+                email="structured@example.com",
+                address="10 Rogers Rd Apt 308, Freeport, ME  4032    US",
+            )
+        ],
+    )
+    _write_csv(unsub_path, UNSUBSCRIBED_HEADERS, [])
+    _write_csv(clean_path, CLEANED_HEADERS, [])
+
+    _run_mailchimp_audience(
+        run_id=str(uuid.uuid4()),
+        started_at="2026-01-01T00:00:00",
+        db_dsn=dsn,
+        counters=RunCounters(),
+        rejects=RejectWriter(rejects_path),
+        subscribed_path=str(sub_path),
+        unsubscribed_path=str(unsub_path),
+        cleaned_path=str(clean_path),
+        max_reject_rate=0.05,
+        dry_run=False,
+    )
+
+    row = conn.execute(
+        """
+        SELECT line1, line2, city, state, postal_code, country_code
+        FROM participant_address
+        ORDER BY created_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "10 Rogers Rd"
+    assert row[1] == "Apt 308"
+    assert row[2] == "Freeport"
+    assert row[3] == "ME"
+    assert row[4] == "04032"
+    assert row[5] == "US"
+
+
 # ---------------------------------------------------------------------------
 # Test: idempotency — rerun produces zero new logical inserts
 # ---------------------------------------------------------------------------

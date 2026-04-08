@@ -13,6 +13,9 @@ import psycopg
 
 from regatta_etl.normalize import (
     normalize_email,
+    normalize_country_code,
+    parse_mailing_address_components,
+    normalize_postal_code_for_storage,
     normalize_phone,
     normalize_space,
     parse_date,
@@ -131,18 +134,85 @@ def _process_row(
             counters.contact_points_inserted += 1
 
     # Address
-    address_raw = row.get("Address")
-    postal_code = row.get("Postal code")
-    if address_raw or postal_code:
-        address_composite = f"{address_raw or ''}|{postal_code or ''}".strip()
-        existing_address = conn.execute("SELECT id FROM participant_address WHERE participant_id = %s AND address_raw = %s", (participant_id, address_composite)).fetchone()
-        if not existing_address:
+    address_raw = trim(row.get("Address"))
+    parsed_address = parse_mailing_address_components(address_raw, fallback_country_code="US")
+    country_code = normalize_country_code(parsed_address.country_code) or "US"
+    postal_code = parsed_address.postal_code or normalize_postal_code_for_storage(
+        row.get("Postal code"),
+        country_code,
+    )
+    line1 = parsed_address.line1 or address_raw
+    line2 = parsed_address.line2
+    city = parsed_address.city
+    state = parsed_address.state
+    if address_raw or postal_code or line1:
+        address_base = address_raw or " | ".join(
+            part for part in [line1, line2, city, state, country_code] if part
+        )
+        address_composite = f"{address_base}|{postal_code or ''}".strip("|").strip()
+        existing_address = conn.execute(
+            """
+            SELECT id, line1, line2, city, state, postal_code, country_code
+            FROM participant_address
+            WHERE participant_id = %s AND address_raw = %s
+            ORDER BY created_at ASC, id ASC
+            LIMIT 1
+            """,
+            (participant_id, address_composite),
+        ).fetchone()
+        if existing_address:
+            updates_needed = any(
+                [
+                    line1 and not existing_address[1],
+                    line2 and not existing_address[2],
+                    city and not existing_address[3],
+                    state and not existing_address[4],
+                    postal_code and not existing_address[5],
+                    country_code and not existing_address[6],
+                ]
+            )
+            if updates_needed:
+                conn.execute(
+                    """
+                    UPDATE participant_address
+                    SET
+                        line1 = COALESCE(line1, %s),
+                        line2 = COALESCE(line2, %s),
+                        city = COALESCE(city, %s),
+                        state = COALESCE(state, %s),
+                        postal_code = COALESCE(postal_code, %s),
+                        country_code = COALESCE(country_code, %s),
+                        updated_at = now()
+                    WHERE id = %s
+                    """,
+                    (
+                        line1,
+                        line2,
+                        city,
+                        state,
+                        postal_code,
+                        country_code,
+                        existing_address[0],
+                    ),
+                )
+        else:
             conn.execute(
                 """
-                INSERT INTO participant_address (participant_id, address_type, line1, postal_code, address_raw, is_primary, source_system)
-                VALUES (%s, 'mailing', %s, %s, %s, true, 'jotform_csv_export')
+                INSERT INTO participant_address
+                    (participant_id, address_type, line1, line2, city, state,
+                     postal_code, country_code, address_raw, is_primary, source_system)
+                VALUES (%s, 'mailing', %s, %s, %s, %s, %s, %s, %s, true, 'jotform_csv_export')
                 """,
-                (participant_id, address_raw, postal_code, address_composite)
+                (
+                    participant_id,
+                    line1,
+                    line2,
+                    city,
+                    state,
+                    postal_code,
+                    country_code,
+                    address_composite,
+                ),
             )
             counters.addresses_inserted += 1
     

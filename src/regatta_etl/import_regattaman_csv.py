@@ -46,7 +46,9 @@ import click
 import psycopg
 
 from regatta_etl.normalize import (
+    normalize_country_code,
     normalize_email,
+    normalize_postal_code_for_storage,
     normalize_phone,
     normalize_space,
     parse_co_owners,
@@ -266,8 +268,8 @@ def _upsert_address(
     line1 = trim(row.get("owner_address"))
     city = trim(row.get("City"))
     state = trim(row.get("owner_state"))
-    postal_code = trim(row.get("owner_zip"))
-    country_code = trim(row.get("ccode"))
+    country_code = normalize_country_code(row.get("ccode"))
+    postal_code = normalize_postal_code_for_storage(row.get("owner_zip"), country_code)
 
     components = [c for c in [line1, city, state, postal_code, country_code] if c]
     if not components:

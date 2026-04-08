@@ -147,7 +147,7 @@ def _profile_context(conn: psycopg.Connection, args: dict) -> None:
     ).fetchall()
 
     addresses = conn.execute(
-        "SELECT address_raw, line1, city, state, postal_code, country_code, is_primary "
+        "SELECT address_raw, line1, line2, city, state, postal_code, country_code, is_primary "
         "FROM candidate_participant_address WHERE candidate_participant_id = %s "
         "ORDER BY is_primary DESC, created_at",
         (cid,),
@@ -210,7 +210,7 @@ def _profile_context(conn: psycopg.Connection, args: dict) -> None:
     ).fetchall()
 
     address_patches = conn.execute(
-        "SELECT id, address_raw, line1, city, state, postal_code, actor, status, created_at "
+        "SELECT id, address_raw, line1, line2, city, state, postal_code, actor, status, created_at "
         "FROM manual_participant_address_patch WHERE candidate_participant_id = %s ORDER BY created_at",
         (cid,),
     ).fetchall()
@@ -592,15 +592,15 @@ def _apply_patch(conn: psycopg.Connection, args: dict, dry_run: bool = False) ->
             cur = conn.execute(
                 """
                 INSERT INTO manual_participant_address_patch
-                    (candidate_participant_id, address_raw, line1, city, state,
+                    (candidate_participant_id, address_raw, line1, line2, city, state,
                      postal_code, country_code, is_primary, actor, reason_code, session_id, patch_hash)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (patch_hash) DO NOTHING
                 RETURNING id
                 """,
                 (
                     cid, address_raw,
-                    args.get("line1"), args.get("city"), args.get("state"),
+                    args.get("line1"), args.get("line2"), args.get("city"), args.get("state"),
                     args.get("postal_code"), args.get("country_code"),
                     bool(args.get("is_primary", False)),
                     actor, reason_code, session_id, ph,

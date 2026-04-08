@@ -30,8 +30,10 @@ import psycopg
 from regatta_etl.normalize import (
     build_person_display_name,
     is_likely_org_name,
+    looks_like_email,
     normalize_person_name_for_identity,
-    parse_name_parts,
+    parse_person_name_parts,
+    trim,
 )
 from regatta_etl.resolution_lifecycle import _write_provenance
 
@@ -157,23 +159,34 @@ def _insert_canonical_participant(conn: psycopg.Connection, pk: str) -> str:
         """,
         (pk,),
     ).fetchone()
-    first_name, last_name = parse_name_parts(candidate_row[0] if candidate_row else None)
-    display_name = build_person_display_name(first_name, last_name)
+    raw_display_name = trim(candidate_row[0] if candidate_row else None)
+    parsed = parse_person_name_parts(raw_display_name)
+    given_name = " ".join(p for p in [parsed.first_name, parsed.middle_name] if p) or None
+    fallback_display_name = build_person_display_name(given_name, parsed.last_name)
+    display_name = (
+        raw_display_name
+        if raw_display_name and "@" not in raw_display_name and not looks_like_email(raw_display_name)
+        else fallback_display_name
+    )
     normalized_name = normalize_person_name_for_identity(display_name)
     row = conn.execute(
         """
         INSERT INTO canonical_participant
-            (display_name, normalized_name, first_name, last_name,
+            (display_name, normalized_name, first_name, middle_name, last_name,
+             name_prefix, name_suffix,
              date_of_birth, best_email, best_phone,
              canonical_confidence_score)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
             display_name,
             normalized_name,
-            first_name,
-            last_name,
+            parsed.first_name,
+            parsed.middle_name,
+            parsed.last_name,
+            parsed.name_prefix,
+            parsed.name_suffix,
             candidate_row[1] if candidate_row else None,
             candidate_row[2] if candidate_row else None,
             candidate_row[3] if candidate_row else None,
@@ -196,8 +209,15 @@ def _sync_canonical_participant_fields(
         """,
         (candidate_participant_id,),
     ).fetchone()
-    first_name, last_name = parse_name_parts(candidate_row[0] if candidate_row else None)
-    display_name = build_person_display_name(first_name, last_name)
+    raw_display_name = trim(candidate_row[0] if candidate_row else None)
+    parsed = parse_person_name_parts(raw_display_name)
+    given_name = " ".join(p for p in [parsed.first_name, parsed.middle_name] if p) or None
+    fallback_display_name = build_person_display_name(given_name, parsed.last_name)
+    display_name = (
+        raw_display_name
+        if raw_display_name and "@" not in raw_display_name and not looks_like_email(raw_display_name)
+        else fallback_display_name
+    )
     normalized_name = normalize_person_name_for_identity(display_name)
     conn.execute(
         """
@@ -215,18 +235,65 @@ def _sync_canonical_participant_fields(
                 ELSE canonical_participant.normalized_name
             END,
             first_name = CASE
-                WHEN canonical_participant.first_name IS NULL
-                  OR canonical_participant.first_name ~* '^[^[:space:]@]+@[^[:space:]@]+\\.[^[:space:]@]+$'
-                  OR canonical_participant.display_name LIKE '%%@%%'
+                WHEN (
+                    canonical_participant.first_name IS NULL
+                    OR canonical_participant.first_name ~* '^[^[:space:]@]+@[^[:space:]@]+\\.[^[:space:]@]+$'
+                    OR canonical_participant.display_name LIKE '%%@%%'
+                ) AND (
+                    canonical_participant.display_name IS NULL
+                    OR %s::text IS NULL
+                    OR canonical_participant.display_name = %s
+                    OR canonical_participant.display_name LIKE '%%@%%'
+                )
                 THEN %s
                 ELSE canonical_participant.first_name
             END,
+            middle_name = CASE
+                WHEN canonical_participant.middle_name IS NULL
+                  AND (
+                    canonical_participant.display_name IS NULL
+                    OR %s::text IS NULL
+                    OR canonical_participant.display_name = %s
+                    OR canonical_participant.display_name LIKE '%%@%%'
+                  )
+                THEN %s
+                ELSE canonical_participant.middle_name
+            END,
             last_name = CASE
-                WHEN canonical_participant.last_name IS NULL
-                  OR canonical_participant.last_name ~* '^[^[:space:]@]+@[^[:space:]@]+\\.[^[:space:]@]+$'
-                  OR canonical_participant.display_name LIKE '%%@%%'
+                WHEN (
+                    canonical_participant.last_name IS NULL
+                    OR canonical_participant.last_name ~* '^[^[:space:]@]+@[^[:space:]@]+\\.[^[:space:]@]+$'
+                    OR canonical_participant.display_name LIKE '%%@%%'
+                ) AND (
+                    canonical_participant.display_name IS NULL
+                    OR %s::text IS NULL
+                    OR canonical_participant.display_name = %s
+                    OR canonical_participant.display_name LIKE '%%@%%'
+                )
                 THEN %s
                 ELSE canonical_participant.last_name
+            END,
+            name_prefix = CASE
+                WHEN canonical_participant.name_prefix IS NULL
+                  AND (
+                    canonical_participant.display_name IS NULL
+                    OR %s::text IS NULL
+                    OR canonical_participant.display_name = %s
+                    OR canonical_participant.display_name LIKE '%%@%%'
+                  )
+                THEN %s
+                ELSE canonical_participant.name_prefix
+            END,
+            name_suffix = CASE
+                WHEN canonical_participant.name_suffix IS NULL
+                  AND (
+                    canonical_participant.display_name IS NULL
+                    OR %s::text IS NULL
+                    OR canonical_participant.display_name = %s
+                    OR canonical_participant.display_name LIKE '%%@%%'
+                  )
+                THEN %s
+                ELSE canonical_participant.name_suffix
             END,
             date_of_birth = COALESCE(canonical_participant.date_of_birth, %s),
             best_email = COALESCE(canonical_participant.best_email, %s),
@@ -237,8 +304,21 @@ def _sync_canonical_participant_fields(
         (
             display_name,
             normalized_name,
-            first_name,
-            last_name,
+            display_name,
+            display_name,
+            parsed.first_name,
+            display_name,
+            display_name,
+            parsed.middle_name,
+            display_name,
+            display_name,
+            parsed.last_name,
+            display_name,
+            display_name,
+            parsed.name_prefix,
+            display_name,
+            display_name,
+            parsed.name_suffix,
             candidate_row[1] if candidate_row else None,
             candidate_row[2] if candidate_row else None,
             candidate_row[3] if candidate_row else None,
@@ -302,12 +382,13 @@ def _sync_canonical_participant_children(
     conn.execute(
         """
         INSERT INTO canonical_participant_address
-            (canonical_participant_id, address_raw, line1, city, state,
+            (canonical_participant_id, address_raw, line1, line2, city, state,
              postal_code, country_code, is_primary)
         SELECT DISTINCT
             %s::uuid,
             a.address_raw,
             a.line1,
+            a.line2,
             a.city,
             a.state,
             a.postal_code,
@@ -323,6 +404,37 @@ def _sync_canonical_participant_children(
           )
         """,
         (canonical_participant_id, candidate_participant_id, canonical_participant_id),
+    )
+
+    # Fill null structured attributes on existing canonical address rows when
+    # the candidate side has better data for the same address_raw.
+    conn.execute(
+        """
+        UPDATE canonical_participant_address existing
+        SET
+            line1 = COALESCE(existing.line1, src.line1),
+            line2 = COALESCE(existing.line2, src.line2),
+            city = COALESCE(existing.city, src.city),
+            state = COALESCE(existing.state, src.state),
+            postal_code = COALESCE(existing.postal_code, src.postal_code),
+            country_code = COALESCE(existing.country_code, src.country_code),
+            is_primary = existing.is_primary OR src.is_primary,
+            updated_at = now()
+        FROM candidate_participant_address src
+        WHERE src.candidate_participant_id = %s
+          AND existing.canonical_participant_id = %s
+          AND existing.address_raw = src.address_raw
+          AND (
+              (existing.line1 IS NULL AND src.line1 IS NOT NULL)
+              OR (existing.line2 IS NULL AND src.line2 IS NOT NULL)
+              OR (existing.city IS NULL AND src.city IS NOT NULL)
+              OR (existing.state IS NULL AND src.state IS NOT NULL)
+              OR (existing.postal_code IS NULL AND src.postal_code IS NOT NULL)
+              OR (existing.country_code IS NULL AND src.country_code IS NOT NULL)
+              OR (existing.is_primary = false AND src.is_primary = true)
+          )
+        """,
+        (candidate_participant_id, canonical_participant_id),
     )
 
     conn.execute(

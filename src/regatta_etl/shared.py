@@ -21,11 +21,11 @@ from regatta_etl.normalize import (
     looks_like_email,
     normalize_email,
     normalize_name,
+    parse_person_name_parts,
     participant_legacy_comma_lookup_key,
     participant_name_lookup_keys,
     normalize_person_name_for_identity,
     normalize_space,
-    parse_name_parts,
     slug_name,
     trim,
 )
@@ -350,18 +350,29 @@ def insert_participant(
     full_name: str,
 ) -> str:
     raw_full_name = normalize_space(full_name)
-    first, last = parse_name_parts(raw_full_name)
-    clean_full_name = build_person_display_name(first, last) or raw_full_name
+    parts = parse_person_name_parts(raw_full_name)
+    given_name = " ".join(p for p in [parts.first_name, parts.middle_name] if p) or None
+    clean_full_name = build_person_display_name(given_name, parts.last_name) or raw_full_name
     norm = normalize_person_name_for_identity(clean_full_name)
     if norm is None and raw_full_name:
         norm = normalize_email(raw_full_name) if looks_like_email(raw_full_name) else normalize_name(raw_full_name)
     row = conn.execute(
         """
-        INSERT INTO participant (full_name, normalized_full_name, first_name, last_name)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO participant
+            (full_name, normalized_full_name, first_name, middle_name, last_name,
+             name_prefix, name_suffix)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
-        (clean_full_name, norm, first, last),
+        (
+            clean_full_name,
+            norm,
+            parts.first_name,
+            parts.middle_name,
+            parts.last_name,
+            parts.name_prefix,
+            parts.name_suffix,
+        ),
     ).fetchone()
     return str(row[0])
 

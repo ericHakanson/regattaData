@@ -48,10 +48,11 @@ import requests
 from bs4 import BeautifulSoup
 
 from regatta_etl.normalize import (
+    normalize_country_code,
     normalize_email,
     normalize_person_name_for_identity,
     normalize_phone,
-    normalize_postal_code,
+    normalize_postal_code_for_storage,
     normalize_space,
     slug_name,
     trim,
@@ -780,11 +781,12 @@ def _try_parse_address_raw(raw: str, addr: dict[str, Any]) -> None:
         tail = parts[-1].split()
         if len(tail) >= 2:
             addr["state"] = tail[0]
-            # FOR-218: normalize_postal_code zero-pads 4-digit codes (e.g. ME/MA exports
-            # from Excel drop the leading zero: "4538" → "04538").
-            addr["postal_code"] = normalize_postal_code(tail[1])
             if len(tail) >= 3:
-                addr["country_code"] = tail[2]
+                addr["country_code"] = normalize_country_code(tail[2])
+            addr["postal_code"] = normalize_postal_code_for_storage(
+                tail[1],
+                addr.get("country_code"),
+            )
     elif len(parts) == 2:
         addr["line1"] = parts[0]
         addr["city"] = parts[1]
@@ -1283,10 +1285,8 @@ def _build_csv_address(
     line1 = " ".join([p for p in line_parts if p]).strip()
     city = trim(city)
     state = trim(state)
-    # FOR-218: normalize_postal_code zero-pads 4-digit codes exported from Excel without
-    # the leading zero (e.g. ME/MA ZIPs "4538" → "04538").
-    postal_code = normalize_postal_code(trim(postal_code))
-    country_code = trim(country_code)
+    country_code = normalize_country_code(trim(country_code))
+    postal_code = normalize_postal_code_for_storage(trim(postal_code), country_code)
     raw = _compose_address_raw(line1, city, state, postal_code, country_code)
     if not raw:
         return None

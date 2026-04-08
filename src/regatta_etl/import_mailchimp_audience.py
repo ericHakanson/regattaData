@@ -32,6 +32,8 @@ from regatta_etl.normalize import (
     addresses_match_for_identity,
     looks_like_email,
     normalize_email,
+    normalize_country_code,
+    parse_mailing_address_components,
     participant_legacy_comma_lookup_key,
     participant_name_lookup_keys,
     normalize_phone,
@@ -595,24 +597,77 @@ def _upsert_address(
     conn: psycopg.Connection,
     participant_id: str,
     address_raw: str,
+    country_hint: str | None,
     counters: RunCounters,
 ) -> None:
+    parsed = parse_mailing_address_components(
+        address_raw,
+        fallback_country_code=country_hint,
+    )
     existing = conn.execute(
         """
-        SELECT id FROM participant_address
+        SELECT id, line1, line2, city, state, postal_code, country_code
+        FROM participant_address
         WHERE participant_id = %s AND address_raw = %s
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
         """,
         (participant_id, address_raw),
     ).fetchone()
     if existing:
+        updates_needed = any(
+            [
+                parsed.line1 and not existing[1],
+                parsed.line2 and not existing[2],
+                parsed.city and not existing[3],
+                parsed.state and not existing[4],
+                parsed.postal_code and not existing[5],
+                parsed.country_code and not existing[6],
+            ]
+        )
+        if updates_needed:
+            conn.execute(
+                """
+                UPDATE participant_address
+                SET
+                    line1 = COALESCE(line1, %s),
+                    line2 = COALESCE(line2, %s),
+                    city = COALESCE(city, %s),
+                    state = COALESCE(state, %s),
+                    postal_code = COALESCE(postal_code, %s),
+                    country_code = COALESCE(country_code, %s),
+                    updated_at = now()
+                WHERE id = %s
+                """,
+                (
+                    parsed.line1,
+                    parsed.line2,
+                    parsed.city,
+                    parsed.state,
+                    parsed.postal_code,
+                    parsed.country_code or normalize_country_code(country_hint),
+                    existing[0],
+                ),
+            )
         return
     conn.execute(
         """
         INSERT INTO participant_address
-          (participant_id, address_type, address_raw, is_primary, source_system)
-        VALUES (%s, 'mailing', %s, true, %s)
+          (participant_id, address_type, line1, line2, city, state,
+           postal_code, country_code, address_raw, is_primary, source_system)
+        VALUES (%s, 'mailing', %s, %s, %s, %s, %s, %s, %s, true, %s)
         """,
-        (participant_id, address_raw, SOURCE_SYSTEM),
+        (
+            participant_id,
+            parsed.line1,
+            parsed.line2,
+            parsed.city,
+            parsed.state,
+            parsed.postal_code,
+            parsed.country_code or normalize_country_code(country_hint),
+            address_raw,
+            SOURCE_SYSTEM,
+        ),
     )
     counters.addresses_inserted += 1
 
@@ -816,10 +871,16 @@ def _process_row(
         if phone_norm:
             _upsert_phone_contact_point(conn, participant_id, phone_raw, phone_norm, counters)
 
-    # Step 9: address (raw only, optional)
+    # Step 9: address (raw + best-effort structured parse, optional)
     address_raw = trim(row.get("Address"))
     if address_raw:
-        _upsert_address(conn, participant_id, address_raw, counters)
+        _upsert_address(
+            conn,
+            participant_id,
+            address_raw,
+            trim(row.get("CC")),
+            counters,
+        )
 
     # Step 10: mailchimp_contact_state (append-only, idempotent by row_hash)
     _insert_mailchimp_state(

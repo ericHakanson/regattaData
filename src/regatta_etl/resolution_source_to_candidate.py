@@ -71,9 +71,11 @@ from regatta_etl.normalize import (
     normalize_name,
     normalize_person_name_for_identity,
     normalize_phone,
+    parse_mailing_address_components,
     parse_name_parts,
     parse_race_url,
     slug_name,
+    split_address_line1_line2,
     trim,
 )
 
@@ -419,6 +421,7 @@ def _upsert_address(
     source_table: str,
     source_pk: str,
     line1: str | None = None,
+    line2: str | None = None,
     city: str | None = None,
     state: str | None = None,
     postal_code: str | None = None,
@@ -426,18 +429,45 @@ def _upsert_address(
     is_primary: bool = False,
 ) -> None:
     """Upsert a candidate_participant_address row (idempotent via unique index on address_raw)."""
+    line1_split, inferred_line2 = split_address_line1_line2(line1)
+    parsed = parse_mailing_address_components(
+        address_raw,
+        fallback_country_code=country_code,
+    )
+    merged_line1 = line1_split or parsed.line1
+    merged_line2 = line2 or inferred_line2 or parsed.line2
+    merged_city = city or parsed.city
+    merged_state = state or parsed.state
+    merged_postal = postal_code or parsed.postal_code
+    merged_country = country_code or parsed.country_code
+
     conn.execute(
         """
         INSERT INTO candidate_participant_address
-            (candidate_participant_id, address_raw, line1, city, state,
+            (candidate_participant_id, address_raw, line1, line2, city, state,
              postal_code, country_code, is_primary, source_table_name, source_row_pk)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (candidate_participant_id, address_raw) DO NOTHING
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (candidate_participant_id, address_raw) DO UPDATE
+            SET line1 = COALESCE(candidate_participant_address.line1, EXCLUDED.line1),
+                line2 = COALESCE(candidate_participant_address.line2, EXCLUDED.line2),
+                city = COALESCE(candidate_participant_address.city, EXCLUDED.city),
+                state = COALESCE(candidate_participant_address.state, EXCLUDED.state),
+                postal_code = COALESCE(candidate_participant_address.postal_code, EXCLUDED.postal_code),
+                country_code = COALESCE(candidate_participant_address.country_code, EXCLUDED.country_code),
+                is_primary = candidate_participant_address.is_primary OR EXCLUDED.is_primary,
+                source_table_name = COALESCE(candidate_participant_address.source_table_name, EXCLUDED.source_table_name),
+                source_row_pk = COALESCE(candidate_participant_address.source_row_pk, EXCLUDED.source_row_pk),
+                updated_at = now()
         """,
         (
             candidate_participant_id,
             address_raw,
-            line1, city, state, postal_code, country_code,
+            merged_line1,
+            merged_line2,
+            merged_city,
+            merged_state,
+            merged_postal,
+            merged_country,
             is_primary,
             source_table,
             source_pk,
@@ -808,7 +838,7 @@ def _ingest_participants_from_participant_table(
     rows = conn.execute(
         """
         SELECT p.id, p.full_name, p.normalized_full_name, p.date_of_birth,
-               p.first_name, p.last_name
+               p.first_name, p.middle_name, p.last_name
         FROM participant p
         ORDER BY p.created_at
         """
@@ -833,7 +863,7 @@ def _ingest_participants_from_participant_table(
 
     address_rows = conn.execute(
         """
-        SELECT participant_id::text, id, address_raw, line1, city, state,
+        SELECT participant_id::text, id, address_raw, line1, line2, city, state,
                postal_code, country_code, is_primary
         FROM participant_address
         ORDER BY participant_id, created_at ASC, id ASC
@@ -848,7 +878,10 @@ def _ingest_participants_from_participant_table(
 
     for row in rows:
         pk = str(row[0])
-        display_name = build_person_display_name(row[4], row[5])
+        given_name = " ".join(
+            part for part in [trim(row[4]), trim(row[5])] if part
+        ) or None
+        display_name = build_person_display_name(given_name, row[6])
         if display_name is None:
             raw_full_name = trim(row[1])
             if raw_full_name and "@" not in raw_full_name and not looks_like_email(raw_full_name):
@@ -928,9 +961,13 @@ def _ingest_participants_from_participant_table(
                         address_raw=a[2],
                         source_table="participant_address",
                         source_pk=str(a[1]),
-                        line1=a[3], city=a[4], state=a[5],
-                        postal_code=a[6], country_code=a[7],
-                        is_primary=bool(a[8]),
+                        line1=a[3],
+                        line2=a[4],
+                        city=a[5],
+                        state=a[6],
+                        postal_code=a[7],
+                        country_code=a[8],
+                        is_primary=bool(a[9]),
                     )
                     ctrs.participant_addresses_linked += 1
 
@@ -1182,7 +1219,7 @@ def _ingest_participants_from_mailchimp(
             # ── Step 4: Address child evidence from participant_address ────────
             addr_rows = conn.execute(
                 """
-                SELECT id, address_raw, line1, city, state, postal_code, country_code, is_primary
+                SELECT id, address_raw, line1, line2, city, state, postal_code, country_code, is_primary
                 FROM participant_address
                 WHERE participant_id = %s
                 ORDER BY created_at ASC
@@ -1196,9 +1233,13 @@ def _ingest_participants_from_mailchimp(
                         address_raw=ar[1],
                         source_table="participant_address",
                         source_pk=str(ar[0]),
-                        line1=ar[2], city=ar[3], state=ar[4],
-                        postal_code=ar[5], country_code=ar[6],
-                        is_primary=bool(ar[7]),
+                        line1=ar[2],
+                        line2=ar[3],
+                        city=ar[4],
+                        state=ar[5],
+                        postal_code=ar[6],
+                        country_code=ar[7],
+                        is_primary=bool(ar[8]),
                     )
                     ctrs.participant_addresses_linked += 1
 
@@ -2226,7 +2267,7 @@ def _ingest_addresses_from_manual_patches(
     """Ingest active manual_participant_address_patch rows into candidate_participant_address."""
     rows = conn.execute(
         """
-        SELECT id, candidate_participant_id, address_raw, line1, city, state,
+        SELECT id, candidate_participant_id, address_raw, line1, line2, city, state,
                postal_code, country_code, is_primary
         FROM manual_participant_address_patch
         WHERE status = 'active'
@@ -2246,11 +2287,12 @@ def _ingest_addresses_from_manual_patches(
             conn.execute(
                 """
                 INSERT INTO candidate_participant_address
-                    (candidate_participant_id, address_raw, line1, city, state,
+                    (candidate_participant_id, address_raw, line1, line2, city, state,
                      postal_code, country_code, is_primary, source_table_name, source_row_pk)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (candidate_participant_id, address_raw) DO UPDATE
                     SET line1        = COALESCE(EXCLUDED.line1,        candidate_participant_address.line1),
+                        line2        = COALESCE(EXCLUDED.line2,        candidate_participant_address.line2),
                         city         = COALESCE(EXCLUDED.city,         candidate_participant_address.city),
                         state        = COALESCE(EXCLUDED.state,        candidate_participant_address.state),
                         postal_code  = COALESCE(EXCLUDED.postal_code,  candidate_participant_address.postal_code),
@@ -2262,7 +2304,7 @@ def _ingest_addresses_from_manual_patches(
                 """,
                 (
                     candidate_id, address_raw,
-                    row[3], row[4], row[5], row[6], row[7], bool(row[8]),
+                    row[3], row[4], row[5], row[6], row[7], row[8], bool(row[9]),
                     "manual_participant_address_patch", pk,
                 ),
             )
@@ -2936,7 +2978,7 @@ def run_under_combination_remediation(
                 # 3. Transfer candidate_participant_address rows
                 addresses = conn.execute(
                     """
-                    SELECT address_raw, line1, city, state, postal_code, country_code,
+                    SELECT address_raw, line1, line2, city, state, postal_code, country_code,
                            is_primary, source_table_name, source_row_pk
                     FROM candidate_participant_address
                     WHERE candidate_participant_id = %s
@@ -2948,13 +2990,25 @@ def run_under_combination_remediation(
                         conn.execute(
                             """
                             INSERT INTO candidate_participant_address
-                                (candidate_participant_id, address_raw, line1, city, state,
+                                (candidate_participant_id, address_raw, line1, line2, city, state,
                                  postal_code, country_code, is_primary,
                                  source_table_name, source_row_pk)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT (candidate_participant_id, address_raw) DO NOTHING
                             """,
-                            (winner_id, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]),
+                            (
+                                winner_id,
+                                a[0],
+                                a[1],
+                                a[2],
+                                a[3],
+                                a[4],
+                                a[5],
+                                a[6],
+                                a[7],
+                                a[8],
+                                a[9],
+                            ),
                         )
                     ctrs.addresses_transferred += 1
 
