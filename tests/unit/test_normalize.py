@@ -203,6 +203,11 @@ class TestSplitAddressLine1Line2:
         assert line1 == "185 Craigie Street"
         assert line2 is None
 
+    def test_does_not_treat_ste_prefix_inside_word_as_suite(self):
+        line1, line2 = split_address_line1_line2("9 Steele Ave Annapolis")
+        assert line1 == "9 Steele Ave Annapolis"
+        assert line2 is None
+
 
 class TestParseMailingAddressComponents:
     def test_parses_comma_delimited_us_address(self):
@@ -267,6 +272,60 @@ class TestParseMailingAddressComponents:
             fallback_country_code="US",
         )
         assert parsed.state == "MA"
+        assert parsed.country_code == "US"
+
+    @pytest.mark.parametrize(
+        ("raw", "line1", "line2", "city", "state", "postal_code"),
+        [
+            (
+                "185 Craigie Street Portland, ME|04102-2537",
+                "185 Craigie Street",
+                None,
+                "Portland",
+                "ME",
+                "04102",
+            ),
+            (
+                "47 Cogswell Avenue Cambridge, MA|02140",
+                "47 Cogswell Avenue",
+                None,
+                "Cambridge",
+                "MA",
+                "02140",
+            ),
+            (
+                "165 Tremont Street - Unit 1801 Boston, MA|02111",
+                "165 Tremont Street -",
+                "Unit 1801",
+                "Boston",
+                "MA",
+                "02111",
+            ),
+            (
+                "9 Steele Ave Annapolis, MD|21401",
+                "9 Steele Ave",
+                None,
+                "Annapolis",
+                "MD",
+                "21401",
+            ),
+        ],
+    )
+    def test_parses_pipe_with_city_state_embedded_in_first_segment(
+        self,
+        raw: str,
+        line1: str,
+        line2: str | None,
+        city: str,
+        state: str,
+        postal_code: str,
+    ):
+        parsed = parse_mailing_address_components(raw, fallback_country_code="US")
+        assert parsed.line1 == line1
+        assert parsed.line2 == line2
+        assert parsed.city == city
+        assert parsed.state == state
+        assert parsed.postal_code == postal_code
         assert parsed.country_code == "US"
 
 # ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ _NAME_TOKEN_CLEAN_RE = re.compile(r"^[\s,]+|[\s,]+$")
 _NAME_INITIAL_RE = re.compile(r"^[A-Za-z]\.?$")
 _ADDRESS_UNIT_RE = re.compile(
     r"^(?P<line1>.*?)(?:\s+(?P<line2>"
-    r"(?:apt|apartment|unit|suite|ste|floor|fl|#)\s*[A-Za-z0-9\-\/]+.*"
+    r"(?:(?:apt|apartment|unit|suite|ste\.?|floor|fl)\b|#)\s*[A-Za-z0-9\-\/]+.*"
     r"))$",
     re.IGNORECASE,
 )
@@ -204,6 +204,7 @@ _CA_PROVINCE_NAME_TO_CODE: dict[str, str] = {
     "saskatchewan": "SK",
     "yukon": "YT",
 }
+_STATE_OR_PROVINCE_CODES = set(_US_STATE_NAME_TO_CODE.values()) | set(_CA_PROVINCE_NAME_TO_CODE.values())
 
 
 @dataclass(frozen=True)
@@ -551,7 +552,7 @@ def _parse_overloaded_address_line(
         return None
 
     country = normalize_country_code(fallback_country_code)
-    compact = re.sub(r"\s*,\s*", " ", text).strip()
+    compact = re.sub(r"\s*[|,]\s*", " ", text).strip()
     tokens = [tok for tok in compact.split() if tok]
     if len(tokens) < 3:
         return None
@@ -713,19 +714,37 @@ def parse_mailing_address_components(
     if not line1:
         line1 = line1_raw
 
+    city_token = _normalize_token_alpha_upper(city)
+    state_token = _normalize_token_alpha_upper(state)
+    city_looks_like_state_code = bool(
+        city_token
+        and len(city_token) == 2
+        and city_token in _STATE_OR_PROVINCE_CODES
+    )
+    suspicious_city_state = bool(
+        city_looks_like_state_code
+        and (
+            not state_token
+            or city_token == state_token
+        )
+    )
+
     needs_fallback = (
         not city
         or not state
         or _looks_like_unit_prefix(city)
+        or suspicious_city_state
     )
     if needs_fallback:
         overloaded = _parse_overloaded_address_line(text, fallback_country_code=country)
         if overloaded:
             line1 = overloaded.line1 or line1
-            if not city or _looks_like_unit_prefix(city):
+            if not city or _looks_like_unit_prefix(city) or suspicious_city_state:
                 city = overloaded.city or city
             if overloaded.line2:
                 if not line2:
+                    line2 = overloaded.line2
+                elif suspicious_city_state:
                     line2 = overloaded.line2
                 elif city and normalize_space(line2).lower().endswith(normalize_space(city).lower()):
                     line2 = overloaded.line2
