@@ -22,6 +22,12 @@ artifacts/qa/*
 !artifacts/qa/.gitkeep
 artifacts/exports/*
 !artifacts/exports/.gitkeep
+artifacts/logs/*
+!artifacts/logs/.gitkeep
+
+# Local audience dataset dumps
+audience_export_*/
+audience_export_*.zip
 
 # Migration smoke logs
 migrations/tests/logs/*
