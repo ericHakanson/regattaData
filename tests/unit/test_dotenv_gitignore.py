@@ -25,7 +25,9 @@ import pytest
 
 # A dotenv secret is `.env` or `.env.<x>` as the final path component, at any depth —
 # but never a `.env.example` template. Evaluated against the full relative path.
-_SECRET_DOTENV_RE = re.compile(r"(?:^|/)\.env(?:\.[^/]+)?$")
+# `[^/]*` (zero-or-more) mirrors the gitignore glob `**/.env.*`, which also matches a
+# trailing-dot name like `.env.` (empty suffix).
+_SECRET_DOTENV_RE = re.compile(r"(?:^|/)\.env(?:\.[^/]*)?$")
 _ENV_EXAMPLE_RE = re.compile(r"(?:^|/)\.env\.example$")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -119,6 +121,8 @@ def _is_secret_dotenv_path(rel_path: str) -> bool:
         (".env", True),
         (".env.local", True),
         (".env.production", True),
+        (".env.", True),                 # trailing-dot: gitignore `.env.*` matches it
+        ("services/api/.env.", True),
         ("services/api/.env", True),
         ("deep/nested/dir/.env.production", True),
         (".env.example", False),
