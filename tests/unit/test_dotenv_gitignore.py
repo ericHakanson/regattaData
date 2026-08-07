@@ -167,6 +167,13 @@ def _is_secret_dotenv_path(rel_path: str) -> bool:
         ("services/api/.env.example", False),
         ("README.env", False),      # not a dotenv secret (no leading-dot .env segment)
         ("config/env.sample", False),  # `env`, not `.env`
+        # Boundary cases: `.env` must be the FINAL path component.
+        (".envx", False),               # `.envx` is not `.env`
+        (".env.backup/file", False),    # `.env.backup` is a dir, not the final leaf
+        ("dir/.env.local", True),
+        # `.env.example.bak` is NOT the pristine template — gitignore `**/.env.*`
+        # ignores it, so it must be treated as a secret if ever tracked.
+        ("foo/.env.example.bak", True),
     ],
 )
 def test_secret_dotenv_path_predicate(path: str, is_secret: bool) -> None:
