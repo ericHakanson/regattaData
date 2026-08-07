@@ -30,11 +30,12 @@ import pytest
 _SECRET_DOTENV_RE = re.compile(r"(?:^|/)\.env(?:\.[^/]*)?$")
 _ENV_EXAMPLE_RE = re.compile(r"(?:^|/)\.env\.example$")
 
-def _find_repo_root() -> Path:
+def _find_repo_root() -> Path | None:
     """Locate the repo root robustly, without assuming a fixed parent depth.
 
-    Prefer git's own answer; fall back to walking upward for repo markers
-    (`.gitignore` + `pyproject.toml`); last resort, the conventional depth.
+    Prefer git's own answer; else walk upward for repo markers
+    (`.gitignore` + `pyproject.toml`). Return None if neither works, so the
+    caller skips the module cleanly rather than guessing a directory depth.
     """
     here = Path(__file__).resolve()
     try:
@@ -42,17 +43,23 @@ def _find_repo_root() -> Path:
             ["git", "rev-parse", "--show-toplevel"],
             cwd=here.parent, capture_output=True, text=True, check=True,
         ).stdout.strip()
-        if top:
+        if top and (Path(top) / ".gitignore").exists():
             return Path(top)
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         pass
     for parent in here.parents:
         if (parent / ".gitignore").exists() and (parent / "pyproject.toml").exists():
             return parent
-    return here.parents[2]
+    return None
 
 
 REPO_ROOT = _find_repo_root()
+if REPO_ROOT is None:
+    pytest.skip(
+        "cannot locate repo root (.gitignore + pyproject.toml)",
+        allow_module_level=True,
+    )
+
 GITIGNORE = REPO_ROOT / ".gitignore"
 
 pytestmark = pytest.mark.skipif(
