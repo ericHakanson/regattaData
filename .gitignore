@@ -1,11 +1,10 @@
 # Environment variables — never commit real secrets (e.g. Neon DB_DSN).
-# Ignore every .env variant, but keep the committed template .env.example.
-.env
-.env.*
-.env.local
+# Directory-agnostic: ignore every .env / .env.* at ANY depth; keep .env.example templates.
+**/.env
+**/.env.*
+!**/.env.example
 /env
 env.*
-!.env.example
 
 # Supabase
 .supabase/
