@@ -54,13 +54,25 @@ TRACKED = [
 
 
 def _is_ignored(rel_path: str, *, cwd: Path) -> bool:
-    """0 = ignored, 1 = not ignored; anything else is an error."""
+    """True if git ignores `rel_path` under `cwd`.
+
+    Output-based and portable across git versions: `git check-ignore` prints the
+    matched path and exits 0 when ignored, prints nothing and exits 1 when not
+    ignored. Any other exit code is a genuine invocation error (raised, not silently
+    treated as a pass/fail of the policy).
+    """
     result = subprocess.run(
-        ["git", "check-ignore", "--quiet", "--", rel_path],
-        cwd=cwd,
+        ["git", "check-ignore", "--", rel_path],
+        cwd=cwd, capture_output=True, text=True,
     )
-    assert result.returncode in (0, 1), f"git check-ignore errored for {rel_path}"
-    return result.returncode == 0
+    if result.returncode == 0:
+        return bool(result.stdout.strip())
+    if result.returncode == 1:
+        return False
+    raise RuntimeError(
+        f"git check-ignore failed for {rel_path!r} "
+        f"(exit {result.returncode}): {result.stderr.strip()}"
+    )
 
 
 @pytest.fixture
