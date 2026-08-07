@@ -17,6 +17,9 @@ cp .env.example .env      # then paste your Neon connection string into DB_DSN
 set -a; . ./.env; set +a  # export DB_DSN
 ```
 
+`.env` (and all `.env.*` except `.env.example`) is git-ignored, so your real Neon
+credentials are never committed. Do not remove that `.gitignore` rule.
+
 Neon DSN shape (from the Neon console → Connection Details):
 
 ```

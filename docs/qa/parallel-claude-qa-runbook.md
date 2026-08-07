@@ -24,6 +24,7 @@ Optional DB setup — point `DB_DSN` at Neon (primary DB; see `docs/runbooks/10-
 cp .env.example .env     # paste your Neon connection string into DB_DSN
 set -a; . ./.env; set +a # exports DB_DSN (postgresql://…neon.tech/neondb?sslmode=require)
 ```
+> `.env` (and all `.env.*` except `.env.example`) is git-ignored — real credentials are never committed.
 
 _Legacy Cloud SQL fallback (soak window only):_
 ```bash
