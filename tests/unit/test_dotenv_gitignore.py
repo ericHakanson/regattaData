@@ -87,3 +87,29 @@ def test_example_templates_tracked_at_any_depth(seeded_repo: Path, rel_path: str
 def test_repo_ships_a_real_env_example_template() -> None:
     """Sanity: the committed template actually exists in the repo."""
     assert (REPO_ROOT / ".env.example").exists(), "repo must ship a .env.example template"
+
+
+def _is_secret_dotenv(name: str) -> bool:
+    """A dotenv secret file is `.env` or `.env.<x>`, but never the `.env.example` template."""
+    return (name == ".env" or name.startswith(".env.")) and name != ".env.example"
+
+
+def test_no_secret_dotenv_files_are_tracked() -> None:
+    """`.gitignore` cannot protect files already committed to the index. Guard against
+    that gap directly: no real `.env` / `.env.*` secret file may be tracked at any depth
+    (`.env.example` templates are allowed). If this fails, purge with `git rm --cached`."""
+    inside = subprocess.run(
+        ["git", "rev-parse", "--is-inside-work-tree"],
+        cwd=REPO_ROOT, capture_output=True, text=True,
+    )
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        pytest.skip("not inside a git work tree (cannot inspect the tracked set)")
+
+    tracked = subprocess.run(
+        ["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+    ).stdout.splitlines()
+    offenders = [p for p in tracked if _is_secret_dotenv(Path(p).name)]
+    assert not offenders, (
+        "secret dotenv files are tracked (gitignore won't protect them); "
+        f"remove with `git rm --cached`: {offenders}"
+    )
