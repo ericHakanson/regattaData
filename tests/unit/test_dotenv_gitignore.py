@@ -16,11 +16,17 @@ Design notes:
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+
+# A dotenv secret is `.env` or `.env.<x>` as the final path component, at any depth —
+# but never a `.env.example` template. Evaluated against the full relative path.
+_SECRET_DOTENV_RE = re.compile(r"(?:^|/)\.env(?:\.[^/]+)?$")
+_ENV_EXAMPLE_RE = re.compile(r"(?:^|/)\.env\.example$")
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GITIGNORE = REPO_ROOT / ".gitignore"
@@ -89,9 +95,28 @@ def test_repo_ships_a_real_env_example_template() -> None:
     assert (REPO_ROOT / ".env.example").exists(), "repo must ship a .env.example template"
 
 
-def _is_secret_dotenv(name: str) -> bool:
-    """A dotenv secret file is `.env` or `.env.<x>`, but never the `.env.example` template."""
-    return (name == ".env" or name.startswith(".env.")) and name != ".env.example"
+def _is_secret_dotenv_path(rel_path: str) -> bool:
+    """True if the full relative path names a dotenv secret (`.env`/`.env.*` at any
+    depth), excluding `.env.example` templates."""
+    return bool(_SECRET_DOTENV_RE.search(rel_path)) and not _ENV_EXAMPLE_RE.search(rel_path)
+
+
+@pytest.mark.parametrize(
+    "path,is_secret",
+    [
+        (".env", True),
+        (".env.local", True),
+        (".env.production", True),
+        ("services/api/.env", True),
+        ("deep/nested/dir/.env.production", True),
+        (".env.example", False),
+        ("services/api/.env.example", False),
+        ("README.env", False),      # not a dotenv secret (no leading-dot .env segment)
+        ("config/env.sample", False),  # `env`, not `.env`
+    ],
+)
+def test_secret_dotenv_path_predicate(path: str, is_secret: bool) -> None:
+    assert _is_secret_dotenv_path(path) is is_secret
 
 
 def test_no_secret_dotenv_files_are_tracked() -> None:
@@ -108,7 +133,7 @@ def test_no_secret_dotenv_files_are_tracked() -> None:
     tracked = subprocess.run(
         ["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
     ).stdout.splitlines()
-    offenders = [p for p in tracked if _is_secret_dotenv(Path(p).name)]
+    offenders = [p for p in tracked if _is_secret_dotenv_path(p)]
     assert not offenders, (
         "secret dotenv files are tracked (gitignore won't protect them); "
         f"remove with `git rm --cached`: {offenders}"

@@ -4,8 +4,9 @@ As of the 2026-08 platform pivot, the regattaData primary database is **Neon**
 (serverless PostgreSQL, us-east-2). This runbook is the current source of truth
 for connecting and operating the database. The Google Cloud SQL runbooks
 (`01-bootstrap-gcp.md`, `05-cloud-sql-migration-plan.md`, `06-post-migration-validation.md`)
-are retained as historical records; Cloud SQL is a read-only fallback during the
-soak window and is being decommissioned.
+are retained as historical records. Cloud SQL is kept only as a **frozen fallback**
+during the soak window — read/compare use only, by operator policy — and is being
+decommissioned (FOR-854).
 
 ## Connecting
 
@@ -73,11 +74,18 @@ claude mcp add --transport http neon https://mcp.neon.tech/mcp   # then /mcp to 
 
 ## Fallback to Cloud SQL (during soak only)
 
-If Neon is unavailable during the soak window, the legacy path still works:
+If Neon is unavailable during the soak window, the legacy path still works for
+**read/compare only**:
 
 ```bash
 PROJECT_ID=regattadata INSTANCE_ID=regatta-data-small scripts/dev_start_proxy.sh --background
 export DB_DSN="postgresql://regatta_app@127.0.0.1:5433/regatta_data"   # password via ~/.pgpass
 ```
+
+> ⚠️ GCP is **frozen**. Neon is the write path. The `regatta_app` DSN above is
+> write-capable, so this is enforced by policy, not by the connection: do **not** run
+> write/mutating ETL modes (e.g. `resolution_promote`, ingestion) against Cloud SQL.
+> For hard enforcement, connect with a read-only Postgres role. Diverging writes on
+> both sides would break the Neon⇄GCP parity the migration established.
 
 Remove this fallback once Cloud SQL is decommissioned (FOR-854).
