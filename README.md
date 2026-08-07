@@ -3,8 +3,9 @@
 This repository defines the architecture and delivery standards for a sailboat regatta promotion orchestration layer.
 
 ## Platform Direction
-- Primary database: `Cloud SQL for PostgreSQL`.
+- Primary database: **Neon** (serverless PostgreSQL). Connect via `DB_DSN` — see `.env.example` and `docs/runbooks/10-neon-operations.md`.
 - Storage-heavy artifacts (scraped pages, raw files): `Google Cloud Storage (GCS)`.
+- _Historical:_ the platform previously ran on `Cloud SQL for PostgreSQL`; migrated to Neon in the 2026-08 pivot. Cloud SQL docs below are retained as records and describe the read-only fallback during decommissioning.
 
 ## Documentation Index
 - Requirements: `docs/requirements/product-requirements.md`
@@ -28,6 +29,7 @@ This repository defines the architecture and delivery standards for a sailboat r
   - `docs/runbooks/05-cloud-sql-migration-plan.md`
   - `docs/runbooks/06-post-migration-validation.md`
   - `docs/runbooks/07-materialized-view-refresh-strategy.md`
+  - `docs/runbooks/10-neon-operations.md` (**current** primary-database runbook)
 - QA and code review standard: `docs/qa/code-review-standard.md`
 - Migration smoke tests: `migrations/tests/README.md`
 

@@ -19,11 +19,15 @@ This runbook is intentionally implementation-agnostic and evidence-first.
 source /Users/erichakanson/projects/regattaData/.venv/bin/activate
 ```
 
-Optional DB setup:
+Optional DB setup — point `DB_DSN` at Neon (primary DB; see `docs/runbooks/10-neon-operations.md`):
 ```bash
-export REGATTA_DB_PASSWORD='***'
-export PGPASSWORD="$REGATTA_DB_PASSWORD"
-export DB_DSN="postgresql://regatta_app@127.0.0.1:5433/regatta_data"
+cp .env.example .env     # paste your Neon connection string into DB_DSN
+set -a; . ./.env; set +a # exports DB_DSN (postgresql://…neon.tech/neondb?sslmode=require)
+```
+
+_Legacy Cloud SQL fallback (soak window only):_
+```bash
+# export PGPASSWORD via ~/.pgpass; DB_DSN="postgresql://regatta_app@127.0.0.1:5433/regatta_data"
 ```
 
 ## Session A QA: Club/Participant/Yacht Promotion Enablement
