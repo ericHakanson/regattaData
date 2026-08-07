@@ -1,10 +1,11 @@
 # Environment variables — never commit real secrets (e.g. Neon DB_DSN).
 # Directory-agnostic: ignore every .env / .env.* at ANY depth; keep .env.example templates.
+# Deliberately scoped to dotenv files only — NOT `env.*`, which would over-ignore
+# unrelated non-secret files like env.schema.json or an env.prod/ directory.
 **/.env
 **/.env.*
 !**/.env.example
 /env
-env.*
 
 # Supabase
 .supabase/

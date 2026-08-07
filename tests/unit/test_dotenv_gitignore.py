@@ -54,6 +54,15 @@ TRACKED = [
     "services/api/.env.example",
 ]
 
+# Non-secret files that merely share an `env` prefix and MUST NOT be ignored. Guards
+# against an over-broad `env.*`-style rule silently hiding unrelated code/config.
+NON_DOTENV_TRACKED = [
+    "env.schema.json",
+    "config/env.yaml",
+    "env.prod/config.yml",
+    "README.env",
+]
+
 
 def _is_ignored(rel_path: str, *, cwd: Path) -> bool:
     """True if git ignores `rel_path` under `cwd`.
@@ -83,7 +92,7 @@ def seeded_repo(tmp_path: Path) -> Path:
     dotenv files at root + depth. Auto-cleaned by pytest's tmp_path."""
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     shutil.copyfile(GITIGNORE, tmp_path / ".gitignore")
-    for rel in IGNORED + TRACKED:
+    for rel in IGNORED + TRACKED + NON_DOTENV_TRACKED:
         target = tmp_path / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("SECRET=x\n")
@@ -101,6 +110,13 @@ def test_secret_files_ignored_at_any_depth(seeded_repo: Path, rel_path: str) -> 
 def test_example_templates_tracked_at_any_depth(seeded_repo: Path, rel_path: str) -> None:
     assert not _is_ignored(rel_path, cwd=seeded_repo), (
         f"{rel_path} template must stay tracked (never ignored)"
+    )
+
+
+@pytest.mark.parametrize("rel_path", NON_DOTENV_TRACKED)
+def test_non_secret_env_prefixed_files_are_not_ignored(seeded_repo: Path, rel_path: str) -> None:
+    assert not _is_ignored(rel_path, cwd=seeded_repo), (
+        f"{rel_path} is not a dotenv secret and must not be ignored"
     )
 
 
