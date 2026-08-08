@@ -173,7 +173,7 @@ def _run_wix_subscribers(
                      subscriber_status, labels, wix_source, created_at_raw, language,
                      raw_payload, row_hash)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (source_system, COALESCE(source_email_normalized, ''), row_hash) DO NOTHING
+                ON CONFLICT (source_system, source_email_normalized, row_hash) DO NOTHING
                 RETURNING id
                 """,
                 (

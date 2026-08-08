@@ -10,7 +10,7 @@ CREATE TABLE wix_subscriber_row (
     source_system           text        NOT NULL DEFAULT 'wix',
     source_file_name        text        NOT NULL,
     source_email_raw        text,
-    source_email_normalized text,
+    source_email_normalized text        NOT NULL,  -- importer rejects no-email rows; keeps the idempotency key null-free
     subscriber_status       text,   -- e.g. 'Subscribed' | 'Never subscribed'
     labels                  text,
     wix_source              text,   -- e.g. 'Form Submission' | 'Site Members' | 'Manual Creation'
@@ -24,11 +24,11 @@ CREATE TABLE wix_subscriber_row (
     updated_at              timestamptz NOT NULL DEFAULT now()
 );
 
--- Idempotency: the same email + identical raw content is captured once.
--- COALESCE the (nullable) email so NULL emails collapse to '' — a plain unique
--- index would treat NULLs as distinct and let identical no-email rows duplicate.
+-- Idempotency: the same email + identical raw content is captured once. The
+-- email column is NOT NULL, so this plain unique index has no NULL-distinctness
+-- gap and `ON CONFLICT` can infer it by plain columns.
 CREATE UNIQUE INDEX idx_wix_subscriber_row_unique
-    ON wix_subscriber_row (source_system, COALESCE(source_email_normalized, ''), row_hash);
+    ON wix_subscriber_row (source_system, source_email_normalized, row_hash);
 
 CREATE INDEX idx_wix_subscriber_row_email
     ON wix_subscriber_row (source_email_normalized);
