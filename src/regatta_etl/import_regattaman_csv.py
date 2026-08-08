@@ -423,6 +423,7 @@ def _process_row(
     default="private_export",
     type=click.Choice([
         "private_export", "public_scrape", "jotform_waiver",
+        "wix_subscribers",
         "mailchimp_audience", "mailchimp_event_activation",
         "airtable_copy", "yacht_scoring",
         "bhyc_member_directory", "bhyc_membership_csv",
@@ -1091,6 +1092,16 @@ def main(
             event_display_name=event_display_name,  # type: ignore[arg-type]
             season_year=season_year,  # type: ignore[arg-type]
             event_unresolved_link_max_reject_rate=event_unresolved_link_max_reject_rate,
+            dry_run=dry_run,
+        )
+    elif mode == "wix_subscribers":
+        from regatta_etl.import_wix_subscribers import _run_wix_subscribers
+        if not csv_path:
+            click.echo(f"[{run_id}] FATAL: wix_subscribers mode requires --csv-path", err=True)
+            sys.exit(1)
+        _run_wix_subscribers(
+            run_id, started_at, db_dsn, counters, rejects,
+            csv_path=csv_path,  # type: ignore[arg-type]
             dry_run=dry_run,
         )
     elif mode == "resolution_source_to_candidate":
