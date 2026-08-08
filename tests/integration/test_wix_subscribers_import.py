@@ -101,6 +101,29 @@ def test_wix_reconcile_link_create_and_never_email_as_name(db_conn, tmp_path):
     ).fetchone()[0] == 1
 
 
+def test_wix_reimport_changed_content_keeps_one_participant(db_conn, tmp_path):
+    """A later export changing a non-email field (new row_hash) is captured as a new
+    raw snapshot, but reconcile-by-email still resolves the SAME participant — no
+    duplicate participant is created (refutes the 'changed row -> dup participant' concern)."""
+    conn, dsn = db_conn
+    first = tmp_path / "wix_first.csv"
+    second = tmp_path / "wix_second.csv"
+    _write_csv(first, [_row(**{"Email 1": "x@example.com", "Email subscriber status": "Subscribed", "Labels": "A"})])
+    _write_csv(second, [_row(**{"Email 1": "x@example.com", "Email subscriber status": "Never subscribed", "Labels": "B"})])
+
+    _run(dsn, first, tmp_path, "r1")
+    _run(dsn, second, tmp_path, "r2")
+    conn.rollback()
+
+    # Two raw snapshots (lossless history) ...
+    assert conn.execute("SELECT count(*) FROM wix_subscriber_row").fetchone()[0] == 2
+    # ... but exactly ONE participant owns the email.
+    assert conn.execute(
+        "SELECT count(DISTINCT c.participant_id) FROM participant_contact_point c "
+        "WHERE c.contact_type = 'email' AND lower(c.contact_value_normalized) = 'x@example.com'"
+    ).fetchone()[0] == 1
+
+
 def test_wix_import_is_idempotent(db_conn, tmp_path):
     conn, dsn = db_conn
     csv_path = tmp_path / "wix.csv"
