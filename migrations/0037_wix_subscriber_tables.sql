@@ -25,8 +25,10 @@ CREATE TABLE wix_subscriber_row (
 );
 
 -- Idempotency: the same email + identical raw content is captured once.
+-- COALESCE the (nullable) email so NULL emails collapse to '' — a plain unique
+-- index would treat NULLs as distinct and let identical no-email rows duplicate.
 CREATE UNIQUE INDEX idx_wix_subscriber_row_unique
-    ON wix_subscriber_row (source_system, source_email_normalized, row_hash);
+    ON wix_subscriber_row (source_system, COALESCE(source_email_normalized, ''), row_hash);
 
 CREATE INDEX idx_wix_subscriber_row_email
     ON wix_subscriber_row (source_email_normalized);
