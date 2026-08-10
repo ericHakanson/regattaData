@@ -147,10 +147,19 @@ def _run_wix_subscribers(
 
     with psycopg.connect(db_dsn, autocommit=False) as conn:
         for cells in raw_cell_rows:
+            counters.rows_read += 1
+            # Reject malformed rows loudly rather than silently truncating (dict(zip) would
+            # drop overflow cells / shift fields): a row must have exactly one cell per header.
+            if len(cells) != len(header):
+                rejects.write(
+                    {"_header_cols": str(len(header)), "_row_cells": str(len(cells))},
+                    "column_count_mismatch",
+                )
+                counters.rows_rejected += 1
+                continue
             # dict for field access (duplicate headers collapse here, which is fine for
             # reads); the hash below is taken from the positional cells, not this dict.
             row = dict(zip(header, cells))
-            counters.rows_read += 1
 
             email_raw = trim(row.get("Email 1"))
             email_norm = normalize_email(email_raw) if email_raw else None

@@ -124,6 +124,28 @@ def test_wix_reimport_changed_content_keeps_one_participant(db_conn, tmp_path):
     ).fetchone()[0] == 1
 
 
+def test_wix_rejects_column_count_mismatch(db_conn, tmp_path):
+    """A malformed row (cell count != header count) is rejected loudly, not silently
+    truncated; the well-formed row is still captured."""
+    conn, dsn = db_conn
+    bad = tmp_path / "wix_bad.csv"
+    bad.write_text(
+        "Email 1,First Name,Email subscriber status\n"
+        "good@example.com,Good,Subscribed\n"
+        "bad@example.com,Bad,Subscribed,EXTRA_COLUMN\n"
+    )
+    counters = _run(dsn, bad, tmp_path, "bad")
+    conn.rollback()
+
+    assert counters.rows_read == 2
+    assert counters.rows_rejected == 1
+    assert conn.execute("SELECT count(*) FROM wix_subscriber_row").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT count(*) FROM participant_contact_point WHERE source_system = 'wix' "
+        "AND lower(contact_value_normalized) = 'bad@example.com'"
+    ).fetchone()[0] == 0
+
+
 def test_wix_import_is_idempotent(db_conn, tmp_path):
     conn, dsn = db_conn
     csv_path = tmp_path / "wix.csv"
