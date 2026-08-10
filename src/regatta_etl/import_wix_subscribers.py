@@ -36,7 +36,7 @@ from regatta_etl.normalize import (
     normalize_space,
     trim,
 )
-from regatta_etl.shared import RejectWriter, RunCounters, normalize_headers
+from regatta_etl.shared import RejectWriter, RunCounters
 
 REQUIRED_HEADERS = {"Email 1", "Email subscriber status"}
 
@@ -126,26 +126,30 @@ def _run_wix_subscribers(
     csv_file = Path(csv_path)
     csv_file_name = csv_file.name
 
+    # Read positionally (csv.reader), not DictReader: this preserves fidelity to the
+    # physical row even if the export has duplicate column names, so row_hash never
+    # collapses two distinct rows into one (which would silently drop a raw snapshot).
     with open(csv_file, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        raw_fieldnames = reader.fieldnames or []
-        normalized_hdr = {k.strip(): k for k in raw_fieldnames}
-        missing = REQUIRED_HEADERS - set(normalized_hdr.keys())
+        reader = csv.reader(fh)
+        header = [h.strip() for h in next(reader, [])]
+        missing = REQUIRED_HEADERS - set(header)
         if missing:
             click.echo(
                 f"[{run_id}] FATAL: wix export missing required headers: {sorted(missing)}",
                 err=True,
             )
             sys.exit(1)
-        rows = list(reader)
+        raw_cell_rows = list(reader)
 
-    click.echo(f"[{run_id}] Pre-scan: {len(rows)} rows read")
+    click.echo(f"[{run_id}] Pre-scan: {len(raw_cell_rows)} rows read")
 
     status_subscribed = status_never = status_other = provenance_points = 0
 
     with psycopg.connect(db_dsn, autocommit=False) as conn:
-        for raw in rows:
-            row = normalize_headers(raw)
+        for cells in raw_cell_rows:
+            # dict for field access (duplicate headers collapse here, which is fine for
+            # reads); the hash below is taken from the positional cells, not this dict.
+            row = dict(zip(header, cells))
             counters.rows_read += 1
 
             email_raw = trim(row.get("Email 1"))
@@ -163,9 +167,11 @@ def _run_wix_subscribers(
             else:
                 status_other += 1
 
-            # 1. Lossless raw capture
-            raw_payload = json.dumps(raw)
-            row_hash = hashlib.sha256(raw_payload.encode("utf-8")).hexdigest()
+            # 1. Lossless raw capture — payload keeps header+cells (order + duplicates
+            #    preserved); hash is over the positional cells so it is faithful to the
+            #    physical row regardless of duplicate headers.
+            raw_payload = json.dumps({"header": header, "cells": cells})
+            row_hash = hashlib.sha256(json.dumps(cells).encode("utf-8")).hexdigest()
             inserted_raw = conn.execute(
                 """
                 INSERT INTO wix_subscriber_row
