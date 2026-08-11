@@ -1009,6 +1009,17 @@ def _ingest_participants_from_participant_table(
                 else:
                     ctrs.participants_candidate_enriched += 1
 
+            # Keep the by-email real-name map fresh within this run so a placeholder row
+            # processed later in the SAME run can still absorb into a real-name owner that
+            # was created earlier in this run (not only owners that pre-existed the run).
+            if best_email and not _is_placeholder_participant_name(display_name, norm_name):
+                _email_key = best_email.lower()
+                _prev = realname_candidate_by_email.get(_email_key)
+                if _prev is None:
+                    realname_candidate_by_email[_email_key] = cid
+                elif _prev != cid and _prev != _AMBIGUOUS:
+                    realname_candidate_by_email[_email_key] = _AMBIGUOUS
+
             # Link source row
             inserted = _link_source(conn, "participant", cid, "participant", pk, "operational_db")
             if inserted:

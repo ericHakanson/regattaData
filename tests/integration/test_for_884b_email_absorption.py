@@ -69,6 +69,22 @@ def test_placeholder_absorbs_into_realname_candidate(db_conn, tmp_path):
     assert _candidate_for_source_pk(conn, real_pid) == _candidate_for_source_pk(conn, ph_pid)
 
 
+def test_single_run_realname_then_placeholder_absorbs(db_conn, tmp_path):
+    """Both rows present before a SINGLE run: the real-name candidate is created earlier
+    in the run and the placeholder processed later must still absorb (map is maintained
+    incrementally within the loop, not just from a pre-run snapshot)."""
+    conn, _ = db_conn
+    _seed_participant(conn, "Paul Koch", "solo@example.com")       # created first in the run
+    _seed_participant(conn, "solo@example.com", "solo@example.com")  # placeholder, same email
+    conn.commit()
+
+    ctrs = run_source_to_candidate(conn, entity_type="participant")
+    conn.commit()
+
+    assert ctrs.participants_email_absorption_reused >= 1
+    assert _candidates_for_email(conn, "solo@example.com") == 1
+
+
 def test_distinct_real_names_sharing_email_are_not_merged(db_conn, tmp_path):
     conn, _ = db_conn
     _seed_participant(conn, "Carrie Bridge", "family@example.com")
