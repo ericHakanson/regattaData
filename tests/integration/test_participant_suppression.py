@@ -128,6 +128,18 @@ def test_anchorless_row_is_rejected(db_conn):
             )
 
 
+def test_mixed_case_email_is_rejected(db_conn):
+    """email_normalized must be lower-cased so case variants can't create parallel
+    active suppressions that the unique indexes would treat as distinct."""
+    conn, _ = db_conn
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with conn.transaction():
+            conn.execute(
+                "INSERT INTO participant_suppression (email_normalized, reason_code, actor) "
+                "VALUES ('Mixed@Example.com', 'manual_optout', 'tester')",
+            )
+
+
 def test_duplicate_active_suppression_is_rejected(db_conn):
     conn, _ = db_conn
     conn.execute(

@@ -36,7 +36,12 @@ CREATE TABLE participant_suppression (
     deleted_at        timestamptz,
     -- Every suppression must anchor to a participant, an email, or both.
     CONSTRAINT participant_suppression_anchor_present
-        CHECK (participant_id IS NOT NULL OR email_normalized IS NOT NULL)
+        CHECK (participant_id IS NOT NULL OR email_normalized IS NOT NULL),
+    -- email_normalized must actually be normalized (lower-cased) so the active-unique
+    -- indexes can't be defeated by case variation (e.g. 'Foo@x' vs 'foo@x') and so it
+    -- matches the lower-cased addresses the active_suppressed_email view emits.
+    CONSTRAINT participant_suppression_email_is_normalized
+        CHECK (email_normalized IS NULL OR email_normalized = lower(email_normalized))
 );
 
 -- One ACTIVE suppression per (participant, email, reason). Enforced with three
