@@ -625,7 +625,8 @@ def _load_realname_candidate_by_email_map(
         SELECT lower(best_email), id::text
         FROM candidate_participant
         WHERE best_email IS NOT NULL
-          AND display_name IS NOT NULL
+          -- real name = non-blank AND not email-like, matching _is_placeholder_participant_name
+          AND nullif(btrim(display_name), '') IS NOT NULL
           AND display_name NOT LIKE '%@%'
         ORDER BY lower(best_email),
                  is_promoted DESC,

@@ -102,6 +102,25 @@ def test_distinct_real_names_sharing_email_are_not_merged(db_conn, tmp_path):
     assert _candidates_for_email(conn, "family@example.com") == 2
 
 
+def test_blank_name_candidate_is_not_a_realname_owner(db_conn, tmp_path):
+    """A candidate whose display_name is blank/whitespace is a placeholder, not a real-name
+    owner — a placeholder record sharing its email must NOT absorb into it."""
+    conn, _ = db_conn
+    conn.execute(
+        "INSERT INTO candidate_participant (stable_fingerprint, display_name, normalized_name, best_email) "
+        "VALUES (%s, %s, %s, %s)",
+        ("fp-blank-884b", "   ", None, "blank@example.com"),
+    )
+    conn.commit()
+
+    _seed_participant(conn, "blank@example.com", "blank@example.com")  # placeholder, same email
+    conn.commit()
+    ctrs = run_source_to_candidate(conn, entity_type="participant")
+    conn.commit()
+
+    assert ctrs.participants_email_absorption_reused == 0
+
+
 def test_ambiguous_shared_email_leaves_placeholder_unabsorbed(db_conn, tmp_path):
     conn, _ = db_conn
     _seed_participant(conn, "Paul Koch", "shared@example.com")
