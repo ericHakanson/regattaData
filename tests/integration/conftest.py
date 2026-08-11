@@ -56,6 +56,7 @@ MIGRATIONS = [
     PROJECT_ROOT / "migrations" / "0035_name_components.sql",
     PROJECT_ROOT / "migrations" / "0036_address_line2_propagation.sql",
     PROJECT_ROOT / "migrations" / "0037_wix_subscriber_tables.sql",
+    PROJECT_ROOT / "migrations" / "0038_participant_suppression.sql",
 ]
 
 # ---------------------------------------------------------------------------
