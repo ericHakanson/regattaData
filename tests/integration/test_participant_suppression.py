@@ -145,6 +145,40 @@ def test_duplicate_active_suppression_is_rejected(db_conn):
             )
 
 
+def test_active_unique_rejects_both_anchor_and_participant_wide_duplicates(db_conn):
+    """The three partial unique indexes each dedupe their anchor shape."""
+    conn, _ = db_conn
+    pid = _seed_participant(conn, "Dup Both", "both@example.com")
+    # both-anchor shape
+    conn.execute(
+        "INSERT INTO participant_suppression (participant_id, email_normalized, reason_code, actor) "
+        "VALUES (%s, 'both@example.com', 'manual_optout', 'a')",
+        (pid,),
+    )
+    conn.commit()
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        with conn.transaction():
+            conn.execute(
+                "INSERT INTO participant_suppression (participant_id, email_normalized, reason_code, actor) "
+                "VALUES (%s, 'both@example.com', 'manual_optout', 'b')",
+                (pid,),
+            )
+    # participant-wide shape (email NULL)
+    conn.execute(
+        "INSERT INTO participant_suppression (participant_id, reason_code, actor) "
+        "VALUES (%s, 'third_party_no_consent', 'a')",
+        (pid,),
+    )
+    conn.commit()
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        with conn.transaction():
+            conn.execute(
+                "INSERT INTO participant_suppression (participant_id, reason_code, actor) "
+                "VALUES (%s, 'third_party_no_consent', 'b')",
+                (pid,),
+            )
+
+
 def test_soft_delete_hides_from_view_and_frees_the_unique_slot(db_conn):
     conn, _ = db_conn
     sid = conn.execute(

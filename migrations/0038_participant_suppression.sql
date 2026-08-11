@@ -39,14 +39,28 @@ CREATE TABLE participant_suppression (
         CHECK (participant_id IS NOT NULL OR email_normalized IS NOT NULL)
 );
 
--- One ACTIVE suppression per (participant, email, reason). NULLS NOT DISTINCT so a
--- participant-wide (email NULL) or email-only (participant NULL) row cannot be
--- duplicated. Soft-deleted rows are excluded from the constraint, so a lifted
--- suppression can be re-added later.
-CREATE UNIQUE INDEX idx_participant_suppression_active_unique
+-- One ACTIVE suppression per (participant, email, reason). Enforced with three
+-- portable partial unique indexes — one per anchor shape — instead of a single
+-- NULLS NOT DISTINCT index (which requires PostgreSQL 15+). This keeps the migration
+-- cross-version and gives the NULL anchors real uniqueness (a default unique index
+-- treats NULLs as distinct, so a plain index would NOT dedupe the NULL shapes).
+-- Soft-deleted rows are excluded so a lifted suppression can be re-added later.
+-- (The all-NULL shape is impossible: participant_suppression_anchor_present forbids it.)
+CREATE UNIQUE INDEX idx_participant_suppression_active_both
     ON participant_suppression (participant_id, email_normalized, reason_code)
-    NULLS NOT DISTINCT
-    WHERE deleted_at IS NULL;
+    WHERE deleted_at IS NULL
+      AND participant_id IS NOT NULL
+      AND email_normalized IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_participant_suppression_active_participant_wide
+    ON participant_suppression (participant_id, reason_code)
+    WHERE deleted_at IS NULL
+      AND email_normalized IS NULL;
+
+CREATE UNIQUE INDEX idx_participant_suppression_active_email_only
+    ON participant_suppression (email_normalized, reason_code)
+    WHERE deleted_at IS NULL
+      AND participant_id IS NULL;
 
 -- Audience-build join path: look up active suppressions by email.
 CREATE INDEX idx_participant_suppression_email_active
