@@ -637,7 +637,12 @@ def _load_realname_candidate_by_email_map(
     ).fetchall()
     by_email: dict[str, list[str]] = defaultdict(list)
     for email, candidate_id in rows:
-        by_email[str(email)].append(str(candidate_id))
+        cid = str(candidate_id)
+        # Dedupe candidate ids per email (ambiguity means >1 DISTINCT real-name owner,
+        # never repeated rows for the same candidate). Order is preserved so [0] stays the
+        # highest-priority owner per the query's ORDER BY.
+        if cid not in by_email[str(email)]:
+            by_email[str(email)].append(cid)
     return {
         email: candidate_ids[0] if len(candidate_ids) == 1 else _AMBIGUOUS
         for email, candidate_ids in by_email.items()
