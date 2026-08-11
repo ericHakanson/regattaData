@@ -622,12 +622,12 @@ def _load_realname_candidate_by_email_map(
     (email-as-name/blank) records into the real person that owns their email."""
     rows = conn.execute(
         """
-        SELECT lower(best_email), id::text
+        SELECT lower(best_email), id::text, display_name
         FROM candidate_participant
         WHERE best_email IS NOT NULL
-          -- real name = non-blank AND not email-like, matching _is_placeholder_participant_name
+          -- non-blank here; the email-like exclusion is applied in Python via looks_like_email
+          -- so producer and consumer (_is_placeholder_participant_name) use the same predicate.
           AND nullif(btrim(display_name), '') IS NOT NULL
-          AND display_name NOT LIKE '%@%'
         ORDER BY lower(best_email),
                  is_promoted DESC,
                  quality_score DESC NULLS LAST,
@@ -636,7 +636,9 @@ def _load_realname_candidate_by_email_map(
         """
     ).fetchall()
     by_email: dict[str, list[str]] = defaultdict(list)
-    for email, candidate_id in rows:
+    for email, candidate_id, display_name in rows:
+        if looks_like_email(display_name):
+            continue  # email-as-name is a placeholder, not a real-name owner
         cid = str(candidate_id)
         # Dedupe candidate ids per email (ambiguity means >1 DISTINCT real-name owner,
         # never repeated rows for the same candidate). Order is preserved so [0] stays the
