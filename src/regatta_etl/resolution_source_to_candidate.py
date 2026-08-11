@@ -173,6 +173,11 @@ class SourceToCandidateCounters:
     # Under-combination prevention
     participants_under_combination_reused: int = 0
     participants_under_combination_ambiguous: int = 0
+    # Email-as-name absorption (FOR-884b): a placeholder-named record with an email
+    # reuses the unique real-name candidate that owns that email, instead of forming
+    # an email-as-name twin. Never merges two distinct real names.
+    participants_email_absorption_reused: int = 0
+    participants_email_absorption_ambiguous: int = 0
     # Errors
     db_errors: int = 0
     warnings: list[str] = field(default_factory=list)
@@ -609,6 +614,82 @@ def _load_email_bearing_candidate_by_name_map(
     }
 
 
+def _load_realname_candidate_by_email_map(
+    conn: psycopg.Connection,
+) -> dict[str, str]:
+    """Return normalized_email -> candidate id (or _AMBIGUOUS) for candidates that carry
+    a REAL name (display_name present and not email-like). Used to absorb placeholder-named
+    (email-as-name/blank) records into the real person that owns their email."""
+    rows = conn.execute(
+        """
+        SELECT lower(best_email), id::text, display_name
+        FROM candidate_participant
+        WHERE best_email IS NOT NULL
+          -- non-blank here; the email-like exclusion is applied in Python via looks_like_email
+          -- so producer and consumer (_is_placeholder_participant_name) use the same predicate.
+          AND nullif(btrim(display_name), '') IS NOT NULL
+        ORDER BY lower(best_email),
+                 is_promoted DESC,
+                 quality_score DESC NULLS LAST,
+                 updated_at DESC,
+                 id ASC
+        """
+    ).fetchall()
+    by_email: dict[str, list[str]] = defaultdict(list)
+    for email, candidate_id, display_name in rows:
+        if looks_like_email(display_name):
+            continue  # email-as-name is a placeholder, not a real-name owner
+        cid = str(candidate_id)
+        # Dedupe candidate ids per email (ambiguity means >1 DISTINCT real-name owner,
+        # never repeated rows for the same candidate). Order is preserved so [0] stays the
+        # highest-priority owner per the query's ORDER BY.
+        if cid not in by_email[str(email)]:
+            by_email[str(email)].append(cid)
+    return {
+        email: candidate_ids[0] if len(candidate_ids) == 1 else _AMBIGUOUS
+        for email, candidate_ids in by_email.items()
+    }
+
+
+def _is_placeholder_participant_name(display_name: str | None, norm_name: str | None) -> bool:
+    """True when the incoming record has no real name to identify a person by: the name
+    is blank, or it is an email address masquerading as a name (the email-as-name defect)."""
+    if not norm_name:
+        return True
+    return bool(display_name) and looks_like_email(display_name)
+
+
+def _absorb_realname_candidate_by_email(
+    norm_email: str | None,
+    display_name: str | None,
+    norm_name: str | None,
+    realname_candidate_by_email: dict[str, str],
+    ctrs: Any,
+) -> str | None:
+    """FOR-884b email-as-name absorption.
+
+    If the incoming record is a placeholder (email-as-name / blank name) but has an email
+    that UNIQUELY belongs to a real-name candidate, return that candidate id to reuse — so
+    the placeholder folds into the real person instead of forming an email-as-name twin.
+
+    Returns None when not applicable, or when the email maps to multiple real-name
+    candidates (ambiguous — e.g. a shared family email), so distinct real people are never
+    merged.
+    """
+    if not norm_email:
+        return None
+    if not _is_placeholder_participant_name(display_name, norm_name):
+        return None  # incoming has a real name -> keep separate (families / distinct people)
+    lookup = realname_candidate_by_email.get(norm_email.lower())
+    if lookup == _AMBIGUOUS:
+        ctrs.participants_email_absorption_ambiguous += 1
+        return None
+    if lookup is not None:
+        ctrs.participants_email_absorption_reused += 1
+        return lookup
+    return None
+
+
 def _enrich_candidate_by_id(
     conn: psycopg.Connection,
     table: str,
@@ -875,6 +956,7 @@ def _ingest_participants_from_participant_table(
 
     candidate_by_source = _load_candidate_by_source_map(conn, "participant", "participant")
     email_bearing_candidate_by_name = _load_email_bearing_candidate_by_name_map(conn)
+    realname_candidate_by_email = _load_realname_candidate_by_email_map(conn)
 
     for row in rows:
         pk = str(row[0])
@@ -911,6 +993,11 @@ def _ingest_participants_from_participant_table(
                 reuse_cid = lookup
                 ctrs.participants_under_combination_reused += 1
 
+        if reuse_cid is None:
+            reuse_cid = _absorb_realname_candidate_by_email(
+                best_email, display_name, norm_name, realname_candidate_by_email, ctrs
+            )
+
         try:
             if source_linked_cid is not None:
                 cid = source_linked_cid
@@ -929,6 +1016,17 @@ def _ingest_participants_from_participant_table(
                     ctrs.participants_candidate_created += 1
                 else:
                     ctrs.participants_candidate_enriched += 1
+
+            # Keep the by-email real-name map fresh within this run so a placeholder row
+            # processed later in the SAME run can still absorb into a real-name owner that
+            # was created earlier in this run (not only owners that pre-existed the run).
+            if best_email and not _is_placeholder_participant_name(display_name, norm_name):
+                _email_key = best_email.lower()
+                _prev = realname_candidate_by_email.get(_email_key)
+                if _prev is None:
+                    realname_candidate_by_email[_email_key] = cid
+                elif _prev != cid and _prev != _AMBIGUOUS:
+                    realname_candidate_by_email[_email_key] = _AMBIGUOUS
 
             # Link source row
             inserted = _link_source(conn, "participant", cid, "participant", pk, "operational_db")
