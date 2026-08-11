@@ -90,6 +90,34 @@ def test_participant_wide_suppression_expands_to_all_emails(db_conn):
     assert emails == {"ruby.primary@example.com", "ruby.alt@example.com"}
 
 
+def test_participant_wide_suppression_is_failsafe_over_unverified_emails(db_conn):
+    """A suppression/consent surface must FAIL SAFE: a participant-wide 'do not email'
+    covers even an unverified/secondary address. Under-suppression (emailing someone
+    who opted out) is the dangerous direction; over-suppression is not. This codifies
+    that participant_contact_point has no active/soft-delete flag to filter on and that
+    we deliberately do not add one here.
+    """
+    conn, _ = db_conn
+    pid = conn.execute(
+        "INSERT INTO participant (full_name, normalized_full_name) VALUES ('Optout Person','optout person') RETURNING id"
+    ).fetchone()[0]
+    # An UNVERIFIED, non-primary email — must still be suppressed.
+    conn.execute(
+        "INSERT INTO participant_contact_point "
+        "(participant_id, contact_type, contact_value_raw, contact_value_normalized, is_primary, is_verified, source_system) "
+        "VALUES (%s, 'email', %s, %s, false, false, 'test')",
+        (pid, "stale@example.com", "stale@example.com"),
+    )
+    conn.execute(
+        "INSERT INTO participant_suppression (participant_id, reason_code, actor) VALUES (%s, 'manual_optout', 'tester')",
+        (pid,),
+    )
+    conn.commit()
+    assert conn.execute(
+        "SELECT count(*) FROM active_suppressed_email WHERE email_normalized = 'stale@example.com'"
+    ).fetchone()[0] == 1
+
+
 def test_anchorless_row_is_rejected(db_conn):
     conn, _ = db_conn
     with pytest.raises(psycopg.errors.CheckViolation):
