@@ -257,6 +257,38 @@ def test_do_not_email_minor_tag_promotes_onto_surface(db_conn):
     ).fetchone()[0] == 1
 
 
+def test_backfill_two_participants_sharing_one_email(db_conn):
+    """Production shape (the real Ruby Garland case): two participant rows share one
+    guardian email, each tagged DO_NOT_EMAIL_MINOR. Both promote — they are distinct
+    on participant_id, so the both-anchor unique index is satisfied and the backfill
+    does not raise."""
+    conn, _ = db_conn
+    pid1 = _seed_participant(conn, "Ruby Garland", "guardian.shared@example.com")
+    pid2 = conn.execute(
+        "INSERT INTO participant (full_name, normalized_full_name) VALUES ('Ruby Garland','ruby garland') RETURNING id"
+    ).fetchone()[0]
+    for pid in (pid1, pid2):
+        conn.execute(
+            "INSERT INTO mailchimp_contact_tag "
+            "(participant_id, email_normalized, tag_value, source_system, source_file_name, observed_at) "
+            "VALUES (%s, 'guardian.shared@example.com', 'DO_NOT_EMAIL_MINOR', 'manual_consent_dq884', 's.csv', now())",
+            (pid,),
+        )
+    conn.commit()
+
+    _run_tag_backfill(conn)
+    conn.commit()
+
+    pids = {
+        r[0]
+        for r in conn.execute(
+            "SELECT participant_id::text FROM participant_suppression "
+            "WHERE email_normalized = 'guardian.shared@example.com'"
+        ).fetchall()
+    }
+    assert pids == {str(pid1), str(pid2)}
+
+
 def test_backfill_is_rerun_safe(db_conn):
     """Re-running the backfill is idempotent (ON CONFLICT DO NOTHING) — applying the
     migration statement twice must not raise or create a duplicate suppression."""
