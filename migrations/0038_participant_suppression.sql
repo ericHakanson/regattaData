@@ -90,9 +90,18 @@ CREATE VIEW active_suppressed_email AS
 -- no-op on databases where that tag was never written (e.g. fresh test databases).
 -- The interim tag rows are intentionally LEFT in place — removing them is a
 -- separate, approval-gated step (DATA_PROTECTION.md).
+--
+-- Robustness (defensive, even though this source can't currently violate either):
+--   * DISTINCT ON (participant_id, email) collapses multiple tag rows for the same
+--     anchor to one, so the statement never proposes two rows that collide on the
+--     active-unique index.
+--   * LEFT JOIN participant + guard skips any tag row whose participant_id does not
+--     resolve, so a stale/dangling anchor could never abort the migration on the FK.
+--     (mailchimp_contact_tag.participant_id already FKs participant(id), so this is
+--     belt-and-suspenders for future/mirrored sources.)
 INSERT INTO participant_suppression
     (participant_id, email_normalized, reason_code, source_system, actor, notes, observed_at)
-SELECT DISTINCT
+SELECT DISTINCT ON (t.participant_id, lower(t.email_normalized))
     t.participant_id,
     lower(t.email_normalized),
     'minor_guardian_email',
@@ -101,7 +110,10 @@ SELECT DISTINCT
     'Migrated from mailchimp_contact_tag DO_NOT_EMAIL_MINOR (minor reachable only via a guardian email).',
     t.observed_at
 FROM mailchimp_contact_tag t
+LEFT JOIN participant p ON p.id = t.participant_id
 WHERE t.tag_value = 'DO_NOT_EMAIL_MINOR'
+  AND (t.participant_id IS NULL OR p.id IS NOT NULL)
+ORDER BY t.participant_id, lower(t.email_normalized), t.observed_at DESC NULLS LAST
 ON CONFLICT DO NOTHING;
 
 COMMIT;

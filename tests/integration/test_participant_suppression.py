@@ -28,6 +28,26 @@ def _seed_participant(conn: psycopg.Connection, full_name: str, email: str) -> s
     return str(pid)
 
 
+def _run_tag_backfill(conn: psycopg.Connection) -> None:
+    """Mirror the DO_NOT_EMAIL_MINOR -> participant_suppression backfill in 0038,
+    verbatim (DISTINCT ON collapse + FK-safe LEFT JOIN guard + ON CONFLICT)."""
+    conn.execute(
+        """
+        INSERT INTO participant_suppression
+            (participant_id, email_normalized, reason_code, source_system, actor, notes, observed_at)
+        SELECT DISTINCT ON (t.participant_id, lower(t.email_normalized))
+            t.participant_id, lower(t.email_normalized), 'minor_guardian_email',
+            t.source_system, 'dq884_migration', 'migrated', t.observed_at
+        FROM mailchimp_contact_tag t
+        LEFT JOIN participant p ON p.id = t.participant_id
+        WHERE t.tag_value = 'DO_NOT_EMAIL_MINOR'
+          AND (t.participant_id IS NULL OR p.id IS NOT NULL)
+        ORDER BY t.participant_id, lower(t.email_normalized), t.observed_at DESC NULLS LAST
+        ON CONFLICT DO NOTHING
+        """
+    )
+
+
 def test_email_scoped_suppression_shows_in_view(db_conn):
     conn, _ = db_conn
     conn.execute(
@@ -140,19 +160,18 @@ def test_do_not_email_minor_tag_promotes_onto_surface(db_conn):
     )
     conn.commit()
 
-    # Same statement the migration runs.
+    # A second tag row for the SAME anchor (participant+email) — DISTINCT ON must
+    # collapse it so the backfill never proposes two rows that collide on the
+    # active-unique index.
     conn.execute(
-        """
-        INSERT INTO participant_suppression
-            (participant_id, email_normalized, reason_code, source_system, actor, notes, observed_at)
-        SELECT DISTINCT t.participant_id, lower(t.email_normalized), 'minor_guardian_email',
-               t.source_system, 'dq884_migration', 'migrated', t.observed_at
-        FROM mailchimp_contact_tag t
-        WHERE t.tag_value = 'DO_NOT_EMAIL_MINOR'
-        ON CONFLICT DO NOTHING
-        """
+        "INSERT INTO mailchimp_contact_tag "
+        "(participant_id, email_normalized, tag_value, source_system, source_file_name, observed_at) "
+        "VALUES (%s, %s, 'DO_NOT_EMAIL_MINOR', 'manual_consent_dq884', 'g.csv', now())",
+        (pid, "guardian.minor@example.com"),
     )
     conn.commit()
+
+    _run_tag_backfill(conn)
 
     row = conn.execute(
         "SELECT reason_code, source_system, actor FROM participant_suppression "
@@ -162,3 +181,27 @@ def test_do_not_email_minor_tag_promotes_onto_surface(db_conn):
     assert conn.execute(
         "SELECT count(*) FROM active_suppressed_email WHERE email_normalized = 'guardian.minor@example.com'"
     ).fetchone()[0] == 1
+
+
+def test_backfill_is_rerun_safe(db_conn):
+    """Re-running the backfill is idempotent (ON CONFLICT DO NOTHING) — applying the
+    migration statement twice must not raise or create a duplicate suppression."""
+    conn, _ = db_conn
+    pid = _seed_participant(conn, "Rerun Kid", "rerun@example.com")
+    conn.execute(
+        "INSERT INTO mailchimp_contact_tag "
+        "(participant_id, email_normalized, tag_value, source_system, source_file_name, observed_at) "
+        "VALUES (%s, %s, 'DO_NOT_EMAIL_MINOR', 'manual_consent_dq884', 'r.csv', now())",
+        (pid, "rerun@example.com"),
+    )
+    conn.commit()
+
+    _run_tag_backfill(conn)
+    _run_tag_backfill(conn)  # rerun must not raise or duplicate
+    conn.commit()
+
+    rows = conn.execute(
+        "SELECT participant_id::text, reason_code FROM participant_suppression "
+        "WHERE email_normalized = 'rerun@example.com'"
+    ).fetchall()
+    assert rows == [(pid, "minor_guardian_email")]
